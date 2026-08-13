@@ -1,0 +1,32 @@
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# Build / temp
+*.log
+*.tmp
+.cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+secrets/
+credentials/
+
+# Generated artifacts (regenerated from source)
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+!docs/**/*.pdf
