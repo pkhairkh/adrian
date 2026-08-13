@@ -42,6 +42,7 @@ sha2.workspace = true
 hmac.workspace = true
 pbkdf2.workspace = true
 md4.workspace = true
+subtle.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 uuid.workspace = true

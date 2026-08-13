@@ -125,6 +125,7 @@ pbkdf2 = "0.12"
 md4 = "0.10"
 md-5 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
 # HSM bindings (per ADR-015/032/037; `enterprise-hsm` feature).
 cryptoki = "0.8"
 # LDAP client (used by adrian-directory-service for client-side testing and

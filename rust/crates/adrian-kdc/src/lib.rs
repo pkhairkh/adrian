@@ -140,6 +140,11 @@ impl Default for PacBuilder {
 /// used by the KDC and PAC signer. Real, tested implementation by Wave 3c.
 pub mod crypto;
 
+/// RFC 3961 §5.1 key derivation (`nfold` + DR-encrypt) for AES enctypes.
+/// Derives per-usage Ke (encryption) and Ki (integrity) keys from the base
+/// key. Required for MIT krb5 / Windows interop.
+pub mod key_derivation;
+
 /// HSM-bound krbtgt key manager with 30-day auto-rotation per ADR-015.
 /// Holds the current and previous krbtgt key handles; the previous is
 /// retained for the overlap window to accept TGTs issued under the old
