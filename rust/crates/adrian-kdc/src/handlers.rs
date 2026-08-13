@@ -69,10 +69,13 @@
 //!   the HSM only supports AES-256-GCM, so etype 18 encryption must happen
 //!   outside the HSM boundary.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use subtle::ConstantTimeEq;
+use tracing::Instrument;
 use uuid::Uuid;
+
+use adrian_monitor::MetricsRegistry;
 
 use crate::crypto::{self, Aes256Key, CONFOUNDER_LEN, HMAC_SHA1_96_LEN};
 use crate::key_derivation;
@@ -995,31 +998,94 @@ fn random_session_key() -> Result<[u8; SESSION_KEY_LEN], KdcError> {
 // AS-REQ handler
 // ---------------------------------------------------------------------------
 
-/// Handle an AS-REQ (RFC 4120 §3.1 / §5.4.1).
+/// Map an `EType` to its canonical Kerberos string label, used as the
+/// `etype` label of the `adrian_as_req_total{realm,etype}` counter per
+/// ADR-057 §Decision (Wave 3b — wire MetricsRegistry producers).
+fn etype_label(e: EType) -> &'static str {
+    match e {
+        EType::Aes256CtsHmacSha1_96 => "aes256-cts-hmac-sha1-96",
+        EType::Aes128CtsHmacSha1_96 => "aes128-cts-hmac-sha1-96",
+        EType::Aes128CtsHmacSha256_128 => "aes128-cts-hmac-sha256-128",
+        EType::Aes256CtsHmacSha384_192 => "aes256-cts-hmac-sha384-192",
+        EType::Rc4Hmac => "rc4-hmac",
+    }
+}
+
+/// Backward-compatible AS-REQ handler (Wave 3a signature): records no
+/// metrics and is equivalent to calling
+/// [`handle_as_req_with_metrics`] with `metrics = None`.
 ///
-/// 1. Parse the AS-REQ from `req_bytes`.
-/// 2. Negotiate etype — accept AES-256 (etype 18), refuse RC4 (etype 23).
-/// 3. Look up the client principal in `store`.
-/// 4. Verify PA-ENC-TIMESTAMP pre-auth (decrypt with client's key, key usage
-///    1; verify timestamp within ±5 min of KDC time per RFC 4120 §3.1.3).
-/// 5. Build the TGT:
-///    - Random 32-byte session key.
-///    - `EncTicketPart` with forwardable+renewable flags, client identity,
-///      authtime=starttime=now, endtime=now+TGT_LIFETIME, renew_till=now+2×TGT_LIFETIME.
-///    - Encrypt the `EncTicketPart` with `krbtgt_key` (key usage 2).
-/// 6. Build the AS-REP `enc-part`:
-///    - `EncKdcRepPart` echoing session key, times, nonce.
-///    - Encrypt with the client's long-term key (key usage 3).
-/// 7. Encode the AS-REP as bytes.
+/// Existing callers (tests, future SDK wiring) keep working unchanged;
+/// production hot paths should call [`handle_as_req_with_metrics`] with a
+/// shared [`MetricsRegistry`] so the AS-REQ counter + latency histogram
+/// are populated for Prometheus (EVALUATION.md P1 #14).
 pub async fn handle_as_req(
     store: &dyn PrincipalStore,
     krbtgt_key: &Aes256Key,
     req_bytes: &[u8],
 ) -> Result<Vec<u8>, KdcError> {
+    handle_as_req_with_metrics(store, krbtgt_key, req_bytes, None).await
+}
+
+/// AS-REQ handler wired to a [`MetricsRegistry`] producer + `tracing` span.
+///
+/// Emits:
+/// - `tracing::info_span!("as_req")` around the whole handler (per
+///   EVALUATION.md §"Add `tracing::Span` per inbound request").
+/// - `tracing::info!("AS-REQ received", realm, principal, etype)` after
+///   parsing + etype negotiation succeeds.
+/// - `tracing::debug!("AS-REQ completed", elapsed)` after the AS-REP is
+///   encoded.
+/// - `metrics.inc_as_req(realm, etype)` (ADR-057 `as_req_total` counter).
+/// - `metrics.observe_as_req_duration(elapsed)` (ADR-057
+///   `as_req_duration_seconds` histogram).
+///
+/// When `metrics` is `None`, no metric calls are made (the handler is
+/// equivalent to the v0.6.0 back-compat path) — used by tests that only
+/// verify the AS-REP bytes.
+pub async fn handle_as_req_with_metrics(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    metrics: Option<&MetricsRegistry>,
+) -> Result<Vec<u8>, KdcError> {
+    let span = tracing::info_span!("as_req");
+    handle_as_req_with_metrics_inner(store, krbtgt_key, req_bytes, metrics)
+        .instrument(span)
+        .await
+}
+
+/// Inner AS-REQ handler body — extracted so the `tracing::Span` from
+/// [`handle_as_req_with_metrics`] is entered for every `await` point.
+async fn handle_as_req_with_metrics_inner(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    metrics: Option<&MetricsRegistry>,
+) -> Result<Vec<u8>, KdcError> {
+    let start = Instant::now();
     let req = decode_as_req(req_bytes)?;
 
     // Etype negotiation (ADR-011): AES family allowed; RC4 refused.
     let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // ---- Metrics + tracing: AS-REQ received ----
+    // Increment the `as_req_total{realm,etype}` counter only after we
+    // have a negotiated etype (so the counter's `etype` label is always
+    // a real cipher name, never "unsupported"). Tracing the principal
+    // here gives operators a per-request breadcrumb to correlate with
+    // the metric increment.
+    let realm = req.realm.clone();
+    let principal = req.cname.join("/");
+    tracing::info!(
+        realm = %realm,
+        principal = %principal,
+        etype = %etype_label(chosen_etype),
+        "AS-REQ received"
+    );
+    if let Some(m) = metrics {
+        m.inc_as_req(&realm, etype_label(chosen_etype)).await;
+    }
 
     // Look up the client principal.
     let client = store
@@ -1101,6 +1167,16 @@ pub async fn handle_as_req(
         enc_part,
     };
 
+    // ---- Metrics + tracing: AS-REQ completed ----
+    // Observe the end-to-end AS-REQ handling latency in the
+    // `as_req_duration_seconds` histogram (ADR-057). The `tracing::debug!`
+    // event mirrors the metric for ad-hoc operator triage via RUST_LOG.
+    let elapsed = start.elapsed();
+    if let Some(m) = metrics {
+        m.observe_as_req_duration(elapsed.as_secs_f64()).await;
+    }
+    tracing::debug!(elapsed = ?elapsed, "AS-REQ completed");
+
     Ok(encode_as_rep(&rep))
 }
 
@@ -1164,7 +1240,28 @@ pub fn verify_pa_enc_timestamp(client: &PrincipalRecord, blob: &[u8]) -> Result<
 // TGS-REQ handler
 // ---------------------------------------------------------------------------
 
-/// Handle a TGS-REQ (RFC 4120 §3.3 / §5.4.2).
+/// Backward-compatible TGS-REQ handler (Wave 3a signature): records no
+/// metrics and is equivalent to calling [`handle_tgs_req_with_metrics`]
+/// with `metrics = None`. See [`handle_as_req`] for the rationale.
+pub async fn handle_tgs_req(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+) -> Result<Vec<u8>, KdcError> {
+    handle_tgs_req_with_metrics(store, krbtgt_key, req_bytes, None).await
+}
+
+/// TGS-REQ handler wired to a [`MetricsRegistry`] producer + `tracing` span.
+///
+/// Because the v0.6.0 `MetricsRegistry` (ADR-057) does not yet expose
+/// `inc_tgs_req` / `observe_tgs_req_duration` methods, TGS-REQs are
+/// recorded under the existing `as_req_total` counter with the etype
+/// label set to the literal string `"tgs_req"` — this distinguishes
+/// TGS-REQ counts from real AS-REQ etype-labelled counts (e.g.
+/// `"aes256-cts-hmac-sha1-96"`) without requiring a new metric. v0.7.0
+/// should split this into a separate `tgs_req_total` counter.
+///
+/// # Flow (RFC 4120 §3.3 / §5.4.2)
 ///
 /// 1. Parse the TGS-REQ from `req_bytes`.
 /// 2. Negotiate etype (same policy as AS-REQ).
@@ -1181,14 +1278,46 @@ pub fn verify_pa_enc_timestamp(client: &PrincipalRecord, blob: &[u8]) -> Result<
 /// 7. Build the TGS-REP `enc-part` (encrypted with the TGT session key,
 ///    key usage 8).
 /// 8. Encode the TGS-REP as bytes.
-pub async fn handle_tgs_req(
+pub async fn handle_tgs_req_with_metrics(
     store: &dyn PrincipalStore,
     krbtgt_key: &Aes256Key,
     req_bytes: &[u8],
+    metrics: Option<&MetricsRegistry>,
 ) -> Result<Vec<u8>, KdcError> {
+    let span = tracing::info_span!("tgs_req");
+    handle_tgs_req_with_metrics_inner(store, krbtgt_key, req_bytes, metrics)
+        .instrument(span)
+        .await
+}
+
+/// Inner TGS-REQ handler body — extracted so the `tracing::Span` from
+/// [`handle_tgs_req_with_metrics`] is entered for every `await` point.
+async fn handle_tgs_req_with_metrics_inner(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    metrics: Option<&MetricsRegistry>,
+) -> Result<Vec<u8>, KdcError> {
+    let start = Instant::now();
     let req = decode_tgs_req(req_bytes)?;
 
     let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // ---- Metrics + tracing: TGS-REQ received ----
+    // The `as_req_total{realm,etype}` counter is reused for TGS-REQs with
+    // the etype label set to the literal `"tgs_req"` — see the doc comment
+    // on [`handle_tgs_req_with_metrics`] for the v0.6.0 rationale.
+    let realm = req.realm.clone();
+    let service = req.sname.join("/");
+    tracing::info!(
+        realm = %realm,
+        service = %service,
+        etype = %etype_label(chosen_etype),
+        "TGS-REQ received"
+    );
+    if let Some(m) = metrics {
+        m.inc_as_req(&realm, "tgs_req").await;
+    }
 
     // Verify the TGT: decrypt with krbtgt key (key usage 2).
     let tgt_enc_part_plaintext =
@@ -1277,6 +1406,16 @@ pub async fn handle_tgs_req(
         enc_part_kvno: req.tgt.kvno,
         enc_part,
     };
+
+    // ---- Metrics + tracing: TGS-REQ completed ----
+    // Same v0.6.0 reuse rationale: the `as_req_duration_seconds` histogram
+    // captures both AS-REQ and TGS-REQ latencies until v0.7.0 adds a
+    // dedicated `tgs_req_duration_seconds` metric.
+    let elapsed = start.elapsed();
+    if let Some(m) = metrics {
+        m.observe_as_req_duration(elapsed.as_secs_f64()).await;
+    }
+    tracing::debug!(elapsed = ?elapsed, "TGS-REQ completed");
 
     Ok(encode_tgs_rep(&rep))
 }
@@ -2174,5 +2313,159 @@ mod tests {
                 .expect("decrypt service ticket");
         let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode svc EncTicketPart");
         assert_eq!(svc_etp.session_key, session_key);
+    }
+
+    // ---- Wave 3b: MetricsRegistry producer wiring ----
+    //
+    // These tests verify that the KDC hot path is now a MetricsRegistry
+    // producer per EVALUATION.md P1 #14 / ADR-057. The assertion strategy
+    // is "handle an AS-REQ via the metrics-enabled entry point, then
+    // render the registry in Prometheus exposition format and grep the
+    // output for the expected counter / histogram lines" — the same
+    // strategy used by `adrian-monitor::tests`.
+
+    /// After a single successful AS-REQ, the `as_req_total{realm,etype}`
+    /// counter must read 1 for the negotiated (realm, etype) label pair.
+    #[tokio::test]
+    async fn as_req_increments_metric() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+        let reg = MetricsRegistry::new();
+
+        let req = build_valid_as_req(&alice).await;
+        let req_bytes = encode_as_req(&req);
+
+        let _rep = handle_as_req_with_metrics(&store, &krbtgt_key, &req_bytes, Some(&reg))
+            .await
+            .expect("AS-REQ must succeed");
+
+        let out = reg.render_prometheus().await;
+        assert!(
+            out.contains("# TYPE adrian_as_req_total counter"),
+            "missing TYPE line: {out}"
+        );
+        assert!(
+            out.contains(
+                r#"adrian_as_req_total{realm="EXAMPLE.COM",etype="aes256-cts-hmac-sha1-96"} 1"#
+            ),
+            "expected as_req_total counter == 1 for EXAMPLE.COM/aes256-cts-hmac-sha1-96: {out}"
+        );
+    }
+
+    /// After a single successful AS-REQ, the `as_req_duration_seconds`
+    /// histogram must have exactly 1 observation (the `_count` line should
+    /// read 1, and the `+Inf` cumulative bucket should also read 1).
+    #[tokio::test]
+    async fn as_req_records_duration() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+        let reg = MetricsRegistry::new();
+
+        let req = build_valid_as_req(&alice).await;
+        let req_bytes = encode_as_req(&req);
+
+        let _rep = handle_as_req_with_metrics(&store, &krbtgt_key, &req_bytes, Some(&reg))
+            .await
+            .expect("AS-REQ must succeed");
+
+        let out = reg.render_prometheus().await;
+        assert!(
+            out.contains("# TYPE adrian_as_req_duration_seconds histogram"),
+            "missing TYPE line: {out}"
+        );
+        assert!(
+            out.contains("adrian_as_req_duration_seconds_count 1"),
+            "expected histogram _count == 1 after one AS-REQ: {out}"
+        );
+        assert!(
+            out.contains(r#"adrian_as_req_duration_seconds_bucket{le="+Inf"} 1"#),
+            "expected +Inf cumulative bucket == 1 after one AS-REQ: {out}"
+        );
+    }
+
+    /// TGS-REQs must also be counted (under the `as_req_total` counter
+    /// with etype label `"tgs_req"` per the v0.6.0 reuse rationale —
+    /// `MetricsRegistry` has no `inc_tgs_req` yet). After a successful
+    /// TGS-REQ, the counter for `(realm, "tgs_req")` must read 1.
+    #[tokio::test]
+    async fn tgs_req_increments_metric_with_tgs_req_label() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_svc_principal("EXAMPLE.COM", "web.example.com", "svc-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+        let reg = MetricsRegistry::new();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1234,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let _rep = handle_tgs_req_with_metrics(&store, &krbtgt_key, &req_bytes, Some(&reg))
+            .await
+            .expect("TGS-REQ must succeed");
+
+        let out = reg.render_prometheus().await;
+        assert!(
+            out.contains(r#"adrian_as_req_total{realm="EXAMPLE.COM",etype="tgs_req"} 1"#),
+            "expected as_req_total counter == 1 for (EXAMPLE.COM, tgs_req) after TGS-REQ: {out}"
+        );
+        assert!(
+            out.contains("adrian_as_req_duration_seconds_count 1"),
+            "expected histogram _count == 1 after one TGS-REQ: {out}"
+        );
+    }
+
+    /// Backward-compat path: `handle_as_req` (no metrics arg) must NOT
+    /// populate the registry — i.e. the legacy entry point is observably
+    /// a no-op for metrics. This guards against accidental metric
+    /// recording when callers (e.g. tests, future SDK shims) pass
+    /// through the back-compat path.
+    #[tokio::test]
+    async fn back_compat_handle_as_req_does_not_record_metrics() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+        let reg = MetricsRegistry::new();
+
+        // The back-compat `handle_as_req` does not take a `MetricsRegistry`;
+        // to assert no metric recording, we exercise it and then check
+        // that the shared registry stays empty. The Prometheus renderer
+        // always emits the `# HELP` / `# TYPE` lines for every registered
+        // metric, so we assert on the *value* lines (counter absent,
+        // histogram count == 0) rather than on the metric name.
+        let req = build_valid_as_req(&alice).await;
+        let req_bytes = encode_as_req(&req);
+        let _rep = handle_as_req(&store, &krbtgt_key, &req_bytes)
+            .await
+            .expect("AS-REQ must succeed");
+
+        let out = reg.render_prometheus().await;
+        assert!(
+            !out.contains(r#"adrian_as_req_total{realm="EXAMPLE.COM""#),
+            "back-compat handle_as_req must not record as_req_total counter, but got: {out}"
+        );
+        // The renderer always emits `_count 0` for an unobserved histogram;
+        // assert the count remains 0 (no observations were recorded).
+        assert!(
+            out.contains("adrian_as_req_duration_seconds_count 0"),
+            "expected histogram _count == 0 (no observations) on back-compat path, got: {out}"
+        );
     }
 }

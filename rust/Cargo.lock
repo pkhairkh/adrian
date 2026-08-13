@@ -284,6 +284,7 @@ dependencies = [
  "adrian-hsm",
  "adrian-identity-core",
  "adrian-identity-fdb",
+ "adrian-monitor",
  "adrian-pac-validator",
  "adrian-schema-compiler",
  "adrian-schema-traits",
