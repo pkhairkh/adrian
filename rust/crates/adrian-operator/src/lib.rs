@@ -346,8 +346,8 @@ image: "{image}"
         image = spec.image,
     );
     // Render the StatefulSet + CRD + Service as YAML strings (pretty).
-    let statefulset_yaml =
-        serde_yaml::to_string(&generate_statefulset(spec)).unwrap_or_else(|e| format!("# error: {e}"));
+    let statefulset_yaml = serde_yaml::to_string(&generate_statefulset(spec))
+        .unwrap_or_else(|e| format!("# error: {e}"));
     let crd_yaml =
         serde_yaml::to_string(&crd_definition()).unwrap_or_else(|e| format!("# error: {e}"));
     let service_yaml = r#"apiVersion: v1
@@ -371,7 +371,10 @@ spec:
     let templates = vec![
         ("templates/statefulset.yaml".to_string(), statefulset_yaml),
         ("templates/crd.yaml".to_string(), crd_yaml),
-        ("templates/service.yaml".to_string(), service_yaml.to_string()),
+        (
+            "templates/service.yaml".to_string(),
+            service_yaml.to_string(),
+        ),
     ];
     HelmChart {
         chart_yaml,
@@ -596,10 +599,19 @@ mod tests {
         );
         let value = serialize_crd(&crd);
         // Verify the top-level fields are present with the expected keys.
-        assert_eq!(value.get("apiVersion").and_then(|v| v.as_str()), Some("adrian.io/v1"));
-        assert_eq!(value.get("kind").and_then(|v| v.as_str()), Some("DomainController"));
         assert_eq!(
-            value.get("metadata").and_then(|v| v.get("name")).and_then(|v| v.as_str()),
+            value.get("apiVersion").and_then(|v| v.as_str()),
+            Some("adrian.io/v1")
+        );
+        assert_eq!(
+            value.get("kind").and_then(|v| v.as_str()),
+            Some("DomainController")
+        );
+        assert_eq!(
+            value
+                .get("metadata")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str()),
             Some("adrian-dc")
         );
         // Verify the spec round-trips.
@@ -618,8 +630,14 @@ mod tests {
         // CustomResourceDefinition that registers the CRD with the
         // Kubernetes API server. Verify the schema is well-formed.
         let def = crd_definition();
-        assert_eq!(def.get("apiVersion").and_then(|v| v.as_str()), Some("apiextensions.k8s.io/v1"));
-        assert_eq!(def.get("kind").and_then(|v| v.as_str()), Some("CustomResourceDefinition"));
+        assert_eq!(
+            def.get("apiVersion").and_then(|v| v.as_str()),
+            Some("apiextensions.k8s.io/v1")
+        );
+        assert_eq!(
+            def.get("kind").and_then(|v| v.as_str()),
+            Some("CustomResourceDefinition")
+        );
         assert_eq!(
             def.get("metadata")
                 .and_then(|v| v.get("name"))
@@ -628,11 +646,23 @@ mod tests {
         );
         // Verify the spec group / names / scope / versions are present.
         let spec = def.get("spec").expect("CRD spec must be present");
-        assert_eq!(spec.get("group").and_then(|v| v.as_str()), Some("adrian.io"));
-        assert_eq!(spec.get("scope").and_then(|v| v.as_str()), Some("Namespaced"));
+        assert_eq!(
+            spec.get("group").and_then(|v| v.as_str()),
+            Some("adrian.io")
+        );
+        assert_eq!(
+            spec.get("scope").and_then(|v| v.as_str()),
+            Some("Namespaced")
+        );
         let names = spec.get("names").expect("CRD names must be present");
-        assert_eq!(names.get("kind").and_then(|v| v.as_str()), Some("DomainController"));
-        assert_eq!(names.get("plural").and_then(|v| v.as_str()), Some("domaincontrollers"));
+        assert_eq!(
+            names.get("kind").and_then(|v| v.as_str()),
+            Some("DomainController")
+        );
+        assert_eq!(
+            names.get("plural").and_then(|v| v.as_str()),
+            Some("domaincontrollers")
+        );
         // Verify the openAPIV3Schema includes the spec fields.
         let schema = spec
             .get("versions")
@@ -644,8 +674,17 @@ mod tests {
             .and_then(|v| v.get("spec"))
             .and_then(|v| v.get("properties"))
             .expect("openAPIV3Schema.spec.properties must be present");
-        for key in ["replicas", "domainDn", "krbtgtHsmKeyId", "fdbClusterFile", "image"] {
-            assert!(schema.get(key).is_some(), "openAPIV3Schema must include `{key}`");
+        for key in [
+            "replicas",
+            "domainDn",
+            "krbtgtHsmKeyId",
+            "fdbClusterFile",
+            "image",
+        ] {
+            assert!(
+                schema.get(key).is_some(),
+                "openAPIV3Schema must include `{key}`"
+            );
         }
     }
 
@@ -691,9 +730,9 @@ mod tests {
             .and_then(|v| v.get("env"))
             .and_then(|v| v.as_array())
             .expect("env array must be present");
-        let fdb_env = env.iter().find(|e| {
-            e.get("name").and_then(|n| n.as_str()) == Some("ADRIAN_FDB_CLUSTER_FILE")
-        });
+        let fdb_env = env
+            .iter()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("ADRIAN_FDB_CLUSTER_FILE"));
         let fdb_env = fdb_env.expect("ADRIAN_FDB_CLUSTER_FILE env var must be present");
         assert_eq!(
             fdb_env.get("value").and_then(|v| v.as_str()),
@@ -724,9 +763,18 @@ mod tests {
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.first())
             .expect("container must be present");
-        assert!(container.get("livenessProbe").is_some(), "livenessProbe required");
-        assert!(container.get("readinessProbe").is_some(), "readinessProbe required");
-        assert!(container.get("startupProbe").is_some(), "startupProbe required");
+        assert!(
+            container.get("livenessProbe").is_some(),
+            "livenessProbe required"
+        );
+        assert!(
+            container.get("readinessProbe").is_some(),
+            "readinessProbe required"
+        );
+        assert!(
+            container.get("startupProbe").is_some(),
+            "startupProbe required"
+        );
     }
 
     #[test]
@@ -743,8 +791,14 @@ mod tests {
         };
         let chart = generate_helm_chart(&spec);
         // Chart.yaml must contain the chart name + version.
-        assert!(chart.chart_yaml.contains("name: adrian-dc"), "Chart.yaml must contain name");
-        assert!(chart.chart_yaml.contains("apiVersion: v2"), "Chart.yaml must contain apiVersion");
+        assert!(
+            chart.chart_yaml.contains("name: adrian-dc"),
+            "Chart.yaml must contain name"
+        );
+        assert!(
+            chart.chart_yaml.contains("apiVersion: v2"),
+            "Chart.yaml must contain apiVersion"
+        );
         // values.yaml must contain the spec values.
         assert!(
             chart.values_yaml.contains("replicas: 3"),
@@ -757,8 +811,7 @@ mod tests {
         );
         // Templates: exactly 3 (statefulset, crd, service).
         assert_eq!(chart.templates.len(), 3, "expected 3 templates");
-        let template_names: Vec<&str> =
-            chart.templates.iter().map(|(n, _)| n.as_str()).collect();
+        let template_names: Vec<&str> = chart.templates.iter().map(|(n, _)| n.as_str()).collect();
         assert!(template_names.contains(&"templates/statefulset.yaml"));
         assert!(template_names.contains(&"templates/crd.yaml"));
         assert!(template_names.contains(&"templates/service.yaml"));
@@ -788,13 +841,19 @@ mod tests {
         // `type_` field is renamed to `type` via serde rename.
         assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("Ready"));
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("True"));
-        assert_eq!(json.get("reason").and_then(|v| v.as_str()), Some("AllReplicasReady"));
+        assert_eq!(
+            json.get("reason").and_then(|v| v.as_str()),
+            Some("AllReplicasReady")
+        );
         // lastTransitionTime must be a string (RFC 3339 date-time).
         let ltt = json
             .get("lastTransitionTime")
             .and_then(|v| v.as_str())
             .expect("lastTransitionTime must be present");
-        assert!(ltt.contains('T'), "lastTransitionTime must be RFC 3339: {ltt}");
+        assert!(
+            ltt.contains('T'),
+            "lastTransitionTime must be RFC 3339: {ltt}"
+        );
         // Must NOT contain `type_` (the Rust field name) — serde renamed it.
         let json_str = serde_json::to_string(&condition).expect("serialize condition");
         assert!(

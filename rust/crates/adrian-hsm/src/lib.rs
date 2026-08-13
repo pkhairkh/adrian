@@ -127,21 +127,13 @@ pub trait Hsm: Send + Sync {
     /// Generate a new key of the given type. The key is identified by `key_id`
     /// (caller-chosen, e.g. `"krbtgt"`); the returned `KeyHandle` records the
     /// initial `version = 1`.
-    async fn generate_key(
-        &self,
-        key_id: &str,
-        key_type: KeyType,
-    ) -> Result<KeyHandle, HsmError>;
+    async fn generate_key(&self, key_id: &str, key_type: KeyType) -> Result<KeyHandle, HsmError>;
 
     /// Sign `data` with the key identified by `key_handle`. For `HmacSha1`
     /// keys, returns the 12-byte HMAC-SHA1-96 truncation (RFC 3961 checksum
     /// profile). For `Aes256` keys, returns `Unsupported` (AES is not a
     /// signing algorithm).
-    async fn sign(
-        &self,
-        key_handle: &KeyHandle,
-        data: &[u8],
-    ) -> Result<Vec<u8>, HsmError>;
+    async fn sign(&self, key_handle: &KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError>;
 
     /// Verify a signature produced by `sign`. Returns `true` on success.
     async fn verify(
@@ -154,18 +146,11 @@ pub trait Hsm: Send + Sync {
     /// Encrypt `plaintext` with the key. For `Aes256` keys, returns
     /// `nonce[12] || ciphertext || tag[16]` (AES-256-GCM, empty AAD). For
     /// `HmacSha1` keys, returns `Unsupported`.
-    async fn encrypt(
-        &self,
-        key_handle: &KeyHandle,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, HsmError>;
+    async fn encrypt(&self, key_handle: &KeyHandle, plaintext: &[u8]) -> Result<Vec<u8>, HsmError>;
 
     /// Decrypt a ciphertext produced by `encrypt`. Returns the plaintext.
-    async fn decrypt(
-        &self,
-        key_handle: &KeyHandle,
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, HsmError>;
+    async fn decrypt(&self, key_handle: &KeyHandle, ciphertext: &[u8])
+        -> Result<Vec<u8>, HsmError>;
 
     /// Rotate the key identified by `key_id`: generate fresh key material,
     /// bump the version by 1, retain the same `id`. The previous key material
@@ -231,7 +216,7 @@ impl SoftwareHsm {
     /// Encrypt `plaintext` with AES-256-GCM under `key`. Returns
     /// `nonce[12] || ciphertext || tag[16]`.
     fn aes_256_gcm_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, HsmError> {
-        use ring::aead::{ Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM };
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
         let unbound = UnboundKey::new(&AES_256_GCM, key)
             .map_err(|_| HsmError::Crypto("AES-256-GCM key init failed".into()))?;
         // `LessSafeKey` (ring's name for the per-call-nonce API — NOT a
@@ -258,7 +243,7 @@ impl SoftwareHsm {
     /// Decrypt a `nonce[12] || ciphertext || tag[16]` blob produced by
     /// `aes_256_gcm_encrypt`.
     fn aes_256_gcm_decrypt(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, HsmError> {
-        use ring::aead::{ Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM };
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
         if ciphertext.len() < 12 + 16 {
             return Err(HsmError::Crypto("ciphertext too short".into()));
         }
@@ -294,11 +279,7 @@ impl Default for SoftwareHsm {
 
 #[async_trait]
 impl Hsm for SoftwareHsm {
-    async fn generate_key(
-        &self,
-        key_id: &str,
-        key_type: KeyType,
-    ) -> Result<KeyHandle, HsmError> {
+    async fn generate_key(&self, key_id: &str, key_type: KeyType) -> Result<KeyHandle, HsmError> {
         if key_type == KeyType::Rsa2048 {
             return Err(HsmError::Unsupported(
                 "RSA-2048 not implemented in SoftwareHsm (use hsm feature + PKCS#11)".into(),
@@ -319,11 +300,7 @@ impl Hsm for SoftwareHsm {
         })
     }
 
-    async fn sign(
-        &self,
-        key_handle: &KeyHandle,
-        data: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
+    async fn sign(&self, key_handle: &KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
         let keys = self.keys.read().await;
         let entry = keys
             .get(&key_handle.id)
@@ -368,11 +345,7 @@ impl Hsm for SoftwareHsm {
         Ok(diff == 0)
     }
 
-    async fn encrypt(
-        &self,
-        key_handle: &KeyHandle,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
+    async fn encrypt(&self, key_handle: &KeyHandle, plaintext: &[u8]) -> Result<Vec<u8>, HsmError> {
         let keys = self.keys.read().await;
         let entry = keys
             .get(&key_handle.id)
@@ -543,7 +516,9 @@ mod tests {
             "tampered signature must NOT verify"
         );
         assert!(
-            !hsm.verify(&kh, b"different data", &sig).await.expect("verify"),
+            !hsm.verify(&kh, b"different data", &sig)
+                .await
+                .expect("verify"),
             "wrong-data signature must NOT verify"
         );
     }
@@ -663,10 +638,9 @@ mod tests {
         let kh2 = hsm.generate_key("k2", KeyType::HmacSha1).await.unwrap();
         let hsm1 = hsm.clone();
         let hsm2 = hsm.clone();
-        let (r1, r2) = tokio::join!(
-            async move { hsm1.sign(&kh1, b"a").await },
-            async move { hsm2.sign(&kh2, b"b").await },
-        );
+        let (r1, r2) = tokio::join!(async move { hsm1.sign(&kh1, b"a").await }, async move {
+            hsm2.sign(&kh2, b"b").await
+        },);
         let s1 = r1.expect("sign k1");
         let s2 = r2.expect("sign k2");
         assert_eq!(s1.len(), 12);

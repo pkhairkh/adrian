@@ -232,9 +232,7 @@ pub unsafe extern "C" fn adrian_auth_token_free(handle: AuthTokenHandle) {
 ///   with `adrian_free_string`. Use-after-free is undefined behavior.
 #[no_mangle]
 #[allow(unsafe_code)]
-pub unsafe extern "C" fn adrian_auth_token_get_principal(
-    handle: AuthTokenHandle,
-) -> *const c_char {
+pub unsafe extern "C" fn adrian_auth_token_get_principal(handle: AuthTokenHandle) -> *const c_char {
     if handle.is_null() {
         return std::ptr::null();
     }

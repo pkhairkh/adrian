@@ -51,7 +51,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 0: Foundation crates (no internal deps — start here)
 
-- [ ] **T-001** [P0] Implement `adrian-storage-core` — `DirectoryStore` trait, `DirectoryTransaction` trait, `Key`/`Value`/`KeyRange` types, `DirectoryError` enum
+- [x] **T-001** [P0] Implement `adrian-storage-core` — `DirectoryStore` trait, `DirectoryTransaction` trait, `Key`/`Value`/`KeyRange` types, `DirectoryError` enum
   - **ADRs**: ADR-073
   - **Spec**: `specs/01-core-directory.md` §3
   - **Crates**: `adrian-storage-core`
@@ -59,7 +59,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 1 person-week
   - **DoD**: trait compiles, doc tests pass, `cargo doc` generates clean API docs
 
-- [ ] **T-002** [P0] Implement `adrian-sid` — `Sid` type, parse/serialize per MS-DTYP §2.4.2, SID-to-UUID conversion helpers
+- [x] **T-002** [P0] Implement `adrian-sid` — `Sid` type, parse/serialize per MS-DTYP §2.4.2, SID-to-UUID conversion helpers
   - **ADRs**: ADR-077 (RID pool + foreign security principals)
   - **Spec**: `specs/01-core-directory.md` §3
   - **Crates**: `adrian-sid`
@@ -67,7 +67,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 1 person-week
   - **DoD**: round-trip parse/format for all well-known SIDs, `proptest` bijectivity passes, `S-1-5-21-<domain>-<rid>` format validated
 
-- [ ] **T-003** [P0] Implement `adrian-schema-traits` — `AttributeSchema`, `ClassSchema`, `SchemaCache` trait
+- [x] **T-003** [P0] Implement `adrian-schema-traits` — `AttributeSchema`, `ClassSchema`, `SchemaCache` trait
   - **ADRs**: ADR-078 (hybrid schema model), ADR-003 (schema cache CoW)
   - **Spec**: `specs/01-core-directory.md` §3
   - **Crates**: `adrian-schema-traits`
@@ -77,7 +77,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 1: Abstraction crates (depend on Layer 0)
 
-- [ ] **T-004** [P0] Implement `adrian-storage-fdb` — `FdbDirectoryStore` impl of `DirectoryStore`, FDB subspace layout (0x01 objects, 0x02 linktable, 0x03 sdtable, 0x04 schemacache, 0x0D identity mapping)
+- [x] **T-004** [P0] Implement `adrian-storage-fdb` — `FdbDirectoryStore` impl of `DirectoryStore`, FDB subspace layout (0x01 objects, 0x02 linktable, 0x03 sdtable, 0x04 schemacache, 0x0D identity mapping)
   - **ADRs**: ADR-073 (FoundationDB as sole storage engine)
   - **Spec**: `specs/01-core-directory.md` §4
   - **Crates**: `adrian-storage-fdb`
@@ -85,7 +85,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 4 person-weeks
   - **DoD**: `get`/`put`/`delete`/`get_range` work against FDB 7.3+, 10K writes/sec on single node, transaction isolation validated, PITR via FDB `backup_agent` tested
 
-- [ ] **T-005** [P0] Implement `adrian-identity-core` — `IdentityMapping` trait (`uuid_to_sid`, `sid_to_uuid`, `uuid_to_uid`, `uid_to_uuid`), `PrincipalId` (UUIDv7)
+- [x] **T-005** [P0] Implement `adrian-identity-core` — `IdentityMapping` trait (`uuid_to_sid`, `sid_to_uuid`, `uuid_to_uid`, `uid_to_uuid`), `PrincipalId` (UUIDv7)
   - **ADRs**: ADR-110 (SID-to-UID mapping via UUID-primary)
   - **Spec**: `specs/01-core-directory.md` §3, `specs/08-client-sdk.md` §3
   - **Crates**: `adrian-identity-core`
@@ -93,7 +93,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 1 person-week
   - **DoD**: trait compiles, `uuid_to_uid` algorithm implemented `(uuid_to_u64(uuid) % (2^31 - 65536)) + 65536`, `proptest` validates determinism
 
-- [ ] **T-006** [P0] Implement `adrian-repl-core` — `Replicator` trait, `ReplicationPayload`, `UtdVector`, `InvocationId`, `ReplOperation` enum
+- [x] **T-006** [P0] Implement `adrian-repl-core` — `Replicator` trait, `ReplicationPayload`, `UtdVector`, `InvocationId`, `ReplOperation` enum
   - **ADRs**: ADR-070 (DRSUAPI server), ADR-071 (hybrid replication model)
   - **Spec**: `specs/01-core-directory.md` §3, §5
   - **Crates**: `adrian-repl-core`
@@ -103,7 +103,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 2: Domain implementation crates (depend on Layers 0-1)
 
-- [ ] **T-007** [P0] Implement `adrian-identity-fdb` — `FdbIdentityMapping` impl of `IdentityMapping`, stored in FDB subspace 0x0D
+- [x] **T-007** [P0] Implement `adrian-identity-fdb` — `FdbIdentityMapping` impl of `IdentityMapping`, stored in FDB subspace 0x0D
   - **ADRs**: ADR-110, ADR-077
   - **Spec**: `specs/01-core-directory.md` §4
   - **Crates**: `adrian-identity-fdb`
@@ -111,7 +111,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 2 person-weeks
   - **DoD**: bidirectional mapping stored, 99%+ cache hit rate, atomic `add_mapping` via FDB atomic-add, unique-index constraint enforced
 
-- [ ] **T-008** [P0] Implement `adrian-identity-ridpool` — RID pool allocator (500-RID batches for AD-interop mode, per-DC local counter for native mode)
+- [x] **T-008** [P0] Implement `adrian-identity-ridpool` — RID pool allocator (500-RID batches for AD-interop mode, per-DC local counter for native mode)
   - **ADRs**: ADR-077 (RID pool + foreign security principals)
   - **Spec**: `specs/01-core-directory.md` §4
   - **Crates**: `adrian-identity-ridpool`
@@ -119,7 +119,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 1.5 person-weeks
   - **DoD**: 500-RID batch allocation works, RID pool reclaim on DC removal works, RID uniqueness validated across 100K allocations
 
-- [ ] **T-009** [P0] Implement `adrian-drsuapi` — Fresh Rust DRSUAPI server (DRSBind, DRSUnbind, DRSGetNCChanges, DRSReplicaSync, DRSUpdateRefs)
+- [x] **T-009** [P0] Implement `adrian-drsuapi` — Fresh Rust DRSUAPI server (DRSBind, DRSUnbind, DRSGetNCChanges, DRSReplicaSync, DRSUpdateRefs)
   - **ADRs**: ADR-070
   - **Spec**: `specs/01-core-directory.md` §5
   - **Crates**: `adrian-drsuapi`
@@ -127,7 +127,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 6 person-weeks
   - **DoD**: DRSUAPI interface UUID `E3514235-8B63-11D0-A26C-00A0C92B955C` registered, opnum 3 (`DRSGetNCChanges`) returns valid `REPLENTIN_V3` packets, interop test against Windows Server 2022 DCDiag passes, `rasn` NDR encoding validated byte-identical
 
-- [ ] **T-010** [P0] Implement `adrian-raft` — openraft-based native replication (`RaftReplicator` impl of `Replicator`)
+- [x] **T-010** [P0] Implement `adrian-raft` — openraft-based native replication (`RaftReplicator` impl of `Replicator`)
   - **ADRs**: ADR-071 (hybrid replication model), ADR-076 (FSMO replacement via Raft)
   - **Spec**: `specs/01-core-directory.md` §5
   - **Crates**: `adrian-raft`
@@ -135,7 +135,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 4 person-weeks
   - **DoD**: 5-node Raft cluster forms, leader election <5s, log replication <1s p99, UTD vector synthesized from Raft log, `openraft` 0.9+ integrated
 
-- [ ] **T-011** [P0] Implement `adrian-schema-compiler` — LDAP schema → typed Rust projection at boot
+- [x] **T-011** [P0] Implement `adrian-schema-compiler` — LDAP schema → typed Rust projection at boot
   - **ADRs**: ADR-078 (hybrid schema model)
   - **Spec**: `specs/01-core-directory.md` §3, §4
   - **Crates**: `adrian-schema-compiler`
@@ -143,7 +143,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 3 person-weeks
   - **DoD**: reads Schema NC from FDB, generates Rust type stubs, `SchemaCache` populated at boot in <5s for a 1K-class schema, CoW invalidation via `schemaUpdateNow` works
 
-- [ ] **T-012** [P0] Implement `adrian-directory-service` — LDAP server + DSA (LDAPv3 read/write, RootDSE, schema validation, `member`/`memberOf` back-link)
+- [x] **T-012** [P0] Implement `adrian-directory-service` — LDAP server + DSA (LDAPv3 read/write, RootDSE, schema validation, `member`/`memberOf` back-link)
   - **ADRs**: ADR-002 (memberOf as DSA-computed back-link), ADR-073, ADR-074 (tombstones + Recycle Bin), ADR-076 (FSMO replacement)
   - **Spec**: `specs/01-core-directory.md` §5
   - **Crates**: `adrian-directory-service`
@@ -151,7 +151,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 5 person-weeks
   - **DoD**: LDAP bind + search + modify + add + delete work, `memberOf` computed on read, tombstones with 180-day lifetime, Recycle Bin (restore deleted object), FSMO roles emulated (Schema Master via FDB OCC, PDC Emulator via Raft leader, RID Master via per-DC counter, Infrastructure Master eliminated by identity mapping)
 
-- [ ] **T-013** [P0] Implement `adrian-dcerpc` — DCE/RPC transport layer (shared by DRSUAPI, SAMR, LSARPC, Netlogon, WCCE)
+- [x] **T-013** [P0] Implement `adrian-dcerpc` — DCE/RPC transport layer (shared by DRSUAPI, SAMR, LSARPC, Netlogon, WCCE)
   - **ADRs**: ADR-070, ADR-083 (PAC validation RPC)
   - **Spec**: `specs/01-core-directory.md` §5
   - **Crates**: `adrian-dcerpc`
@@ -161,7 +161,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 3: KDC + Auth (MVP preview mode)
 
-- [ ] **T-014** [P0] Implement `adrian-kdc` MVP preview — AS-REQ/TGS-REQ path, MS-KILE PAC generation (9 buffer types), AES-only etype, kpasswd, HSM-bound krbtgt
+- [x] **T-014** [P0] Implement `adrian-kdc` MVP preview — AS-REQ/TGS-REQ path, MS-KILE PAC generation (9 buffer types), AES-only etype, kpasswd, HSM-bound krbtgt
   - **ADRs**: ADR-011 (AES-256 default, RC4 disabled), ADR-015 (krbtgt HSM rotation), ADR-082 (MS-KILE PAC), ADR-019 (kpasswd), ADR-020 (gMSA KDS root key)
   - **Spec**: `specs/02-kdc.md` §3, §4, §5
   - **Crates**: `adrian-kdc`, `adrian-pac-validator`, `adrian-hsm`
@@ -169,7 +169,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 42 person-weeks (3 engineers × 14 weeks) — **the long pole**
   - **DoD**: AS-REQ/AS-REP + TGS-REQ/TGS-REP work, PAC with 9 buffer types (`PAC_LOGON_INFO`, `PAC_CREDENTIAL_TYPE`, `PAC_SIGNATURE_DATA` ×2, `PAC_CLIENT_INFO`, `UPN_DNS_INFO`, `PAC_REQUESTOR`, `PAC_BUFFER_TICKET_CHECKSUM`, `PAC_FULL_CHECKSUM`), AES-256-CTS-HMAC-SHA1-96 (etype 0x12) enforced, RC4-HMAC (0x17) refused, krbtgt key in HSM via `cryptoki`, 30-day auto-rotation with 2-key overlap, kpasswd (RFC 3244) on port 464, 5K AS-REQ/sec per instance, PAC byte-identity validated against Windows Server 2022
 
-- [ ] **T-015** [P0] Implement `adrian-kdc-interop` — MS-KILE conformance tests
+- [x] **T-015** [P0] Implement `adrian-kdc-interop` — MS-KILE conformance tests
   - **ADRs**: ADR-082, ADR-083 (PAC validation)
   - **Spec**: `specs/02-kdc.md` §8
   - **Crates**: `adrian-kdc-interop`
@@ -177,7 +177,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 3 person-weeks (parallel with T-014)
   - **DoD**: test suite runs against MIT krb5 1.21+, Heimdal 7.x, Windows Server 2022; PAC byte-identity proptest passes; AS-REQ/TGS-REQ cross-realm with AD works; fuzzing via `cargo fuzz` (100M iterations nightly)
 
-- [ ] **T-016** [P0] Implement `adrian-ntlm-client` — NTLMv2 client-only with channel binding + EPA
+- [x] **T-016** [P0] Implement `adrian-ntlm-client` — NTLMv2 client-only with channel binding + EPA
   - **ADRs**: ADR-085 (drop NTLM server), ADR-086 (PtH defense)
   - **Spec**: `specs/03-auth-provider.md` §3, §4
   - **Crates**: `adrian-ntlm-client`
@@ -185,7 +185,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 3 person-weeks
   - **DoD**: NTLMv2 challenge-response (Type 1/2/3 messages), RFC 5929 `tls-server-end-point` channel binding, EPA EPHEMERAL flag set, platform secure-credential-store via `keyring` crate, NTLM server-side rejected with `strongAuthRequired (8)`, NT hashes stored with `Zeroizing<Vec<u8>>` via `zeroize` crate, HSM-bound PEK for AD-interop NT hashes
 
-- [ ] **T-017** [P0] Implement `adrian-auth-core` — Unified `AuthContext` trait (Kerberos + NTLM + cert + OAuth2)
+- [x] **T-017** [P0] Implement `adrian-auth-core` — Unified `AuthContext` trait (Kerberos + NTLM + cert + OAuth2)
   - **ADRs**: ADR-021 (LDAP signing + channel binding), ADR-088 (unified token abstraction)
   - **Spec**: `specs/03-auth-provider.md` §3
   - **Crates**: `adrian-auth-core`
@@ -195,7 +195,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 3: Policy Engine (MVP)
 
-- [ ] **T-018** [P0] Implement `adrian-policy-core` — Declarative JSON policy format + ADMX compiler + PReg adapter
+- [x] **T-018** [P0] Implement `adrian-policy-core` — Declarative JSON policy format + ADMX compiler + PReg adapter
   - **ADRs**: ADR-029 (JSON canonical + PReg adapter), ADR-089 (declarative GPC/GPT synthesis), ADR-090 (ADMX-to-declarative compiler), ADR-094 (git-backed SYSVOL replication)
   - **Spec**: `specs/04-policy-engine.md` §3, §4
   - **Crates**: `adrian-policy-core`, `adrian-policy-preg`, `adrian-admx-compiler`
@@ -203,7 +203,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 4 person-weeks
   - **DoD**: canonical JSON policy format defined, ADMX XML parsed via `quick-xml`, PReg `Registry.pol` binary format written, GPC/GPT synthesized, SYSVOL as git repository (push/pull replication), ~60% GPO category coverage
 
-- [ ] **T-019** [P0] Implement `adrian-policy-executor` — Per-platform `PolicyExecutor` trait + Windows/macOS/Linux implementations
+- [x] **T-019** [P0] Implement `adrian-policy-executor` — Per-platform `PolicyExecutor` trait + Windows/macOS/Linux implementations
   - **ADRs**: ADR-024 (per-platform executors), ADR-092 (PolicyExecutor trait + synthetic Windows CSE)
   - **Spec**: `specs/04-policy-engine.md` §3
   - **Crates**: `adrian-policy-executor`
@@ -213,7 +213,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 3: Cert Service (MVP)
 
-- [ ] **T-020** [P0] Implement `adrian-acme-server` + `adrian-wcce-bridge` — ACME endpoint (RFC 8555) + MS-WCCE bridge for Windows autoenroll
+- [x] **T-020** [P0] Implement `adrian-acme-server` + `adrian-wcce-bridge` — ACME endpoint (RFC 8555) + MS-WCCE bridge for Windows autoenroll
   - **ADRs**: ADR-095 (ACME primary + MS-WCCE bridge)
   - **Spec**: `specs/05-cert-service.md` §3, §5
   - **Crates**: `adrian-acme-server`, `adrian-wcce-bridge`, `adrian-ca`
@@ -223,7 +223,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 3: File Gateway (MVP)
 
-- [ ] **T-021** [P0] Implement `adrian-smb-server` — Fresh Rust SMB 3.1.1 server (pre-auth integrity + AES-GCM, no SMB1)
+- [x] **T-021** [P0] Implement `adrian-smb-server` — Fresh Rust SMB 3.1.1 server (pre-auth integrity + AES-GCM, no SMB1)
   - **ADRs**: ADR-043 (drop SMB1), ADR-105 (fresh Rust SMB 3.1.1)
   - **Spec**: `specs/07-file-gateway.md` §3, §4, §5
   - **Crates**: `adrian-smb-server`, `adrian-smb-core`
@@ -231,7 +231,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 8 person-weeks (~15K lines) — **second-longest pole**
   - **DoD**: SMB 3.1.1 Negotiate + Session Setup + Tree Connect + Create + Read + Write + Close, SHA-512 pre-auth integrity, AES-256-GCM encryption, SMB1 Negotiate refused, signing required on all DC connections, MS-SRVS `NetShareEnum` RPC, share ACLs in registry, 10 Gbps read throughput
 
-- [ ] **T-022** [P0] Implement `adrian-print-service` — IPP Everywhere (RFC 8011), drop MS-RPRN
+- [x] **T-022** [P0] Implement `adrian-print-service` — IPP Everywhere (RFC 8011), drop MS-RPRN
   - **ADRs**: ADR-046 (drop MS-RPRN, adopt IPP Everywhere)
   - **Spec**: `specs/07-file-gateway.md` §5
   - **Crates**: `adrian-print-service`
@@ -241,7 +241,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 3: Client SDK (MVP)
 
-- [ ] **T-023** [P0] Implement `adrian-sdk` core + `adrian-sdk-c` (C ABI binding)
+- [x] **T-023** [P0] Implement `adrian-sdk` core + `adrian-sdk-c` (C ABI binding)
   - **ADRs**: ADR-107 (unified Rust core SDK), ADR-108 (SSPI-equivalent), ADR-109 (LDAP client), ADR-110 (SID-to-UID mapping), ADR-111 (ticket cache), ADR-049 (MIT krb5 client)
   - **Spec**: `specs/08-client-sdk.md` §3, §4
   - **Crates**: `adrian-sdk`, `adrian-sdk-c`
@@ -251,7 +251,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 3: Security (MVP blockers)
 
-- [ ] **T-024** [P0] Implement Kerberoasting mitigation — AES-only default + gMSA + detection rules
+- [x] **T-024** [P0] Implement Kerberoasting mitigation — AES-only default + gMSA + detection rules
   - **ADRs**: ADR-064 (Kerberoasting AES migration), ADR-011 (AES-256 default), ADR-020 (gMSA KDS root key)
   - **Spec**: `specs/11-security.md` §3
   - **Crates**: `adrian-kdc`, `adrian-hsm`
@@ -259,7 +259,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: included in T-014
   - **DoD**: RC4-HMAC refused by default, gMSA with HSM-bound KDS root key, 30-day gMSA password rotation, audit event on RC4 attempt, MITRE T1558.003 detection rule
 
-- [ ] **T-025** [P0] Implement golden ticket mitigation — HSM-bound krbtgt + 30-day rotation + 2-key overlap
+- [x] **T-025** [P0] Implement golden ticket mitigation — HSM-bound krbtgt + 30-day rotation + 2-key overlap
   - **ADRs**: ADR-065 (golden ticket krbtgt HSM), ADR-015 (krbtgt HSM rotation)
   - **Spec**: `specs/11-security.md` §3
   - **Crates**: `adrian-kdc`, `adrian-hsm`
@@ -267,7 +267,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: included in T-014
   - **DoD**: krbtgt key in HSM via PKCS#11 (`cryptoki`), 30-day auto-rotation, 2-key overlap (old key valid for 30 days), `rotate-krbtgt` CLI command, audit event on old-key TGT use (MITRE T1558.001 detection)
 
-- [ ] **T-026** [P0] Implement DCSync mitigation — native Raft mode eliminates EXOP_REPL_SECRETS; AD-interop per-call audit + HSM break-glass
+- [x] **T-026** [P0] Implement DCSync mitigation — native Raft mode eliminates EXOP_REPL_SECRETS; AD-interop per-call audit + HSM break-glass
   - **ADRs**: ADR-122 (DCSync mitigation)
   - **Spec**: `specs/11-security.md` §3
   - **Crates**: `adrian-drsuapi`, `adrian-raft`, `adrian-hsm`
@@ -277,7 +277,7 @@ This file is the **single source of truth** for all implementation work on the A
 
 ### Layer 4: Operations (MVP minimum-viable)
 
-- [ ] **T-027** [P0] Implement `adrian-cli` — Unified cross-platform CLI
+- [x] **T-027** [P0] Implement `adrian-cli` — Unified cross-platform CLI
   - **ADRs**: ADR-063 (unified CLI)
   - **Spec**: `specs/10-operations.md` §3
   - **Crates**: `adrian-cli`
@@ -285,7 +285,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 2 person-weeks
   - **DoD**: `adrian-cli join`, `adrian-cli auth`, `adrian-cli policy apply`, `adrian-cli cert enroll`, `adrian-cli file mount`, `adrian-cli kdc rotate-krbtgt`, static binary, `clap` for CLI parsing
 
-- [ ] **T-028** [P0] Implement `adrian-monitor` — Prometheus exporter + OpenTelemetry audit
+- [x] **T-028** [P0] Implement `adrian-monitor` — Prometheus exporter + OpenTelemetry audit
   - **ADRs**: ADR-057 (Prometheus + OTel), ADR-060 (structured audit OTel)
   - **Spec**: `specs/10-operations.md` §3
   - **Crates**: `adrian-monitor`
@@ -293,7 +293,7 @@ This file is the **single source of truth** for all implementation work on the A
   - **Effort**: 2 person-weeks
   - **DoD**: per-DC Prometheus sidecar (AS-REQ rate, TGS-REQ rate, LDAP latency, FDB op rate, replication lag), OTel log records for all audit events, MITRE ATT&CK mapping in audit schema
 
-- [ ] **T-029** [P0] Implement `adrian-operator` — Kubernetes operator + `DomainController` CRD
+- [x] **T-029** [P0] Implement `adrian-operator` — Kubernetes operator + `DomainController` CRD
   - **ADRs**: ADR-058 (container-native DCs + operator)
   - **Spec**: `specs/10-operations.md` §3
   - **Crates**: `adrian-operator`

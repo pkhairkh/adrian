@@ -69,8 +69,8 @@
 #![warn(missing_docs)]
 
 use adrian_repl_core::{
-    ConflictRecord, InvocationId, NcHead, ReplicationError, ReplicationPayload, Replicator,
-    Resolution, ReplOperation, UtdDelta, UtdVector, UtdVectorEntry, Usn,
+    ConflictRecord, InvocationId, NcHead, ReplOperation, ReplicationError, ReplicationPayload,
+    Replicator, Resolution, Usn, UtdDelta, UtdVector, UtdVectorEntry,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -541,17 +541,13 @@ impl ManualRaftReplicator {
     /// Read the local node's `voted_for` (test/diagnostic helper).
     pub async fn voted_for(&self) -> Option<Uuid> {
         let nodes = self.nodes.read().await;
-        nodes
-            .get(&self.local_node_id)
-            .and_then(|s| s.voted_for)
+        nodes.get(&self.local_node_id).and_then(|s| s.voted_for)
     }
 
     /// Read the local node's `leader_id` (test/diagnostic helper).
     pub async fn leader_id(&self) -> Option<Uuid> {
         let nodes = self.nodes.read().await;
-        nodes
-            .get(&self.local_node_id)
-            .and_then(|s| s.leader_id)
+        nodes.get(&self.local_node_id).and_then(|s| s.leader_id)
     }
 }
 
@@ -969,7 +965,9 @@ mod tests {
             term,
             index,
             origin_invocation_id,
-            ReplOperation::TombstoneGC { cutoff: index * 100 },
+            ReplOperation::TombstoneGC {
+                cutoff: index * 100,
+            },
         )
     }
 
@@ -1145,7 +1143,12 @@ mod tests {
             dummy_entry(2, 5, inv_b),
         ];
         let v = synthesize_utd_vector(&log, dummy_invocation_id());
-        assert_eq!(v.entries.len(), 2, "expected 2 cursors, got {:?}", v.entries);
+        assert_eq!(
+            v.entries.len(),
+            2,
+            "expected 2 cursors, got {:?}",
+            v.entries
+        );
         for e in &v.entries {
             if e.invocation_id == inv_a {
                 assert_eq!(e.highest_usn, 2);
@@ -1359,7 +1362,9 @@ mod tests {
         // Per Raft §5.4.1 step 2 — if term > currentTerm, update currentTerm
         // and reset voted_for. Then step 3 grants vote freely.
         let repl = ManualRaftReplicator::new(dummy_invocation_id());
-        repl.vote(1, dummy_invocation_id_b(), 0, 0).await.expect("first vote");
+        repl.vote(1, dummy_invocation_id_b(), 0, 0)
+            .await
+            .expect("first vote");
         let res = repl
             .vote(2, Uuid::from_u128(0x_44), 0, 0)
             .await
@@ -1530,7 +1535,11 @@ mod tests {
             .get_changes(NcHead::nil(), &cursor)
             .await
             .expect("get_changes");
-        assert_eq!(payload.operations.len(), 1, "should return 1 entry past cursor");
+        assert_eq!(
+            payload.operations.len(),
+            1,
+            "should return 1 entry past cursor"
+        );
         assert_eq!(payload.highest_usn, 2);
     }
 
@@ -1570,7 +1579,9 @@ mod tests {
     async fn raft_directory_replicator_sync_metadata_succeeds_stub() {
         let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
         let repl = RaftDirectoryReplicator::new(dummy_invocation_id(), store, "c");
-        repl.sync_metadata("partner-dc").await.expect("sync_metadata");
+        repl.sync_metadata("partner-dc")
+            .await
+            .expect("sync_metadata");
     }
 
     #[test]

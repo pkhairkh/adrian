@@ -124,14 +124,8 @@ impl SchemaCompiler {
             "// schema_generation: {}\n",
             projection.generation
         ));
-        out.push_str(&format!(
-            "// schema_nc_head: {}\n",
-            self.schema_nc_head
-        ));
-        out.push_str(&format!(
-            "// attributes: {}\n",
-            projection.attributes.len()
-        ));
+        out.push_str(&format!("// schema_nc_head: {}\n", self.schema_nc_head));
+        out.push_str(&format!("// attributes: {}\n", projection.attributes.len()));
         out.push_str(&format!("// classes: {}\n\n", projection.classes.len()));
 
         out.push_str("pub static ATTRIBUTE_IDS: &[(u32, &str)] = &[\n");
@@ -166,7 +160,8 @@ impl SchemaCompiler {
 /// during unit tests). Per MS-ADTS §3.1.1.3, the schema NC head is created
 /// at forest promotion; this UUID is deterministic so tests are
 /// reproducible.
-pub const WELL_KNOWN_SCHEMA_NC_HEAD: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_07D8);
+pub const WELL_KNOWN_SCHEMA_NC_HEAD: Uuid =
+    Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_07D8);
 
 /// The well-known DN of the Schema NC head (per MS-ADTS §3.1.1.3.2.6 —
 /// `CN=Schema,CN=Configuration,<domain-dn>`).
@@ -174,7 +169,8 @@ pub const SCHEMA_NC_DN: &str = "CN=Schema,CN=Configuration,DC=adrian,DC=example,
 
 /// The well-known DN of the Aggregate (per ADR-003 — where
 /// `schemaCacheGeneration` is exposed for monitoring).
-pub const AGGREGATE_DN: &str = "CN=Aggregate,CN=Schema,CN=Configuration,DC=adrian,DC=example,DC=com";
+pub const AGGREGATE_DN: &str =
+    "CN=Aggregate,CN=Schema,CN=Configuration,DC=adrian,DC=example,DC=com";
 
 /// Read the schema NC head UUID from the directory config subspace (per
 /// ADR-003 — the schema NC head UUID is read at boot from a well-known
@@ -309,10 +305,8 @@ impl SchemaProjectionExt for SchemaProjection {
         let mut may_contain: std::collections::HashSet<AttributeId> =
             std::collections::HashSet::new();
 
-        let mut visited: std::collections::HashSet<ClassId> =
-            std::collections::HashSet::new();
-        let mut queue: std::collections::VecDeque<ClassId> =
-            std::collections::VecDeque::new();
+        let mut visited: std::collections::HashSet<ClassId> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<ClassId> = std::collections::VecDeque::new();
         for name in &object_class_values {
             if let Some(&cid) = self.class_name_to_id.get(&name.to_ascii_lowercase()) {
                 queue.push_back(cid);
@@ -498,27 +492,129 @@ pub fn minimal_schema() -> SchemaProjection {
     // AD-interop only requires the `ldapDisplayName` strings to match.
     let attr_defs: &[(AttributeId, &str, AttributeSyntax, bool, bool)] = &[
         // (id, ldap_name, syntax, is_single_valued, is_linked)
-        (0x10_000, "cn", AttributeSyntax::DirectoryString, false, false),
-        (0x10_001, "name", AttributeSyntax::DirectoryString, true, false),
+        (
+            0x10_000,
+            "cn",
+            AttributeSyntax::DirectoryString,
+            false,
+            false,
+        ),
+        (
+            0x10_001,
+            "name",
+            AttributeSyntax::DirectoryString,
+            true,
+            false,
+        ),
         (0x10_002, "objectClass", AttributeSyntax::Oid, false, false),
         (0x10_003, "member", AttributeSyntax::Dn, false, true),
         (0x10_004, "memberOf", AttributeSyntax::Dn, false, true),
         (0x10_005, "objectSid", AttributeSyntax::Sid, true, false),
-        (0x10_006, "objectGUID", AttributeSyntax::OctetString, true, false),
-        (0x10_007, "sAMAccountName", AttributeSyntax::DirectoryString, true, false),
-        (0x10_008, "userPrincipalName", AttributeSyntax::DirectoryString, true, false),
-        (0x10_009, "distinguishedName", AttributeSyntax::Dn, true, true),
-        (0x10_00A, "whenCreated", AttributeSyntax::GeneralizedTime, true, false),
-        (0x10_00B, "whenChanged", AttributeSyntax::GeneralizedTime, true, false),
-        (0x10_00C, "description", AttributeSyntax::DirectoryString, false, false),
-        (0x10_00D, "nTSecurityDescriptor", AttributeSyntax::SecurityDescriptor, true, false),
-        (0x10_00E, "instanceType", AttributeSyntax::Integer, true, false),
-        (0x10_00F, "systemFlags", AttributeSyntax::Integer, true, false),
-        (0x10_010, "sn", AttributeSyntax::DirectoryString, false, false),
-        (0x10_011, "givenName", AttributeSyntax::DirectoryString, false, false),
-        (0x10_012, "displayName", AttributeSyntax::DirectoryString, false, false),
-        (0x10_013, "userAccountControl", AttributeSyntax::Integer, true, false),
-        (0x10_014, "primaryGroupID", AttributeSyntax::Integer, true, false),
+        (
+            0x10_006,
+            "objectGUID",
+            AttributeSyntax::OctetString,
+            true,
+            false,
+        ),
+        (
+            0x10_007,
+            "sAMAccountName",
+            AttributeSyntax::DirectoryString,
+            true,
+            false,
+        ),
+        (
+            0x10_008,
+            "userPrincipalName",
+            AttributeSyntax::DirectoryString,
+            true,
+            false,
+        ),
+        (
+            0x10_009,
+            "distinguishedName",
+            AttributeSyntax::Dn,
+            true,
+            true,
+        ),
+        (
+            0x10_00A,
+            "whenCreated",
+            AttributeSyntax::GeneralizedTime,
+            true,
+            false,
+        ),
+        (
+            0x10_00B,
+            "whenChanged",
+            AttributeSyntax::GeneralizedTime,
+            true,
+            false,
+        ),
+        (
+            0x10_00C,
+            "description",
+            AttributeSyntax::DirectoryString,
+            false,
+            false,
+        ),
+        (
+            0x10_00D,
+            "nTSecurityDescriptor",
+            AttributeSyntax::SecurityDescriptor,
+            true,
+            false,
+        ),
+        (
+            0x10_00E,
+            "instanceType",
+            AttributeSyntax::Integer,
+            true,
+            false,
+        ),
+        (
+            0x10_00F,
+            "systemFlags",
+            AttributeSyntax::Integer,
+            true,
+            false,
+        ),
+        (
+            0x10_010,
+            "sn",
+            AttributeSyntax::DirectoryString,
+            false,
+            false,
+        ),
+        (
+            0x10_011,
+            "givenName",
+            AttributeSyntax::DirectoryString,
+            false,
+            false,
+        ),
+        (
+            0x10_012,
+            "displayName",
+            AttributeSyntax::DirectoryString,
+            false,
+            false,
+        ),
+        (
+            0x10_013,
+            "userAccountControl",
+            AttributeSyntax::Integer,
+            true,
+            false,
+        ),
+        (
+            0x10_014,
+            "primaryGroupID",
+            AttributeSyntax::Integer,
+            true,
+            false,
+        ),
         (0x10_015, "groupType", AttributeSyntax::Integer, true, false),
         (0x10_016, "managedBy", AttributeSyntax::Dn, true, true),
         (0x10_017, "managedObjects", AttributeSyntax::Dn, false, true),
@@ -563,8 +659,20 @@ pub fn minimal_schema() -> SchemaProjection {
     // Add the additional attributes referenced by the minimal classes
     // that weren't in the original list (`ou`, `dc`).
     let extra_attrs: &[(AttributeId, &str, AttributeSyntax, bool, bool)] = &[
-        (0x10_01A, "ou", AttributeSyntax::DirectoryString, false, false),
-        (0x10_01B, "dc", AttributeSyntax::DirectoryString, true, false),
+        (
+            0x10_01A,
+            "ou",
+            AttributeSyntax::DirectoryString,
+            false,
+            false,
+        ),
+        (
+            0x10_01B,
+            "dc",
+            AttributeSyntax::DirectoryString,
+            true,
+            false,
+        ),
     ];
     for &(id, name, syntax, is_single_valued, is_linked) in extra_attrs {
         attributes.insert(
@@ -597,7 +705,12 @@ pub fn minimal_schema() -> SchemaProjection {
             "top",
             &[],
             &["objectClass", "cn", "instanceType"],
-            &["nTSecurityDescriptor", "whenCreated", "whenChanged", "systemFlags"],
+            &[
+                "nTSecurityDescriptor",
+                "whenCreated",
+                "whenChanged",
+                "systemFlags",
+            ],
             SystemFlags::DISALLOW_DELETE.bits(),
             3, // abstract
         ),
@@ -884,7 +997,14 @@ mod tests {
     fn minimal_schema_includes_core_classes() {
         let proj = minimal_schema();
         assert!(proj.classes.len() >= 6, "got {}", proj.classes.len());
-        for name in &["top", "person", "user", "group", "organizationalunit", "domaindns"] {
+        for name in &[
+            "top",
+            "person",
+            "user",
+            "group",
+            "organizationalunit",
+            "domaindns",
+        ] {
             assert!(
                 proj.class_name_to_id.contains_key(*name),
                 "missing class: {}",
@@ -897,8 +1017,16 @@ mod tests {
     fn minimal_schema_includes_core_attributes() {
         let proj = minimal_schema();
         for name in &[
-            "cn", "name", "objectclass", "member", "memberof", "objectsid",
-            "objectguid", "samaccountname", "userprincipalname", "distinguishedname",
+            "cn",
+            "name",
+            "objectclass",
+            "member",
+            "memberof",
+            "objectsid",
+            "objectguid",
+            "samaccountname",
+            "userprincipalname",
+            "distinguishedname",
         ] {
             assert!(
                 proj.attribute_name_to_id.contains_key(*name),
@@ -1112,7 +1240,9 @@ mod tests {
         // a real (in-memory) DirectoryStore implementation, not just the
         // stub.
         let store = InMemoryDirectoryStore::new();
-        let projection = SchemaProjection::compile_from_directory(&store).await.unwrap();
+        let projection = SchemaProjection::compile_from_directory(&store)
+            .await
+            .unwrap();
         assert!(projection.generation >= 1);
         assert!(projection.attributes.len() >= 16);
     }

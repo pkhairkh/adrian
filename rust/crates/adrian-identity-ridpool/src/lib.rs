@@ -206,14 +206,8 @@ impl RidBackend {
     /// error for the FDB path when the `fdb` feature is not enabled.
     async fn begin_write(&self) -> Result<Box<dyn WriteTxn>, IdentityError> {
         match self {
-            Self::Fdb(s) => s
-                .begin_write()
-                .await
-                .map_err(map_storage_err),
-            Self::InMemory(s) => s
-                .begin_write()
-                .await
-                .map_err(map_storage_err),
+            Self::Fdb(s) => s.begin_write().await.map_err(map_storage_err),
+            Self::InMemory(s) => s.begin_write().await.map_err(map_storage_err),
         }
     }
 
@@ -228,10 +222,7 @@ impl RidBackend {
 
     /// Range-scan the backend for keys with the given prefix. Returns a
     /// `Backend` error for the FDB path when the `fdb` feature is not enabled.
-    async fn scan_prefix(
-        &self,
-        prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, IdentityError> {
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, IdentityError> {
         let r = self.begin_read().await?;
         let mut end = prefix.to_vec();
         // strinc: increment the last byte; if it would overflow (0xFF),
@@ -864,9 +855,17 @@ mod tests {
         let allocator = FdbRidPoolAllocator::new(adrian_storage_fdb::FdbDirectoryStore::new(None));
         let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
         let result = allocator.allocate(&domain_sid).await;
-        assert!(result.is_ok(), "allocate must succeed via in-memory fallback: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "allocate must succeed via in-memory fallback: {:?}",
+            result.err()
+        );
         let rid = result.unwrap();
-        assert!(rid >= 1000, "first allocated RID must be >= INITIAL_RID (1000), got {}", rid);
+        assert!(
+            rid >= 1000,
+            "first allocated RID must be >= INITIAL_RID (1000), got {}",
+            rid
+        );
     }
 
     #[tokio::test]
@@ -874,7 +873,11 @@ mod tests {
         let allocator = FdbRidPoolAllocator::new(adrian_storage_fdb::FdbDirectoryStore::new(None));
         let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
         let result = allocator.allocate_batch(&domain_sid, 500).await;
-        assert!(result.is_ok(), "allocate_batch must succeed via in-memory fallback: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "allocate_batch must succeed via in-memory fallback: {:?}",
+            result.err()
+        );
         let rids = result.unwrap();
         assert_eq!(rids.len(), 500);
         // RIDs must be strictly increasing and contiguous.
@@ -890,9 +893,16 @@ mod tests {
         // Allocate first to populate state.
         allocator.allocate(&domain_sid).await.unwrap();
         let result = allocator.state(&domain_sid).await;
-        assert!(result.is_ok(), "state must succeed via in-memory fallback: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "state must succeed via in-memory fallback: {:?}",
+            result.err()
+        );
         let state = result.unwrap();
-        assert!(state.next_rid >= 1001, "next_rid must have advanced past INITIAL_RID after one allocation");
+        assert!(
+            state.next_rid >= 1001,
+            "next_rid must have advanced past INITIAL_RID after one allocation"
+        );
     }
 
     #[tokio::test]
@@ -905,7 +915,11 @@ mod tests {
         let r1 = allocator.allocate(&domain_sid).await;
         assert!(r1.is_ok(), "allocate must succeed: {:?}", r1.err());
         let batch = allocator.allocate_batch(&domain_sid, 10).await;
-        assert!(batch.is_ok(), "allocate_batch must succeed: {:?}", batch.err());
+        assert!(
+            batch.is_ok(),
+            "allocate_batch must succeed: {:?}",
+            batch.err()
+        );
         assert_eq!(batch.unwrap().len(), 10);
         let st = allocator.state(&domain_sid).await;
         assert!(st.is_ok(), "state must succeed: {:?}", st.err());
@@ -918,7 +932,11 @@ mod tests {
         ));
         let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
         let result = assign_sid(allocator.as_ref(), &domain_sid, Uuid::nil()).await;
-        assert!(result.is_ok(), "assign_sid must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "assign_sid must succeed: {:?}",
+            result.err()
+        );
         let sid = result.unwrap();
         assert_eq!(sid.domain_sid(), Some(domain_sid));
     }
@@ -1133,7 +1151,10 @@ mod tests {
         let assigned = assign_sid(&allocator, &domain_sid, principal_uuid)
             .await
             .unwrap();
-        assert_eq!(assigned.sub_authorities, vec![21, 100, 200, 300, INITIAL_RID]);
+        assert_eq!(
+            assigned.sub_authorities,
+            vec![21, 100, 200, 300, INITIAL_RID]
+        );
         assert_eq!(assigned.rid(), Some(INITIAL_RID));
         // The domain SID of the assigned SID must match the input domain SID.
         assert_eq!(assigned.domain_sid().unwrap(), domain_sid);
@@ -1143,8 +1164,12 @@ mod tests {
     async fn assign_sid_consecutive_calls_produce_distinct_sids() {
         let allocator = FdbRidPoolAllocator::new_in_memory_default();
         let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
-        let s1 = assign_sid(&allocator, &domain_sid, Uuid::nil()).await.unwrap();
-        let s2 = assign_sid(&allocator, &domain_sid, Uuid::nil()).await.unwrap();
+        let s1 = assign_sid(&allocator, &domain_sid, Uuid::nil())
+            .await
+            .unwrap();
+        let s2 = assign_sid(&allocator, &domain_sid, Uuid::nil())
+            .await
+            .unwrap();
         assert_ne!(s1, s2);
         assert_eq!(s1.rid(), Some(INITIAL_RID));
         assert_eq!(s2.rid(), Some(INITIAL_RID + 1));

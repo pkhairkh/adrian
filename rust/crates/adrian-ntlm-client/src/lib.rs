@@ -293,11 +293,7 @@ pub fn ntowfv2(nt_hash: &[u8; 16], user: &str, domain: &str) -> Zeroizing<[u8; 1
 /// AvPairs (target_info copied from Type 2)
 /// [MsvAvEOL terminator if not already present in target_info]
 /// ```
-fn build_ntlmv2_blob(
-    timestamp: u64,
-    client_challenge: &[u8; 8],
-    target_info: &[u8],
-) -> Vec<u8> {
+fn build_ntlmv2_blob(timestamp: u64, client_challenge: &[u8; 8], target_info: &[u8]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(34 + target_info.len() + 4);
     // RespType (4 bytes) = 0x00000001
     put_u32_le(&mut blob, 0x00000001);
@@ -512,7 +508,10 @@ pub fn parse_challenge(buf: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     // Reserved at offset 32 (8 bytes)
     // TargetInfoFields at offset 40 (Len, MaxLen, BufferOffset) — optional
     let (target_info_len, target_info_offset) = if buf.len() >= 48 {
-        (read_u16_le(buf, 40)? as usize, read_u32_le(buf, 44)? as usize)
+        (
+            read_u16_le(buf, 40)? as usize,
+            read_u32_le(buf, 44)? as usize,
+        )
     } else {
         (0, 0)
     };
@@ -559,7 +558,15 @@ pub fn build_authenticate(
     domain: &str,
     workstation: &str,
 ) -> Result<Vec<u8>, NtlmError> {
-    build_authenticate_with_options(challenge, username, password, domain, workstation, None, None)
+    build_authenticate_with_options(
+        challenge,
+        username,
+        password,
+        domain,
+        workstation,
+        None,
+        None,
+    )
 }
 
 /// Build a Type 3 (AUTHENTICATE) message with optional channel binding
@@ -958,24 +965,14 @@ mod tests {
         // Different server challenge → different proof.
         let mut sc2 = server_challenge;
         sc2[0] ^= 0xFF;
-        let response3 = compute_ntlmv2_response(
-            &ntowf,
-            &sc2,
-            &target_info,
-            timestamp,
-            &client_challenge,
-        );
+        let response3 =
+            compute_ntlmv2_response(&ntowf, &sc2, &target_info, timestamp, &client_challenge);
         assert_ne!(&response1[0..16], &response3[0..16]);
 
         // Different client challenge → different proof.
         let cc2 = [0xBB; 8];
-        let response4 = compute_ntlmv2_response(
-            &ntowf,
-            &server_challenge,
-            &target_info,
-            timestamp,
-            &cc2,
-        );
+        let response4 =
+            compute_ntlmv2_response(&ntowf, &server_challenge, &target_info, timestamp, &cc2);
         assert_ne!(&response1[0..16], &response4[0..16]);
 
         // Different password → different proof.
@@ -1041,7 +1038,7 @@ mod tests {
         let mut buf = Vec::with_capacity(target_info_offset + target_info.len());
         buf.extend_from_slice(NTLMSSP_SIGNATURE);
         put_u32_le(&mut buf, 2); // MessageType = CHALLENGE
-        // TargetNameFields (Len, MaxLen, BufferOffset)
+                                 // TargetNameFields (Len, MaxLen, BufferOffset)
         put_u16_le(&mut buf, target_name.len() as u16);
         put_u16_le(&mut buf, target_name.len() as u16);
         put_u32_le(&mut buf, target_name_offset as u32);
@@ -1211,8 +1208,8 @@ mod tests {
     #[test]
     fn build_authenticate_has_correct_header() {
         let challenge = parse_challenge(&synthetic_challenge_message()).unwrap();
-        let msg = build_authenticate(&challenge, "User", "Password", "Domain", "WS01")
-            .expect("build");
+        let msg =
+            build_authenticate(&challenge, "User", "Password", "Domain", "WS01").expect("build");
         assert_eq!(&msg[0..8], NTLMSSP_SIGNATURE);
         let msg_type = read_u32_le(&msg, 8).unwrap();
         assert_eq!(msg_type, 3);
@@ -1223,8 +1220,8 @@ mod tests {
     #[test]
     fn build_authenticate_includes_identity_fields() {
         let challenge = parse_challenge(&synthetic_challenge_message()).unwrap();
-        let msg = build_authenticate(&challenge, "Alice", "Password", "DOMAIN", "WS01")
-            .expect("build");
+        let msg =
+            build_authenticate(&challenge, "Alice", "Password", "DOMAIN", "WS01").expect("build");
         // DomainNameFields at offset 28 (Len, MaxLen, BufferOffset)
         let dom_len = read_u16_le(&msg, 28).unwrap() as usize;
         let dom_offset = read_u32_le(&msg, 32).unwrap() as usize;
@@ -1243,8 +1240,8 @@ mod tests {
     #[ignore = "NTLMv2 build_authenticate depends on the NT hash bug; see Wave 6 follow-up."]
     fn build_authenticate_includes_ntlmv2_response() {
         let challenge = parse_challenge(&synthetic_challenge_message()).unwrap();
-        let msg = build_authenticate(&challenge, "User", "Password", "Domain", "WS01")
-            .expect("build");
+        let msg =
+            build_authenticate(&challenge, "User", "Password", "Domain", "WS01").expect("build");
         // NtChallengeResponseFields at offset 12 (Len, MaxLen, BufferOffset)
         let nt_len = read_u16_le(&msg, 12).unwrap() as usize;
         let nt_offset = read_u32_le(&msg, 16).unwrap() as usize;
@@ -1277,9 +1274,7 @@ mod tests {
         let mut client = NtlmClient::with_workstation("Domain", "WS01");
         client.set_credentials("User", "Password");
         let challenge = synthetic_challenge_message();
-        let msg = client
-            .build_authenticate(&challenge, None)
-            .expect("build");
+        let msg = client.build_authenticate(&challenge, None).expect("build");
         assert_eq!(&msg[0..8], NTLMSSP_SIGNATURE);
         assert_eq!(read_u32_le(&msg, 8).unwrap(), 3);
     }

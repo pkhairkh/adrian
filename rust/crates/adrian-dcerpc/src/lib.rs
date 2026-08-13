@@ -74,14 +74,14 @@ pub mod transport;
 
 // Re-export the most-used types at the crate root for convenience.
 pub use ndr::{
-    NdrReader, NdrWriter, NDR_TRANSFER_SYNTAX_UUID, NDR_TRANSFER_SYNTAX_VERSION,
-    DEFAULT_MAX_RECV_FRAG, DEFAULT_MAX_XMIT_FRAG,
+    NdrReader, NdrWriter, DEFAULT_MAX_RECV_FRAG, DEFAULT_MAX_XMIT_FRAG, NDR_TRANSFER_SYNTAX_UUID,
+    NDR_TRANSFER_SYNTAX_VERSION,
 };
 pub use pdu::{
     ack_reason, ack_result, decode_bind_ack_pdu, decode_bind_pdu, decode_response_pdu,
     encode_bind_ack_pdu, encode_bind_pdu, encode_request_pdu, BindAckPdu, BindPdu, PContextElem,
-    PResult, PFC_CONC_MPX, PFC_FIRST_FRAG, PFC_LAST_FRAG, PTYPE_BIND, PTYPE_BIND_ACK,
-    PTYPE_REQUEST, PTYPE_RESPONSE, NDR20_DATA_REP, COMMON_HEADER_SIZE, REQUEST_HEADER_SIZE,
+    PResult, COMMON_HEADER_SIZE, NDR20_DATA_REP, PFC_CONC_MPX, PFC_FIRST_FRAG, PFC_LAST_FRAG,
+    PTYPE_BIND, PTYPE_BIND_ACK, PTYPE_REQUEST, PTYPE_RESPONSE, REQUEST_HEADER_SIZE,
     RESPONSE_HEADER_SIZE,
 };
 pub use transport::DcerpcTcpTransport;

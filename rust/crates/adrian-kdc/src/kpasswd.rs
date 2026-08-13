@@ -50,9 +50,9 @@
 use crate::krbtgt::KrbtgtManager;
 use crate::KdcError;
 use adrian_hsm::{Hsm, KeyType};
-use adrian_storage_core::{DirectoryStore, DistinguishedName};
 #[cfg(test)]
 use adrian_storage_core::Object;
+use adrian_storage_core::{DirectoryStore, DistinguishedName};
 use std::sync::Arc;
 
 /// RFC 3244 result codes (§3.2 / §3.3).
@@ -231,7 +231,9 @@ impl KpasswdRequest {
         }
         let mut p = 2usize;
         // version
-        if p + 2 > bytes.len() { return Err(KdcError::Storage("kpasswd: truncated version".into())); }
+        if p + 2 > bytes.len() {
+            return Err(KdcError::Storage("kpasswd: truncated version".into()));
+        }
         let version = u16::from_be_bytes([bytes[p], bytes[p + 1]]);
         p += 2;
         if version != KPASSWD_VERSION_CHANGE {
@@ -242,7 +244,9 @@ impl KpasswdRequest {
         // helper to read a length-prefixed field
         let read_field = |p: &mut usize, name: &str| -> Result<Vec<u8>, KdcError> {
             if *p + 2 > bytes.len() {
-                return Err(KdcError::Storage(format!("kpasswd: truncated {name} length")));
+                return Err(KdcError::Storage(format!(
+                    "kpasswd: truncated {name} length"
+                )));
             }
             let len = u16::from_be_bytes([bytes[*p], bytes[*p + 1]]) as usize;
             *p += 2;
@@ -317,21 +321,30 @@ impl KpasswdResponse {
         let _version = u16::from_be_bytes([bytes[p], bytes[p + 1]]);
         p += 2;
         if p + 2 > bytes.len() {
-            return Err(KdcError::Storage("kpasswd-resp: truncated result code".into()));
+            return Err(KdcError::Storage(
+                "kpasswd-resp: truncated result code".into(),
+            ));
         }
         let result_code = u16::from_be_bytes([bytes[p], bytes[p + 1]]) as u32;
         p += 2;
         if p + 2 > bytes.len() {
-            return Err(KdcError::Storage("kpasswd-resp: truncated result-string length".into()));
+            return Err(KdcError::Storage(
+                "kpasswd-resp: truncated result-string length".into(),
+            ));
         }
         let rs_len = u16::from_be_bytes([bytes[p], bytes[p + 1]]) as usize;
         p += 2;
         if p + rs_len > bytes.len() {
-            return Err(KdcError::Storage("kpasswd-resp: truncated result-string body".into()));
+            return Err(KdcError::Storage(
+                "kpasswd-resp: truncated result-string body".into(),
+            ));
         }
         let result_string = String::from_utf8(bytes[p..p + rs_len].to_vec())
             .map_err(|_| KdcError::Storage("kpasswd-resp: result string not UTF-8".into()))?;
-        Ok(Self { result_code, result_string })
+        Ok(Self {
+            result_code,
+            result_string,
+        })
     }
 }
 
@@ -369,7 +382,11 @@ impl KpasswdService {
         krbtgt: Arc<KrbtgtManager>,
         hsm: Arc<dyn Hsm>,
     ) -> Self {
-        Self { directory, krbtgt, hsm }
+        Self {
+            directory,
+            krbtgt,
+            hsm,
+        }
     }
 
     /// Handle a kpasswd request (RFC 3244 / ADR-019).
@@ -418,7 +435,9 @@ impl KpasswdService {
                 // stays 1 (the HSM's generate is idempotent on existing keys
                 // in the software impl — it overwrites the entry).
                 let _ = self.hsm.rotate_key("krbtgt-mac").await;
-                self.hsm.generate_key("krbtgt-mac", KeyType::HmacSha1).await?
+                self.hsm
+                    .generate_key("krbtgt-mac", KeyType::HmacSha1)
+                    .await?
             }
         };
         let verified = self
@@ -434,13 +453,14 @@ impl KpasswdService {
         }
         // 4. Look up the target principal.
         let target_dn = req.target_principal.to_dn();
-        let dn = DistinguishedName { dn: target_dn.clone() };
+        let dn = DistinguishedName {
+            dn: target_dn.clone(),
+        };
         let mut target_obj = match self.directory.get_by_dn(&dn).await {
             Ok(Some(obj)) => obj,
             Ok(None) => {
-                let resp = KpasswdResponse::principal_unknown(format!(
-                    "principal not found: {target_dn}"
-                ));
+                let resp =
+                    KpasswdResponse::principal_unknown(format!("principal not found: {target_dn}"));
                 return Ok(resp.encode());
             }
             Err(e) => {
@@ -466,7 +486,11 @@ impl KpasswdService {
         // 6. Hash + write unicodePwd.
         let hash = hash_password(pwd)?;
         // Replace any existing unicodePwd attribute; otherwise add.
-        if let Some(attr) = target_obj.attributes.iter_mut().find(|a| a.name == "unicodePwd") {
+        if let Some(attr) = target_obj
+            .attributes
+            .iter_mut()
+            .find(|a| a.name == "unicodePwd")
+        {
             attr.value = hash;
         } else {
             // NOTE: `attribute_id` is set to 0 (placeholder) — the schema
@@ -525,8 +549,9 @@ mod tests {
         let req = KpasswdRequest {
             client_principal: PrincipalName::new("alice@ADRIAN.EXAMPLE.COM"),
             target_principal: PrincipalName::new("alice@ADRIAN.EXAMPLE.COM"),
-            authenticator_mac: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33,
-                                    0x44, 0x55, 0x66, 0x77],
+            authenticator_mac: vec![
+                0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            ],
             new_password: b"new-password-12345!".to_vec(),
         };
         let bytes = req.encode();
@@ -555,7 +580,8 @@ mod tests {
         let bytes = resp.encode();
         let parsed = KpasswdResponse::parse(&bytes).expect("parse");
         assert_eq!(
-            parsed.result_code, result_code::KRB5_KPASSWD_SOFTERROR,
+            parsed.result_code,
+            result_code::KRB5_KPASSWD_SOFTERROR,
             "16-bit wire code must be SOFTERROR (8) for KRB5 errors > u16::MAX"
         );
         // Original message preserved in result_string.
@@ -601,7 +627,9 @@ mod tests {
         // Seed the directory with the target user.
         let obj = Object {
             uuid: Uuid::from_u128(0xAAAA),
-            dn: DistinguishedName { dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into() },
+            dn: DistinguishedName {
+                dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            },
             attributes: vec![],
             dnt: UNASSIGNED_DNT,
         };
@@ -619,7 +647,8 @@ mod tests {
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
         assert_eq!(
-            resp.result_code, result_code::KRB5KRB_AP_ERR_BAD_INTEGRITY,
+            resp.result_code,
+            result_code::KRB5KRB_AP_ERR_BAD_INTEGRITY,
             "tampered MAC must be rejected"
         );
     }
@@ -635,7 +664,9 @@ mod tests {
         // Seed the directory with the target user.
         let obj = Object {
             uuid: Uuid::from_u128(0xBBBB),
-            dn: DistinguishedName { dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into() },
+            dn: DistinguishedName {
+                dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            },
             attributes: vec![],
             dnt: UNASSIGNED_DNT,
         };
@@ -643,7 +674,10 @@ mod tests {
         let svc = KpasswdService::new(dir.clone(), krbtgt, hsm.clone());
         // Pre-generate the krbtgt-mac HMAC key so we can sign the request
         // with the same key the service will use to verify.
-        let mac_kh = hsm.generate_key("krbtgt-mac", KeyType::HmacSha1).await.unwrap();
+        let mac_kh = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .unwrap();
         let client = "alice@ADRIAN.EXAMPLE.COM";
         let pwd = b"new-strong-password!";
         let mut mac_input = Vec::new();
@@ -659,7 +693,11 @@ mod tests {
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
-        assert_eq!(resp.result_code, result_code::KRB5_KPASSWD_SUCCESS, "expected success");
+        assert_eq!(
+            resp.result_code,
+            result_code::KRB5_KPASSWD_SUCCESS,
+            "expected success"
+        );
         // Verify the directory was updated with a unicodePwd attribute.
         let updated = dir
             .get_by_dn(&DistinguishedName {
@@ -685,7 +723,10 @@ mod tests {
         let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
         let dir: Arc<dyn DirectoryStore> = Arc::new(InMemoryDirectoryStore::new());
         let svc = KpasswdService::new(dir, krbtgt, hsm.clone());
-        let mac_kh = hsm.generate_key("krbtgt-mac", KeyType::HmacSha1).await.unwrap();
+        let mac_kh = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .unwrap();
         let client = "ghost@ADRIAN.EXAMPLE.COM";
         let pwd = b"some-password-here";
         let mut mac_input = Vec::new();
@@ -704,7 +745,11 @@ mod tests {
         // The response wire format maps KRB5 errors > u16::MAX to SOFTERROR(8);
         // the result-string carries the principal-unknown context.
         assert_eq!(resp.result_code, result_code::KRB5_KPASSWD_SOFTERROR);
-        assert!(resp.result_string.contains("not found"), "result={}", resp.result_string);
+        assert!(
+            resp.result_string.contains("not found"),
+            "result={}",
+            resp.result_string
+        );
     }
 
     /// Too-short password → `KRB5KDC_ERR_POLICY` (ADR-019 §Decision:
@@ -718,12 +763,19 @@ mod tests {
         // Seed alice.
         dir.put(&Object {
             uuid: Uuid::from_u128(0xCCCC),
-            dn: DistinguishedName { dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into() },
+            dn: DistinguishedName {
+                dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            },
             attributes: vec![],
             dnt: UNASSIGNED_DNT,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let svc = KpasswdService::new(dir, krbtgt, hsm.clone());
-        let mac_kh = hsm.generate_key("krbtgt-mac", KeyType::HmacSha1).await.unwrap();
+        let mac_kh = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .unwrap();
         let client = "alice@ADRIAN.EXAMPLE.COM";
         let pwd = b"short"; // 5 chars < MIN_PASSWORD_LEN (12)
         let mut mac_input = Vec::new();
@@ -742,7 +794,11 @@ mod tests {
         // KRB5KDC_ERR_POLICY = 1_000_048 → mapped to SOFTERROR(8) on wire;
         // result-string carries the policy message.
         assert_eq!(resp.result_code, result_code::KRB5_KPASSWD_SOFTERROR);
-        assert!(resp.result_string.contains("too short"), "result={}", resp.result_string);
+        assert!(
+            resp.result_string.contains("too short"),
+            "result={}",
+            resp.result_string
+        );
     }
 
     /// FAST armor TGT: `fast_required=true` + `pkinit_available=false` →
@@ -788,8 +844,15 @@ mod tests {
         let h2 = hash_password(pwd).unwrap();
         assert_eq!(h1.len(), PBKDF2_SALT_LEN + PBKDF2_OUTPUT_LEN);
         assert_eq!(h2.len(), PBKDF2_SALT_LEN + PBKDF2_OUTPUT_LEN);
-        assert_ne!(h1, h2, "two hashes of the same password must differ (random salt)");
+        assert_ne!(
+            h1, h2,
+            "two hashes of the same password must differ (random salt)"
+        );
         // The salt is the first 16 bytes; the digest is the next 32.
-        assert_ne!(&h1[..PBKDF2_SALT_LEN], &h2[..PBKDF2_SALT_LEN], "salts must differ");
+        assert_ne!(
+            &h1[..PBKDF2_SALT_LEN],
+            &h2[..PBKDF2_SALT_LEN],
+            "salts must differ"
+        );
     }
 }

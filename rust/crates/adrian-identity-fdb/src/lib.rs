@@ -332,7 +332,9 @@ impl IdentityMapping for FdbIdentityMapping {
             return Ok(());
         }
         txn.put(&fkey, &sid_bytes).await.map_err(map_storage_err)?;
-        txn.put(&rkey, uuid.as_bytes()).await.map_err(map_storage_err)?;
+        txn.put(&rkey, uuid.as_bytes())
+            .await
+            .map_err(map_storage_err)?;
         txn.commit().await.map_err(map_storage_err)?;
         // Populate the cache.
         self.cache_put(uuid, sid.clone());
@@ -358,7 +360,9 @@ impl IdentityMapping for FdbIdentityMapping {
         if let Some(uid_buf) = uid_buf {
             if uid_buf.len() == 4 {
                 let uid = u32::from_be_bytes(uid_buf[..4].try_into().expect("4-byte slice"));
-                txn.delete(&uid_index_key(uid)).await.map_err(map_storage_err)?;
+                txn.delete(&uid_index_key(uid))
+                    .await
+                    .map_err(map_storage_err)?;
             }
             txn.delete(&uid_key).await.map_err(map_storage_err)?;
         }
@@ -393,11 +397,12 @@ pub async fn allocate_uid(
         Some(buf) if buf.len() == 8 => i64::from_be_bytes(buf[..8].try_into().expect("8-byte buf")),
         _ => 65535,
     };
-    txn.atomic_add(&counter_key, 1).await.map_err(map_storage_err)?;
+    txn.atomic_add(&counter_key, 1)
+        .await
+        .map_err(map_storage_err)?;
     // Also write the UUID→UID index for the new UID.
-    let uid: PosixId = u32::try_from(seed + 1).map_err(|_| {
-        IdentityError::Backend("UID counter overflowed u32".to_string())
-    })?;
+    let uid: PosixId = u32::try_from(seed + 1)
+        .map_err(|_| IdentityError::Backend("UID counter overflowed u32".to_string()))?;
     let uuid_uid_key = uuid_to_uid_key(&uuid);
     let uid_index_k = uid_index_key(uid);
     txn.put(&uuid_uid_key, &uid.to_be_bytes())
@@ -447,7 +452,10 @@ mod tests {
     fn store_handle_is_propagated() {
         let store = adrian_storage_fdb::FdbDirectoryStore::new(Some("/tmp/test.cluster"));
         let mapping = FdbIdentityMapping::new(store);
-        assert_eq!(mapping.store.cluster_file.as_deref(), Some("/tmp/test.cluster"));
+        assert_eq!(
+            mapping.store.cluster_file.as_deref(),
+            Some("/tmp/test.cluster")
+        );
     }
 
     #[test]

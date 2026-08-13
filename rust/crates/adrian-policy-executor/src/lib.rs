@@ -204,24 +204,31 @@ impl WindowsPolicyExecutor {
             "[Unicode]\nUnicode=yes\n[Version]\nsignature=\"$CHICAGO$\"\nRevision=1\n[General]\nDisplayName={name}\n",
             name = policy.name
         );
-        out.push_file("Machine/Microsoft/Windows NT/SecEdit/GptTmpl.inf", gpttmpl.into_bytes());
+        out.push_file(
+            "Machine/Microsoft/Windows NT/SecEdit/GptTmpl.inf",
+            gpttmpl.into_bytes(),
+        );
 
         // 3. Scripts.ini — empty if no scripts.* settings; otherwise
         //    emits the INI-encoded startup/shutdown scripts.
         let mut scripts = String::from("[Startup]\n[Shutdown]\n");
         for s in &policy.settings {
             if let Some(rest) = s.key.strip_prefix("scripts.startup.") {
-                scripts.push_str(&format!("{rest}={val}\n", val = match &s.value {
-                    adrian_policy_core::PolicyValue::String(s) => s.clone(),
-                    _ => String::new(),
-                }));
+                scripts.push_str(&format!(
+                    "{rest}={val}\n",
+                    val = match &s.value {
+                        adrian_policy_core::PolicyValue::String(s) => s.clone(),
+                        _ => String::new(),
+                    }
+                ));
             }
         }
         out.push_file("Machine/Scripts/Startup/Scripts.ini", scripts.into_bytes());
 
         // 4. GPP XML — emit a minimal Preferences XML document listing
         //    the registry values (per ADR-091 §GPP compilation).
-        let mut gpp_xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Preferences>\n");
+        let mut gpp_xml =
+            String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Preferences>\n");
         for s in &policy.settings {
             if s.key.starts_with("registry.") {
                 gpp_xml.push_str(&format!("  <Preference key=\"{k}\"/>\n", k = s.key));
@@ -319,12 +326,17 @@ impl MacOsPolicyExecutor {
 
         // 2. com.apple.security.firewall — emit a minimal firewall
         //    plist if any firewall.* settings are present.
-        let has_firewall = policy.settings.iter().any(|s| s.key.starts_with("firewall."));
+        let has_firewall = policy
+            .settings
+            .iter()
+            .any(|s| s.key.starts_with("firewall."));
         if has_firewall {
             let mut fw = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
             fw.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
             fw.push_str("<plist version=\"1.0\">\n<dict>\n");
-            fw.push_str("  <key>PayloadType</key>\n  <string>com.apple.security.firewall</string>\n");
+            fw.push_str(
+                "  <key>PayloadType</key>\n  <string>com.apple.security.firewall</string>\n",
+            );
             fw.push_str("  <key>EnableFirewall</key>\n  <true/>\n");
             fw.push_str("  <key>BlockAllIncoming</key>\n  <false/>\n");
             fw.push_str("</dict>\n</plist>\n");
@@ -335,7 +347,10 @@ impl MacOsPolicyExecutor {
         //    all settings (consumed by the framework's macOS daemon
         //    to map settings to per-area payloads).
         let manifest = serde_json::to_string_pretty(policy).unwrap_or_else(|_| String::from("{}"));
-        out.push_file("Configuration/com.adrian.manifest.json", manifest.into_bytes());
+        out.push_file(
+            "Configuration/com.adrian.manifest.json",
+            manifest.into_bytes(),
+        );
 
         out.summary = format!(
             "macOS MDM payloads synthesised: managed-client preferences{}, manifest.json",
@@ -408,14 +423,14 @@ impl LinuxPolicyExecutor {
         //    config snippet suitable for `authselect select <profile>`.
         let profile = adrian_policy_core::compile_to_authselect_profile(policy);
         let authselect_conf = format!("# Adrian-managed authselect profile\n{profile}\n");
-        out.push_file(
-            "etc/authselect/adrian.conf",
-            authselect_conf.into_bytes(),
-        );
+        out.push_file("etc/authselect/adrian.conf", authselect_conf.into_bytes());
 
         // 2. firewalld XML — emit a minimal firewalld zone XML if any
         //    firewall.* settings are present.
-        let has_firewall = policy.settings.iter().any(|s| s.key.starts_with("firewall."));
+        let has_firewall = policy
+            .settings
+            .iter()
+            .any(|s| s.key.starts_with("firewall."));
         if has_firewall {
             let mut fw = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
             fw.push_str("<zone>\n  <short>Adrian managed zone</short>\n");
@@ -447,10 +462,8 @@ impl LinuxPolicyExecutor {
                             adrian_policy_core::PolicyValue::String(s) => s.clone(),
                             _ => String::new(),
                         };
-                        limits.push_str(&format!(
-                            "{} {} {} {}\n",
-                            parts[0], parts[1], parts[2], val
-                        ));
+                        limits
+                            .push_str(&format!("{} {} {} {}\n", parts[0], parts[1], parts[2], val));
                     }
                 }
             }
@@ -552,8 +565,8 @@ mod tests {
 
     use super::*;
     use adrian_policy_core::{
-        DeclarativePolicy, PolicyArea, PolicyDoc, PolicyScope, RegistryPolicy, PolicySetting,
-        PolicyValue,
+        DeclarativePolicy, PolicyArea, PolicyDoc, PolicyScope, PolicySetting, PolicyValue,
+        RegistryPolicy,
     };
     use uuid::Uuid;
 
@@ -660,7 +673,10 @@ mod tests {
     async fn windows_executor_synthesizes_registry_pol_and_gpttmpl() {
         let exec = WindowsPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         assert_eq!(applied.platform, Platform::Windows);
         let paths: Vec<&str> = applied.files.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"Machine/Registry.pol"));
@@ -674,7 +690,10 @@ mod tests {
     async fn windows_executor_registry_pol_round_trips_through_preg_decode() {
         let exec = WindowsPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         let preg_bytes = applied
             .files
             .iter()
@@ -683,17 +702,18 @@ mod tests {
             .expect("Registry.pol present");
         let preg = adrian_policy_preg::decode_preg_file(&preg_bytes).expect("decode");
         // The "Enabled" registry setting from the sample policy.
-        assert!(preg
-            .entries
-            .iter()
-            .any(|e| e.value_name == "Enabled" && e.value_type == adrian_policy_preg::reg_value::REG_DWORD));
+        assert!(preg.entries.iter().any(|e| e.value_name == "Enabled"
+            && e.value_type == adrian_policy_preg::reg_value::REG_DWORD));
     }
 
     #[tokio::test]
     async fn windows_executor_gpttmpl_contains_policy_name() {
         let exec = WindowsPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         let gpttmpl_bytes = applied
             .files
             .iter()
@@ -710,7 +730,10 @@ mod tests {
     async fn macos_executor_synthesizes_managed_client_plist() {
         let exec = MacOsPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         assert_eq!(applied.platform, Platform::MacOs);
         let paths: Vec<&str> = applied.files.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths
@@ -723,7 +746,10 @@ mod tests {
     async fn macos_executor_emits_firewall_payload_when_firewall_settings_present() {
         let exec = MacOsPolicyExecutor::new();
         let policy = sample_declarative(); // contains firewall.allow.ssh
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         assert!(
             applied.files.iter().any(|(p, _)| p.contains("firewall")),
             "firewall payload must be present when firewall.* settings exist"
@@ -735,7 +761,10 @@ mod tests {
         let exec = MacOsPolicyExecutor::new();
         let mut policy = sample_declarative();
         policy.settings.retain(|s| !s.key.starts_with("firewall."));
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         assert!(
             !applied.files.iter().any(|(p, _)| p.contains("firewall")),
             "firewall payload must be absent when no firewall.* settings exist"
@@ -748,7 +777,10 @@ mod tests {
     async fn linux_executor_synthesizes_authselect_profile_fragment() {
         let exec = LinuxPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         assert_eq!(applied.platform, Platform::Linux);
         let authselect = applied
             .files
@@ -764,7 +796,10 @@ mod tests {
     async fn linux_executor_emits_firewalld_xml_when_firewall_settings_present() {
         let exec = LinuxPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         let fw = applied
             .files
             .iter()
@@ -780,7 +815,10 @@ mod tests {
     async fn linux_executor_emits_limits_conf_when_limits_settings_present() {
         let exec = LinuxPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         let limits = applied
             .files
             .iter()
@@ -795,7 +833,10 @@ mod tests {
     async fn linux_executor_emits_audit_rules_when_audit_settings_present() {
         let exec = LinuxPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         let audit = applied
             .files
             .iter()
@@ -810,7 +851,10 @@ mod tests {
     async fn linux_executor_summary_mentions_each_emitted_area() {
         let exec = LinuxPolicyExecutor::new();
         let policy = sample_declarative();
-        let applied = exec.synthesize(&policy, "host01").await.expect("synthesize");
+        let applied = exec
+            .synthesize(&policy, "host01")
+            .await
+            .expect("synthesize");
         assert!(applied.summary.contains("authselect"));
         assert!(applied.summary.contains("firewalld"));
         assert!(applied.summary.contains("limits.conf.d"));

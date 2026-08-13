@@ -211,10 +211,7 @@ impl Sid {
     /// Returns `Err(SidError::TooManySubAuthorities)` if the caller supplies
     /// more than [`MAX_SUB_AUTHORITIES`] (15) sub-authorities — MS-DTYP
     /// §2.4.2 forbids this and the binary wire form cannot represent it.
-    pub fn new(
-        identifier_authority: [u8; 6],
-        sub_authorities: Vec<u32>,
-    ) -> Result<Self, SidError> {
+    pub fn new(identifier_authority: [u8; 6], sub_authorities: Vec<u32>) -> Result<Self, SidError> {
         if sub_authorities.len() > MAX_SUB_AUTHORITIES {
             return Err(SidError::TooManySubAuthorities(sub_authorities.len()));
         }
@@ -227,10 +224,7 @@ impl Sid {
     /// Construct a SID without validation. Used internally by well-known
     /// constructors whose sub-authority counts are statically known to be
     /// valid.
-    const fn new_unchecked(
-        identifier_authority: [u8; 6],
-        sub_authorities: Vec<u32>,
-    ) -> Self {
+    const fn new_unchecked(identifier_authority: [u8; 6], sub_authorities: Vec<u32>) -> Self {
         Self {
             identifier_authority,
             sub_authorities,
@@ -297,9 +291,7 @@ impl Sid {
     /// validates up-front).
     pub fn to_bytes(&self) -> Result<Vec<u8>, SidError> {
         if self.sub_authorities.len() > MAX_SUB_AUTHORITIES {
-            return Err(SidError::TooManySubAuthorities(
-                self.sub_authorities.len(),
-            ));
+            return Err(SidError::TooManySubAuthorities(self.sub_authorities.len()));
         }
         let count = self.sub_authorities.len() as u8;
         let mut out = Vec::with_capacity(SID_BINARY_HEADER_LEN + 4 * self.sub_authorities.len());
@@ -558,9 +550,11 @@ impl std::str::FromStr for Sid {
             return Err(SidError::UnsupportedRevision(revision));
         }
         let auth_str = parts[2];
-        let auth: u64 = if let Some(hex_str) = auth_str.strip_prefix("0x").or_else(|| auth_str.strip_prefix("0X")) {
-            u64::from_str_radix(hex_str, 16)
-                .map_err(|_| SidError::InvalidString(s.to_string()))?
+        let auth: u64 = if let Some(hex_str) = auth_str
+            .strip_prefix("0x")
+            .or_else(|| auth_str.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex_str, 16).map_err(|_| SidError::InvalidString(s.to_string()))?
         } else {
             auth_str
                 .parse::<u64>()
@@ -819,7 +813,17 @@ mod tests {
         assert_eq!(bytes[1], 15);
         let decoded = Sid::from_bytes(&bytes).unwrap();
         assert_eq!(sid, decoded);
-        assert_eq!(decoded.to_string(), format!("S-1-5-{}", sub_auths.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("-")));
+        assert_eq!(
+            decoded.to_string(),
+            format!(
+                "S-1-5-{}",
+                sub_auths
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-")
+            )
+        );
         // Borrow sub_auths back for the assertion above (it was moved).
         sub_auths = decoded.sub_authorities.clone();
         assert_eq!(sub_auths, (1..=15u32).collect::<Vec<_>>());
@@ -982,7 +986,10 @@ mod tests {
         assert!(sid.is_domain_account_sid());
         assert_eq!(sid.rid(), Some(1103));
         let domain = sid.domain_sid().unwrap();
-        assert_eq!(domain.to_string(), "S-1-5-21-3623811015-3361044348-30300820");
+        assert_eq!(
+            domain.to_string(),
+            "S-1-5-21-3623811015-3361044348-30300820"
+        );
         assert!(domain.is_domain_sid());
     }
 

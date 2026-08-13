@@ -485,11 +485,7 @@ pub fn encode_dn_index_key(dn: &DistinguishedName) -> Vec<u8> {
 ///
 /// Key layout (22 bytes): `[0x02][0x00 (forward marker)][link_dnt (8)]
 /// [link_id (4)][backlink_dnt (8)]`
-pub fn encode_link_forward_key(
-    link_dnt: Dnt,
-    link_id: AttributeId,
-    backlink_dnt: Dnt,
-) -> Vec<u8> {
+pub fn encode_link_forward_key(link_dnt: Dnt, link_id: AttributeId, backlink_dnt: Dnt) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 8 + 4 + 8);
     out.push(Subspace::LinkTable as u8);
     out.push(LINK_FORWARD_MARKER);
@@ -507,11 +503,7 @@ pub fn encode_link_forward_key(
 ///
 /// Key layout (22 bytes): `[0x02][0x01 (reverse marker)][backlink_dnt (8)]
 /// [link_id (4)][link_dnt (8)]`
-pub fn encode_link_reverse_key(
-    backlink_dnt: Dnt,
-    link_id: AttributeId,
-    link_dnt: Dnt,
-) -> Vec<u8> {
+pub fn encode_link_reverse_key(backlink_dnt: Dnt, link_id: AttributeId, link_dnt: Dnt) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 8 + 4 + 8);
     out.push(Subspace::LinkTable as u8);
     out.push(LINK_REVERSE_MARKER);
@@ -642,9 +634,9 @@ pub trait DirectoryTransaction: WriteTxn {
         // Compute the new DNT locally. This matches what FDB's read-your-
         // writes would return after `atomic_add(k, 1)` on the snapshot
         // value (i.e. `snapshot_val + 1`).
-        let new_dnt = snapshot_val.checked_add(1).ok_or_else(|| {
-            StorageError::Backend("DNT counter overflow (i64 overflow)".into())
-        })?;
+        let new_dnt = snapshot_val
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Backend("DNT counter overflow (i64 overflow)".into()))?;
         // Stage the atomic-add. In real FDB, this is visible to subsequent
         // reads in this transaction; in the testkit, this is applied at
         // commit time. Either way, the final counter value after commit
@@ -881,7 +873,10 @@ mod tests {
         assert_eq!(fwd[1], LINK_FORWARD_MARKER);
         assert_eq!(rev[0], Subspace::LinkTable as u8);
         assert_eq!(rev[1], LINK_REVERSE_MARKER);
-        assert!(fwd < rev, "forward-link keys must sort before reverse-link keys");
+        assert!(
+            fwd < rev,
+            "forward-link keys must sort before reverse-link keys"
+        );
         // Forward-link range prefix (everything for link_dnt=10 outgoing).
         let fwd_prefix = {
             let mut p = Vec::with_capacity(10);

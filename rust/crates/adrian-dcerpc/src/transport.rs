@@ -96,11 +96,7 @@ where
     ///
     /// The `opnum` is encoded as the first 2 bytes of the stub data per
     /// IDL contract (see [`pdu::encode_request_pdu`] for the wire layout).
-    pub async fn send_request(
-        &mut self,
-        opnum: u16,
-        stub: &[u8],
-    ) -> Result<Vec<u8>, DceRpcError> {
+    pub async fn send_request(&mut self, opnum: u16, stub: &[u8]) -> Result<Vec<u8>, DceRpcError> {
         let call_id = self.next_call_id();
         let req = pdu::encode_request_pdu(call_id, 0, opnum, stub);
         self.stream.write_all(&req).await?;
@@ -203,9 +199,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(req_buf[2], crate::pdu::PTYPE_REQUEST);
-        let call_id = u32::from_le_bytes([
-            req_buf[12], req_buf[13], req_buf[14], req_buf[15],
-        ]);
+        let call_id = u32::from_le_bytes([req_buf[12], req_buf[13], req_buf[14], req_buf[15]]);
 
         let total = (RESPONSE_HEADER_SIZE + response_stub.len()) as u16;
         let mut resp_buf = Vec::with_capacity(total as usize);
@@ -286,7 +280,10 @@ mod tests {
             let mut buf = vec![0u8; frag_length];
             buf[..COMMON_HEADER_SIZE].copy_from_slice(&header);
             if frag_length > COMMON_HEADER_SIZE {
-                server_rx.read_exact(&mut buf[COMMON_HEADER_SIZE..]).await.unwrap();
+                server_rx
+                    .read_exact(&mut buf[COMMON_HEADER_SIZE..])
+                    .await
+                    .unwrap();
             }
             let bind = pdu::decode_bind_pdu(&buf).unwrap();
             let ack = BindAckPdu {
@@ -305,7 +302,10 @@ mod tests {
                     transfer_syntax: (Uuid::nil(), 0),
                 }],
             };
-            server_tx.write_all(&pdu::encode_bind_ack_pdu(&ack)).await.unwrap();
+            server_tx
+                .write_all(&pdu::encode_bind_ack_pdu(&ack))
+                .await
+                .unwrap();
             server_tx.flush().await.unwrap();
         });
 

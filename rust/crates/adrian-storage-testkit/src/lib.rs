@@ -489,7 +489,11 @@ mod tests {
             dnt: UNASSIGNED_DNT,
         };
         store.put(&obj).await.unwrap();
-        let got = store.get_by_dn(&dn).await.unwrap().expect("object should exist");
+        let got = store
+            .get_by_dn(&dn)
+            .await
+            .unwrap()
+            .expect("object should exist");
         assert_eq!(got.uuid, uuid);
     }
 
@@ -498,15 +502,27 @@ mod tests {
         let store = InMemoryDirectoryStore::new();
         assert_eq!(store.next_dnt(), 1);
         store
-            .put(&make_obj(test_uuid(10), "CN=a,DC=corp,DC=com", UNASSIGNED_DNT))
+            .put(&make_obj(
+                test_uuid(10),
+                "CN=a,DC=corp,DC=com",
+                UNASSIGNED_DNT,
+            ))
             .await
             .unwrap();
         store
-            .put(&make_obj(test_uuid(11), "CN=b,DC=corp,DC=com", UNASSIGNED_DNT))
+            .put(&make_obj(
+                test_uuid(11),
+                "CN=b,DC=corp,DC=com",
+                UNASSIGNED_DNT,
+            ))
             .await
             .unwrap();
         store
-            .put(&make_obj(test_uuid(12), "CN=c,DC=corp,DC=com", UNASSIGNED_DNT))
+            .put(&make_obj(
+                test_uuid(12),
+                "CN=c,DC=corp,DC=com",
+                UNASSIGNED_DNT,
+            ))
             .await
             .unwrap();
         assert_eq!(store.next_dnt(), 4, "next_dnt must advance by 3");
@@ -724,7 +740,10 @@ mod tests {
         // txn_b still sees the snapshot value (read isolation).
         assert_eq!(txn_b.get(b"shared").await.unwrap(), Some(b"base".to_vec()));
         // txn_a sees its own write (read-your-writes).
-        assert_eq!(txn_a.get(b"shared").await.unwrap(), Some(b"a-wins".to_vec()));
+        assert_eq!(
+            txn_a.get(b"shared").await.unwrap(),
+            Some(b"a-wins".to_vec())
+        );
         txn_a.commit().await.unwrap();
         txn_b.rollback().await.unwrap();
         // After txn_a commits, a new read observes a-wins.
@@ -741,7 +760,11 @@ mod tests {
         // state. We observe that via `store` itself, since
         // `Box<dyn DirectoryStore>` doesn't expose `.len()`.
         store
-            .put(&make_obj(test_uuid(7), "CN=g,DC=corp,DC=com", UNASSIGNED_DNT))
+            .put(&make_obj(
+                test_uuid(7),
+                "CN=g,DC=corp,DC=com",
+                UNASSIGNED_DNT,
+            ))
             .await
             .unwrap();
         assert_eq!(store.len(), 1, "snapshot must reflect live state");
@@ -841,18 +864,18 @@ mod tests {
             let uuid = Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000 + i);
             let dn_str = format!("CN=user-{i},OU=Eng,DC=corp,DC=com");
             store
-                .put(&make_obj(
-                    uuid,
-                    &dn_str,
-                    UNASSIGNED_DNT,
-                ))
+                .put(&make_obj(uuid, &dn_str, UNASSIGNED_DNT))
                 .await
                 .unwrap();
             uuids.push(uuid);
             dns.push((dn_str, uuid));
         }
         assert_eq!(store.len(), 100, "all 100 inserts must be live");
-        assert_eq!(store.next_dnt(), 101, "counter must advance exactly 100 times");
+        assert_eq!(
+            store.next_dnt(),
+            101,
+            "counter must advance exactly 100 times"
+        );
 
         // Verify every UUID lookup returns the right UUID.
         for uuid in &uuids {
@@ -909,7 +932,11 @@ mod tests {
         // Counter advances again on re-insert.
         assert_eq!(store.next_dnt(), 3);
         assert_eq!(store.len(), 1);
-        let got = store.get(uuid).await.unwrap().expect("re-insert must resolve");
+        let got = store
+            .get(uuid)
+            .await
+            .unwrap()
+            .expect("re-insert must resolve");
         assert_eq!(got.dn.dn, "CN=second,DC=corp,DC=com");
         assert_eq!(got.dnt, 2, "re-inserted object gets the next free DNT");
     }

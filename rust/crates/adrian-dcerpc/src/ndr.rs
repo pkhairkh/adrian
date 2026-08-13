@@ -181,7 +181,11 @@ impl<'a> NdrReader<'a> {
     }
 
     fn require(&self, n: usize) -> Result<(), DceRpcError> {
-        if self.pos.checked_add(n).is_none_or(|end| end > self.buf.len()) {
+        if self
+            .pos
+            .checked_add(n)
+            .is_none_or(|end| end > self.buf.len())
+        {
             return Err(DceRpcError::Ndr(format!(
                 "short read: requested {n} bytes at offset {}, have {} remaining",
                 self.pos,
@@ -221,9 +225,9 @@ impl<'a> NdrReader<'a> {
     /// Read `N` raw bytes into a fixed array (no alignment).
     pub fn read_array<const N: usize>(&mut self) -> Result<[u8; N], DceRpcError> {
         let slice = self.read_bytes(N)?;
-        slice.try_into().map_err(|_| {
-            DceRpcError::Ndr(format!("internal: {N}-byte slice conversion failed"))
-        })
+        slice
+            .try_into()
+            .map_err(|_| DceRpcError::Ndr(format!("internal: {N}-byte slice conversion failed")))
     }
 
     /// Read a single `u8` (no alignment).
@@ -297,9 +301,8 @@ impl<'a> NdrReader<'a> {
         if units.last() == Some(&0u16) {
             units.pop();
         }
-        String::from_utf16(&units).map_err(|e| {
-            DceRpcError::Ndr(format!("ndr string: utf-16 decode failed: {e}"))
-        })
+        String::from_utf16(&units)
+            .map_err(|e| DceRpcError::Ndr(format!("ndr string: utf-16 decode failed: {e}")))
     }
 }
 
@@ -354,10 +357,7 @@ mod tests {
         let mut w = NdrWriter::new();
         w.write_uint64(0x01020304_05060708);
         let bytes = w.into_bytes();
-        assert_eq!(
-            bytes,
-            vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
-        );
+        assert_eq!(bytes, vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
 
         let mut r = NdrReader::new(&bytes);
         assert_eq!(r.read_uint64().unwrap(), 0x01020304_05060708);

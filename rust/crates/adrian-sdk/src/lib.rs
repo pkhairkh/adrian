@@ -429,16 +429,9 @@ pub mod sdk {
             password: &str,
         ) -> Result<AuthToken, SdkError>;
         /// Acquire an X.509 client cert credential (Schannel-equivalent).
-        async fn authenticate_cert(
-            &self,
-            cert: &[u8],
-            key: &[u8],
-        ) -> Result<AuthToken, SdkError>;
+        async fn authenticate_cert(&self, cert: &[u8], key: &[u8]) -> Result<AuthToken, SdkError>;
         /// Wrap an OAuth2 bearer token as a credential.
-        async fn authenticate_oauth2(
-            &self,
-            access_token: &str,
-        ) -> Result<AuthToken, SdkError>;
+        async fn authenticate_oauth2(&self, access_token: &str) -> Result<AuthToken, SdkError>;
     }
 
     /// Directory module (ADR-109 — Wldap32-equivalent). Exposes LDAP
@@ -548,10 +541,7 @@ pub mod sdk {
                 "Cert auth not yet wired to platform key store (ADR-108)".into(),
             ))
         }
-        async fn authenticate_oauth2(
-            &self,
-            _access_token: &str,
-        ) -> Result<AuthToken, SdkError> {
+        async fn authenticate_oauth2(&self, _access_token: &str) -> Result<AuthToken, SdkError> {
             // Production: validates the JWT via `openidconnect` crate
             // (per ADR-107 §Decision §Federation).
             Err(SdkError::Auth(
@@ -584,11 +574,7 @@ pub mod sdk {
                 "LDAP get_by_dn '{dn}' not yet wired to adrian-directory-service (ADR-109)"
             )))
         }
-        async fn modify(
-            &self,
-            dn: &str,
-            _changes: Vec<ModifyEntry>,
-        ) -> Result<(), SdkError> {
+        async fn modify(&self, dn: &str, _changes: Vec<ModifyEntry>) -> Result<(), SdkError> {
             Err(SdkError::Directory(format!(
                 "LDAP modify on '{dn}' not yet wired to adrian-directory-service (ADR-109)"
             )))
@@ -678,9 +664,9 @@ pub mod sdk {
 // at crate root and are NOT shadowed here — the traits live only in
 // `sdk::*` to avoid the name collision.
 pub use sdk::{
-    AcmeCertModule, AppliedPolicy, AuthToken, AuthTokenKind, CertEnrollRequest,
-    DeclarativePolicy, DeclarativePolicyModule, DirEntry, KerberosAuthModule,
-    LdapDirectoryModule, ModifyEntry, ModifyOp, MountedShare, SmbFileModule,
+    AcmeCertModule, AppliedPolicy, AuthToken, AuthTokenKind, CertEnrollRequest, DeclarativePolicy,
+    DeclarativePolicyModule, DirEntry, KerberosAuthModule, LdapDirectoryModule, ModifyEntry,
+    ModifyOp, MountedShare, SmbFileModule,
 };
 
 // =========================================================================
@@ -780,8 +766,8 @@ mod api_tests {
     //! module API per ADR-107/108/109/110/111. Each stub impl is
     //! exercised via the trait to verify dispatch + error propagation.
 
-    use super::*;
     use super::sdk::{AuthModule, CertModule, DirectoryModule, FileModule, PolicyModule};
+    use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -800,10 +786,7 @@ mod api_tests {
             .build()
             .expect_err("empty builder must fail to build");
         match err {
-            SdkError::Auth(msg) => assert!(
-                msg.contains("auth module not set"),
-                "got: {msg}"
-            ),
+            SdkError::Auth(msg) => assert!(msg.contains("auth module not set"), "got: {msg}"),
             other => panic!("expected SdkError::Auth, got {other:?}"),
         }
     }
@@ -839,10 +822,9 @@ mod api_tests {
             .build()
             .expect_err("partial builder must fail to build");
         match err {
-            SdkError::Directory(msg) => assert!(
-                msg.contains("directory module not set"),
-                "got: {msg}"
-            ),
+            SdkError::Directory(msg) => {
+                assert!(msg.contains("directory module not set"), "got: {msg}")
+            }
             other => panic!("expected SdkError::Directory, got {other:?}"),
         }
     }
@@ -965,10 +947,7 @@ mod api_tests {
             version: "1.0.0".into(),
             settings: vec![],
         };
-        let err = m
-            .apply(&policy)
-            .await
-            .expect_err("stub must return Err");
+        let err = m.apply(&policy).await.expect_err("stub must return Err");
         match err {
             SdkError::Policy(msg) => {
                 assert!(msg.contains("audit-policy"), "got: {msg}");
@@ -982,7 +961,10 @@ mod api_tests {
             applied_at: None,
             rollback_token: vec![0u8; 16],
         };
-        let err = m.rollback(&applied).await.expect_err("stub must return Err");
+        let err = m
+            .rollback(&applied)
+            .await
+            .expect_err("stub must return Err");
         assert!(matches!(err, SdkError::Policy(_)), "got {err:?}");
     }
 
@@ -1065,10 +1047,7 @@ mod api_tests {
         ) -> Result<AuthToken, SdkError> {
             Err(SdkError::Auth("mock: cert not supported".into()))
         }
-        async fn authenticate_oauth2(
-            &self,
-            _access_token: &str,
-        ) -> Result<AuthToken, SdkError> {
+        async fn authenticate_oauth2(&self, _access_token: &str) -> Result<AuthToken, SdkError> {
             Err(SdkError::Auth("mock: OAuth2 not supported".into()))
         }
     }

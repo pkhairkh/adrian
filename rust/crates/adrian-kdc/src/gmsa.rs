@@ -90,7 +90,11 @@ impl GmsaManager {
 
     /// Wrap an existing KDS root key handle (used by callers that loaded the
     /// handle from durable storage).
-    pub fn with_root_key(hsm: Arc<dyn Hsm>, root_key: KeyHandle, interval_days: u64) -> Result<Self, KdcError> {
+    pub fn with_root_key(
+        hsm: Arc<dyn Hsm>,
+        root_key: KeyHandle,
+        interval_days: u64,
+    ) -> Result<Self, KdcError> {
         if !(1..=90).contains(&interval_days) {
             return Err(KdcError::Policy(format!(
                 "gMSA rotation interval {interval_days} days out of range [1, 90]"
@@ -197,7 +201,9 @@ mod tests {
 
     async fn new_manager(interval_days: u64) -> GmsaManager {
         let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
-        GmsaManager::new(hsm, interval_days).await.expect("manager init")
+        GmsaManager::new(hsm, interval_days)
+            .await
+            .expect("manager init")
     }
 
     /// `current_cycle()` advances predictably: at time T and T + interval, the
@@ -213,7 +219,8 @@ mod tests {
         // interval is 30 days = 2_592_000 seconds; sub-millisecond gap).
         let c2 = mgr.current_cycle();
         assert_eq!(
-            c1, c2,
+            c1,
+            c2,
             "back-to-back current_cycle() calls must agree (interval={}s)",
             mgr.rotation_interval_secs()
         );
@@ -242,8 +249,14 @@ mod tests {
     async fn password_differs_across_cycles() {
         let mgr = new_manager(DEFAULT_ROTATION_INTERVAL_DAYS).await;
         let dn = "CN=svc-web,CN=Managed Service Accounts,DC=adrian,DC=example,DC=com";
-        let p_n = mgr.compute_gmsa_password(dn, 100).await.expect("derive cycle 100");
-        let p_n1 = mgr.compute_gmsa_password(dn, 101).await.expect("derive cycle 101");
+        let p_n = mgr
+            .compute_gmsa_password(dn, 100)
+            .await
+            .expect("derive cycle 100");
+        let p_n1 = mgr
+            .compute_gmsa_password(dn, 101)
+            .await
+            .expect("derive cycle 101");
         assert_ne!(
             p_n, p_n1,
             "password MUST change across cycles (rotation is cryptographically effective)"
@@ -273,13 +286,20 @@ mod tests {
     async fn different_root_keys_produce_different_passwords() {
         let hsm1: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
         let hsm2: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
-        let mgr1 = GmsaManager::new(hsm1.clone(), DEFAULT_ROTATION_INTERVAL_DAYS).await.unwrap();
-        let mgr2 = GmsaManager::new(hsm2.clone(), DEFAULT_ROTATION_INTERVAL_DAYS).await.unwrap();
+        let mgr1 = GmsaManager::new(hsm1.clone(), DEFAULT_ROTATION_INTERVAL_DAYS)
+            .await
+            .unwrap();
+        let mgr2 = GmsaManager::new(hsm2.clone(), DEFAULT_ROTATION_INTERVAL_DAYS)
+            .await
+            .unwrap();
         let dn = "CN=svc,CN=MSA,DC=adrian,DC=com";
         let cycle = 5;
         let p1 = mgr1.compute_gmsa_password(dn, cycle).await.unwrap();
         let p2 = mgr2.compute_gmsa_password(dn, cycle).await.unwrap();
-        assert_ne!(p1, p2, "different root keys MUST produce different passwords");
+        assert_ne!(
+            p1, p2,
+            "different root keys MUST produce different passwords"
+        );
     }
 
     /// Interval out of range (< 1 day) is rejected (ADR-020 §Decision: 1–90 days).

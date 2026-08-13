@@ -156,7 +156,10 @@ mod tests {
         assert_eq!(current.id, KRBGTGT_KEY_ID);
         assert_eq!(current.version, 1, "initial key must be version 1");
         assert_eq!(current.key_type, KeyType::Aes256);
-        assert!(mgr.previous_key().await.is_none(), "no previous before first rotation");
+        assert!(
+            mgr.previous_key().await.is_none(),
+            "no previous before first rotation"
+        );
         assert_eq!(mgr.key_count().await, 1);
         assert_eq!(mgr.kvno().await, 1);
     }
@@ -171,7 +174,11 @@ mod tests {
         mgr.rotate().await.expect("rotate");
 
         let new_current = mgr.current_key().await;
-        assert_eq!(new_current.version, old_current.version + 1, "version must bump");
+        assert_eq!(
+            new_current.version,
+            old_current.version + 1,
+            "version must bump"
+        );
         assert_eq!(new_current.id, KRBGTGT_KEY_ID, "id stable across rotation");
         assert_eq!(new_current.key_type, KeyType::Aes256);
 
@@ -198,7 +205,8 @@ mod tests {
         let previous = mgr.previous_key().await.expect("prev after 2nd");
         assert_eq!(current.version, 3, "version 3 after 2nd rotation");
         assert_eq!(
-            previous.version, prev_after_first + 1,
+            previous.version,
+            prev_after_first + 1,
             "previous is the just-rotated current (v{prev_after_first} → v{})",
             prev_after_first + 1
         );
@@ -219,7 +227,11 @@ mod tests {
         for expected_kvno in 2..=4 {
             mgr.rotate().await.expect("rotate");
             assert_eq!(mgr.kvno().await, expected_kvno);
-            assert_eq!(mgr.key_count().await, 2, "exactly 2 keys after rotation {expected_kvno}");
+            assert_eq!(
+                mgr.key_count().await,
+                2,
+                "exactly 2 keys after rotation {expected_kvno}"
+            );
         }
     }
 }

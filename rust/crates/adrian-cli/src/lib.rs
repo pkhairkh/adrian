@@ -400,14 +400,9 @@ mod tests {
             other => panic!("expected Command::Auth, got {other:?}"),
         }
 
-        let cli = Cli::try_parse_from([
-            "adrian",
-            "auth",
-            "admin@ADRIAN.DEV",
-            "--password",
-            "s3cret",
-        ])
-        .expect("auth --password parse should succeed");
+        let cli =
+            Cli::try_parse_from(["adrian", "auth", "admin@ADRIAN.DEV", "--password", "s3cret"])
+                .expect("auth --password parse should succeed");
         match cli.command {
             Command::Auth {
                 principal,
@@ -436,14 +431,8 @@ mod tests {
 
     #[test]
     fn parse_cert_enroll_subcommand_populates_subject_and_sans() {
-        let cli = Cli::try_parse_from([
-            "adrian",
-            "cert",
-            "enroll",
-            "--subject",
-            "dc01.adrian.dev",
-        ])
-        .expect("cert enroll (no SAN) parse should succeed");
+        let cli = Cli::try_parse_from(["adrian", "cert", "enroll", "--subject", "dc01.adrian.dev"])
+            .expect("cert enroll (no SAN) parse should succeed");
         match cli.command {
             Command::Cert {
                 subcommand: CertSub::Enroll { subject, sans },
@@ -491,10 +480,11 @@ mod tests {
         .expect("file mount parse should succeed");
         match cli.command {
             Command::File {
-                subcommand: FileSub::Mount {
-                    server_share,
-                    mountpoint,
-                },
+                subcommand:
+                    FileSub::Mount {
+                        server_share,
+                        mountpoint,
+                    },
             } => {
                 assert_eq!(server_share, "fs01.adrian.dev/users");
                 assert_eq!(mountpoint, "/mnt/users");
@@ -530,7 +520,10 @@ mod tests {
     #[test]
     fn parse_rejects_cert_enroll_without_subject() {
         let result = Cli::try_parse_from(["adrian", "cert", "enroll"]);
-        assert!(result.is_err(), "cert enroll without --subject should error");
+        assert!(
+            result.is_err(),
+            "cert enroll without --subject should error"
+        );
         let err = result.unwrap_err();
         assert!(
             err.kind() == clap::error::ErrorKind::MissingRequiredArgument,
@@ -542,7 +535,10 @@ mod tests {
     #[test]
     fn parse_rejects_file_mount_with_missing_positional() {
         let result = Cli::try_parse_from(["adrian", "file", "mount", "fs01/users"]);
-        assert!(result.is_err(), "file mount without mountpoint should error");
+        assert!(
+            result.is_err(),
+            "file mount without mountpoint should error"
+        );
         let err = result.unwrap_err();
         assert!(
             err.kind() == clap::error::ErrorKind::MissingRequiredArgument,
@@ -554,7 +550,10 @@ mod tests {
     #[test]
     fn parse_rejects_policy_apply_with_unknown_subcommand() {
         let result = Cli::try_parse_from(["adrian", "policy", "delete", "x.json"]);
-        assert!(result.is_err(), "policy delete should error (not a valid subcommand)");
+        assert!(
+            result.is_err(),
+            "policy delete should error (not a valid subcommand)"
+        );
         let err = result.unwrap_err();
         assert!(
             err.kind() == clap::error::ErrorKind::InvalidSubcommand,

@@ -80,10 +80,11 @@
 #![warn(missing_docs)]
 
 use adrian_storage_core::{
-    decode_i64_be, decode_object_key, encode_dn_index_key, encode_object_key as encode_object_key_canonical,
-    encode_object_prefix, encode_tombstone_key, encode_uuid_index_key, DirectoryStore,
-    DirectoryTransaction, DistinguishedName, KeyRange, Object, ReadTxn, StorageError, Subspace,
-    WriteTxn, DN_ATTR_SENTINEL, DNT_ATTR_SENTINEL, UUID_ATTR_SENTINEL,
+    decode_i64_be, decode_object_key, encode_dn_index_key,
+    encode_object_key as encode_object_key_canonical, encode_object_prefix, encode_tombstone_key,
+    encode_uuid_index_key, DirectoryStore, DirectoryTransaction, DistinguishedName, KeyRange,
+    Object, ReadTxn, StorageError, Subspace, WriteTxn, DNT_ATTR_SENTINEL, DN_ATTR_SENTINEL,
+    UUID_ATTR_SENTINEL,
 };
 use adrian_storage_core::{Attribute, Dnt, ValueIndex};
 use async_trait::async_trait;
@@ -798,9 +799,8 @@ mod real_fdb {
         pub async fn connect(cluster_file: Option<&str>) -> Result<Self, StorageError> {
             // Initialise the FDB network. `foundationdb::boot()` is
             // idempotent and starts the background network thread.
-            let _guard = foundationdb::boot().map_err(|e| {
-                StorageError::Backend(format!("foundationdb::boot failed: {e}"))
-            })?;
+            let _guard = foundationdb::boot()
+                .map_err(|e| StorageError::Backend(format!("foundationdb::boot failed: {e}")))?;
             // The boot guard must be held for the lifetime of the process.
             // We leak it here (the network runs forever once booted) —
             // this is the recommended pattern for long-running services
@@ -810,9 +810,8 @@ mod real_fdb {
                 Some(path) => foundationdb::Database::from_path(path).map_err(|e| {
                     StorageError::Backend(format!("Database::from_path failed: {e}"))
                 })?,
-                None => foundationdb::Database::new(None).map_err(|e| {
-                    StorageError::Backend(format!("Database::new failed: {e}"))
-                })?,
+                None => foundationdb::Database::new(None)
+                    .map_err(|e| StorageError::Backend(format!("Database::new failed: {e}")))?,
             };
             Ok(Self {
                 db: std::sync::Arc::new(db),
@@ -821,17 +820,19 @@ mod real_fdb {
 
         /// Begin a read transaction (FDB snapshot read).
         pub async fn begin_read(&self) -> Result<RealFdbReadTxn, StorageError> {
-            let trx = self.db.create_trx().map_err(|e| {
-                StorageError::Backend(format!("create_trx failed: {e}"))
-            })?;
+            let trx = self
+                .db
+                .create_trx()
+                .map_err(|e| StorageError::Backend(format!("create_trx failed: {e}")))?;
             Ok(RealFdbReadTxn { trx })
         }
 
         /// Begin a read-write transaction.
         pub async fn begin_write(&self) -> Result<RealFdbWriteTxn, StorageError> {
-            let trx = self.db.create_trx().map_err(|e| {
-                StorageError::Backend(format!("create_trx failed: {e}"))
-            })?;
+            let trx = self
+                .db
+                .create_trx()
+                .map_err(|e| StorageError::Backend(format!("create_trx failed: {e}")))?;
             Ok(RealFdbWriteTxn { trx })
         }
     }
@@ -846,9 +847,9 @@ mod real_fdb {
     impl ReadTxn for RealFdbReadTxn {
         async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
             let fut = self.trx.get(key, true /* snapshot */);
-            let slice = fut.await.map_err(|e| {
-                StorageError::Backend(format!("FDB get failed: {e}"))
-            })?;
+            let slice = fut
+                .await
+                .map_err(|e| StorageError::Backend(format!("FDB get failed: {e}")))?;
             Ok(slice.as_deref().map(|s| s.to_vec()))
         }
 
@@ -860,9 +861,9 @@ mod real_fdb {
             use foundationdb::RangeOption;
             let opt = RangeOption::from((begin..end));
             let futs = self.trx.get_ranges(&opt, true /* snapshot */);
-            let result = futs.await.map_err(|e| {
-                StorageError::Backend(format!("FDB get_ranges failed: {e}"))
-            })?;
+            let result = futs
+                .await
+                .map_err(|e| StorageError::Backend(format!("FDB get_ranges failed: {e}")))?;
             let mut out = Vec::new();
             for kv in result.iter() {
                 out.push((kv.key().to_vec(), kv.value().to_vec()));
@@ -881,9 +882,9 @@ mod real_fdb {
     impl ReadTxn for RealFdbWriteTxn {
         async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
             let fut = self.trx.get(key, false /* not snapshot */);
-            let slice = fut.await.map_err(|e| {
-                StorageError::Backend(format!("FDB get failed: {e}"))
-            })?;
+            let slice = fut
+                .await
+                .map_err(|e| StorageError::Backend(format!("FDB get failed: {e}")))?;
             Ok(slice.as_deref().map(|s| s.to_vec()))
         }
 
@@ -895,9 +896,9 @@ mod real_fdb {
             use foundationdb::RangeOption;
             let opt = RangeOption::from((begin..end));
             let futs = self.trx.get_ranges(&opt, false);
-            let result = futs.await.map_err(|e| {
-                StorageError::Backend(format!("FDB get_ranges failed: {e}"))
-            })?;
+            let result = futs
+                .await
+                .map_err(|e| StorageError::Backend(format!("FDB get_ranges failed: {e}")))?;
             let mut out = Vec::new();
             for kv in result.iter() {
                 out.push((kv.key().to_vec(), kv.value().to_vec()));
@@ -1068,7 +1069,10 @@ mod tests {
         let obj = make_obj(
             uuid,
             "CN=alice,DC=corp,DC=com",
-            vec![make_attr(3, "cn", b"alice"), make_attr(7, "displayName", b"Alice")],
+            vec![
+                make_attr(3, "cn", b"alice"),
+                make_attr(7, "displayName", b"Alice"),
+            ],
         );
         store.put(&obj).await.unwrap();
         let got = store.get(uuid).await.unwrap().expect("object should exist");
@@ -1361,7 +1365,11 @@ mod tests {
         let store = FdbDirectoryStore::connect(None).await.unwrap();
         assert!(!store.is_in_memory_fallback());
         let uuid = test_uuid(1);
-        let obj = make_obj(uuid, "CN=real,DC=corp,DC=com", vec![make_attr(3, "cn", b"real")]);
+        let obj = make_obj(
+            uuid,
+            "CN=real,DC=corp,DC=com",
+            vec![make_attr(3, "cn", b"real")],
+        );
         store.put(&obj).await.unwrap();
         let got = store.get(uuid).await.unwrap().expect("object should exist");
         assert_eq!(got.uuid, uuid);

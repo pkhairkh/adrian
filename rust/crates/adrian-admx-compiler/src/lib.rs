@@ -170,7 +170,10 @@ impl AdmxPolicy {
 /// display_name / explanation fields are populated with the raw
 /// `$(string.<id>)` references from the ADMX. A future wave will
 /// substitute the ADML strings.
-pub fn compile(admx_path: &str, adml_path: &str) -> Result<Vec<adrian_policy_core::PolicyDoc>, AdmxError> {
+pub fn compile(
+    admx_path: &str,
+    adml_path: &str,
+) -> Result<Vec<adrian_policy_core::PolicyDoc>, AdmxError> {
     let admx_text = std::fs::read_to_string(admx_path)
         .map_err(|e| AdmxError::Parse(format!("read {admx_path:?}: {e}")))?;
     let _ = std::fs::read_to_string(adml_path)
@@ -225,7 +228,8 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let name_bytes = e.name().as_ref().to_vec(); let (ns, local) = split_ns(&name_bytes);
+                let name_bytes = e.name().as_ref().to_vec();
+                let (ns, local) = split_ns(&name_bytes);
                 let _ = ns;
                 match local {
                     b"policy" => {
@@ -286,7 +290,11 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
                             current_enum_items.clear();
                         }
                     }
-                    b"item" if current_element.as_ref().is_some_and(|b| matches!(b, AdmxElementBuilder::Enum { .. })) => {
+                    b"item"
+                        if current_element
+                            .as_ref()
+                            .is_some_and(|b| matches!(b, AdmxElementBuilder::Enum { .. })) =>
+                    {
                         in_enum_item = true;
                         current_enum_item_display = None;
                         current_enum_item_value = None;
@@ -303,7 +311,8 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
                 }
             }
             Ok(Event::Empty(e)) => {
-                let name_bytes = e.name().as_ref().to_vec(); let (_, local) = split_ns(&name_bytes);
+                let name_bytes = e.name().as_ref().to_vec();
+                let (_, local) = split_ns(&name_bytes);
                 match local {
                     b"boolean" => {
                         if let Some(vn) = attr(&e, b"valueName") {
@@ -349,7 +358,8 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
                 }
             }
             Ok(Event::End(e)) => {
-                let name_bytes = e.name().as_ref().to_vec(); let (_, local) = split_ns(&name_bytes);
+                let name_bytes = e.name().as_ref().to_vec();
+                let (_, local) = split_ns(&name_bytes);
                 match local {
                     b"policy" => {
                         if let Some(p) = current_policy.take() {
@@ -375,7 +385,9 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
                         if in_enum_item {
                             let display = current_enum_item_display.take().unwrap_or_default();
                             let value = current_enum_item_value.take().unwrap_or_default();
-                            if let Some(AdmxElementBuilder::Enum { items, .. }) = current_element.as_mut() {
+                            if let Some(AdmxElementBuilder::Enum { items, .. }) =
+                                current_element.as_mut()
+                            {
                                 items.push((value, display));
                             }
                             in_enum_item = false;
@@ -391,7 +403,10 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
                 }
             }
             Ok(Event::Text(t)) => {
-                let text = t.unescape().map_err(|e| AdmxError::Parse(e.to_string()))?.to_string();
+                let text = t
+                    .unescape()
+                    .map_err(|e| AdmxError::Parse(e.to_string()))?
+                    .to_string();
                 if in_enum_item && current_enum_item_display.is_some() {
                     if let Some(d) = current_enum_item_display.as_mut() {
                         d.push_str(&text);
@@ -423,8 +438,12 @@ pub fn parse_admx(admx_xml: &str) -> Result<Vec<AdmxPolicy>, AdmxError> {
 /// start/end events.
 #[derive(Debug, Clone)]
 enum AdmxElementBuilder {
-    Boolean { value_name: String },
-    Text { value_name: String },
+    Boolean {
+        value_name: String,
+    },
+    Text {
+        value_name: String,
+    },
     Integer {
         value_name: String,
         min: Option<i64>,
@@ -541,10 +560,7 @@ pub fn admx_to_declarative(policies: &[AdmxPolicy]) -> DeclarativePolicy {
                 AdmxElement::Enum {
                     value_name, items, ..
                 } => {
-                    let default = items
-                        .first()
-                        .map(|(v, _)| v.clone())
-                        .unwrap_or_default();
+                    let default = items.first().map(|(v, _)| v.clone()).unwrap_or_default();
                     settings.push(PolicySetting {
                         key: format!("registry.{}\\{}", p.key, value_name),
                         value: PolicyValue::String(default),
@@ -653,10 +669,7 @@ mod tests {
         assert_eq!(first.class, AdmxClass::Machine);
         assert_eq!(first.key, "Software\\Policies\\Contoso\\App");
         assert_eq!(first.value_name.as_deref(), Some("Enabled"));
-        assert_eq!(
-            first.supported_on.as_deref(),
-            Some("SUPPORTED_Win10_1809")
-        );
+        assert_eq!(first.supported_on.as_deref(), Some("SUPPORTED_Win10_1809"));
         assert_eq!(first.display_name, "$(string.POL_EnableFeature)");
     }
 
@@ -782,11 +795,8 @@ mod tests {
         let adml_path = tmp.join("w4a_admx_compiler_test.adml");
         std::fs::write(&admx_path, SAMPLE_ADMX).expect("write admx");
         std::fs::write(&adml_path, "<adml/>").expect("write adml");
-        let docs = compile(
-            admx_path.to_str().unwrap(),
-            adml_path.to_str().unwrap(),
-        )
-        .expect("compile");
+        let docs =
+            compile(admx_path.to_str().unwrap(), adml_path.to_str().unwrap()).expect("compile");
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].name, "admx-imported");
     }

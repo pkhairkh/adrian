@@ -221,9 +221,10 @@ pub fn encode_bind_pdu(pdu: &BindPdu) -> Vec<u8> {
         let n_ts = ctx.transfer_syntaxes.len() as u8;
         w.write_uint8(n_ts);
         w.write_uint8(0); // reserved
-        // abstract_syntax: 16-byte UUID + 4-byte version (major in upper 16).
+                          // abstract_syntax: 16-byte UUID + 4-byte version (major in upper 16).
         w.write_uuid(ctx.abstract_syntax.0);
-        let iface_ver = ((ctx.abstract_syntax.1.0 as u32) << 16) | (ctx.abstract_syntax.1.1 as u32);
+        let iface_ver =
+            ((ctx.abstract_syntax.1 .0 as u32) << 16) | (ctx.abstract_syntax.1 .1 as u32);
         w.write_bytes(&iface_ver.to_le_bytes());
         for ts in &ctx.transfer_syntaxes {
             w.write_uuid(ts.0);
@@ -277,7 +278,10 @@ pub fn decode_bind_pdu(buf: &[u8]) -> Result<BindPdu, DceRpcError> {
         let _reserved = r.read_uint8()?;
         let iface_uuid = r.read_uuid()?;
         let iface_ver_u32 = u32::from_le_bytes(r.read_array::<4>()?);
-        let iface_ver = ((iface_ver_u32 >> 16) as u16, (iface_ver_u32 & 0xFFFF) as u16);
+        let iface_ver = (
+            (iface_ver_u32 >> 16) as u16,
+            (iface_ver_u32 & 0xFFFF) as u16,
+        );
         let mut tss = Vec::with_capacity(n_ts as usize);
         for _ in 0..n_ts {
             let ts_uuid = r.read_uuid()?;
@@ -393,9 +397,7 @@ pub fn decode_bind_ack_pdu(buf: &[u8]) -> Result<BindAckPdu, DceRpcError> {
 
     let sec_addr_len = r.read_uint16()? as usize;
     let sec_addr_bytes = r.read_bytes(sec_addr_len)?;
-    let trimmed = sec_addr_bytes
-        .strip_suffix(b"\0")
-        .unwrap_or(sec_addr_bytes);
+    let trimmed = sec_addr_bytes.strip_suffix(b"\0").unwrap_or(sec_addr_bytes);
     let sec_addr = std::str::from_utf8(trimmed)
         .map_err(|e| DceRpcError::Ndr(format!("bind_ack sec_addr utf8: {e}")))?
         .to_string();
@@ -509,8 +511,8 @@ pub fn decode_response_pdu(buf: &[u8]) -> Result<Vec<u8>, DceRpcError> {
 mod tests {
     use super::*;
     use crate::ndr::{
-        NDR_TRANSFER_SYNTAX_UUID, NDR_TRANSFER_SYNTAX_VERSION, DEFAULT_MAX_RECV_FRAG,
-        DEFAULT_MAX_XMIT_FRAG,
+        DEFAULT_MAX_RECV_FRAG, DEFAULT_MAX_XMIT_FRAG, NDR_TRANSFER_SYNTAX_UUID,
+        NDR_TRANSFER_SYNTAX_VERSION,
     };
 
     fn drsuapi_iface() -> Uuid {
@@ -525,7 +527,10 @@ mod tests {
 
         assert_eq!(decoded.rpc_vers, 5);
         assert_eq!(decoded.rpc_vers_minor, 0);
-        assert_eq!(decoded.pfc_flags, PFC_FIRST_FRAG | PFC_LAST_FRAG | PFC_CONC_MPX);
+        assert_eq!(
+            decoded.pfc_flags,
+            PFC_FIRST_FRAG | PFC_LAST_FRAG | PFC_CONC_MPX
+        );
         assert_eq!(decoded.data_rep, NDR20_DATA_REP);
         assert_eq!(decoded.call_id, 1);
         assert_eq!(decoded.max_xmit_frag, DEFAULT_MAX_XMIT_FRAG);
@@ -623,15 +628,15 @@ mod tests {
                 Uuid::from_u128(0x12345778_1234_ABCD_EF00_0123456789AC),
                 (1, 0),
             ),
-            transfer_syntaxes: vec![(
-                NDR_TRANSFER_SYNTAX_UUID,
-                NDR_TRANSFER_SYNTAX_VERSION,
-            )],
+            transfer_syntaxes: vec![(NDR_TRANSFER_SYNTAX_UUID, NDR_TRANSFER_SYNTAX_VERSION)],
         });
         let bytes = encode_bind_pdu(&pdu);
         let decoded = decode_bind_pdu(&bytes).unwrap();
         assert_eq!(decoded.context_elements.len(), 2);
-        assert_eq!(decoded.context_elements[0].abstract_syntax.0, drsuapi_iface());
+        assert_eq!(
+            decoded.context_elements[0].abstract_syntax.0,
+            drsuapi_iface()
+        );
         assert_eq!(
             decoded.context_elements[1].abstract_syntax.0,
             Uuid::from_u128(0x12345778_1234_ABCD_EF00_0123456789AC)
@@ -779,7 +784,10 @@ mod tests {
         assert_eq!(decoded.p_results.len(), 2);
         assert_eq!(decoded.p_results[0].result, ack_result::ACCEPTANCE);
         assert_eq!(decoded.p_results[1].result, ack_result::PROVIDER_REJECTION);
-        assert_eq!(decoded.p_results[1].reason, ack_reason::ABSTRACT_SYNTAX_NOT_SUPPORTED);
+        assert_eq!(
+            decoded.p_results[1].reason,
+            ack_reason::ABSTRACT_SYNTAX_NOT_SUPPORTED
+        );
     }
 
     #[test]

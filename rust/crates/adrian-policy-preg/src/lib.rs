@@ -93,7 +93,12 @@ impl PregEntry {
     /// and raw data bytes. Convenience constructor that avoids the
     /// struct-literal ceremony at call sites.
     #[must_use]
-    pub fn new(key: impl Into<String>, value_name: impl Into<String>, value_type: u32, value: Vec<u8>) -> Self {
+    pub fn new(
+        key: impl Into<String>,
+        value_name: impl Into<String>,
+        value_type: u32,
+        value: Vec<u8>,
+    ) -> Self {
         Self {
             key: key.into(),
             value_name: value_name.into(),
@@ -173,14 +178,14 @@ pub fn encode_preg_file(file: &PregFile) -> Vec<u8> {
         out.extend_from_slice(&[0x3B, 0x00]); // ';'
         encode_field_utf16(&mut out, &entry.value_name);
         out.extend_from_slice(&[0x3B, 0x00]); // ';'
-        // type as decimal ASCII digits, UTF-16LE
+                                              // type as decimal ASCII digits, UTF-16LE
         encode_field_utf16(&mut out, &entry.value_type.to_string());
         out.extend_from_slice(&[0x3B, 0x00]); // ';'
-        // size as decimal ASCII digits, UTF-16LE
+                                              // size as decimal ASCII digits, UTF-16LE
         let size = entry.size();
         encode_field_utf16(&mut out, &size.to_string());
         out.extend_from_slice(&[0x3B, 0x00]); // ';'
-        // data as hex-encoded ASCII, UTF-16LE
+                                              // data as hex-encoded ASCII, UTF-16LE
         let mut hex = String::with_capacity(entry.value.len() * 2);
         for b in &entry.value {
             // uppercase hex per MS-GPREG §2.2.1 examples (samba-gpupdate
@@ -453,9 +458,8 @@ pub fn decode_reg_multi_sz(bytes: &[u8]) -> Result<Vec<String>, PregError> {
                 saw_final_terminator = true;
                 break;
             }
-            let s = String::from_utf16(&current).map_err(|e| {
-                PregError::Invalid(format!("REG_MULTI_SZ entry not UTF-16LE: {e}"))
-            })?;
+            let s = String::from_utf16(&current)
+                .map_err(|e| PregError::Invalid(format!("REG_MULTI_SZ entry not UTF-16LE: {e}")))?;
             out.push(s);
             current.clear();
         } else {
@@ -612,7 +616,9 @@ mod tests {
             reg_value::REG_BINARY,
             vec![0x00, 0xFF, 0x80, 0x7F],
         );
-        let file = PregFile { entries: vec![entry.clone()] };
+        let file = PregFile {
+            entries: vec![entry.clone()],
+        };
         let bytes = encode_preg_file(&file);
         let back = decode_preg_file(&bytes).expect("decode");
         assert_eq!(back.entries.len(), 1);

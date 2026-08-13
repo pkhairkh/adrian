@@ -382,7 +382,7 @@ pub enum PolicyValue {
 /// emitted; other settings are skipped (they are compiled by the per-
 /// platform executors into other wire formats).
 pub fn compile_to_preg(policy: &DeclarativePolicy) -> adrian_policy_preg::PregFile {
-    use adrian_policy_preg::{PregEntry, PregFile, reg_value};
+    use adrian_policy_preg::{reg_value, PregEntry, PregFile};
 
     let mut entries = Vec::new();
     for setting in &policy.settings {
@@ -423,7 +423,12 @@ pub fn compile_to_preg(policy: &DeclarativePolicy) -> adrian_policy_preg::PregFi
                 ));
             }
             PolicyValue::Bytes(b) => {
-                entries.push(PregEntry::new(key, value_name, reg_value::REG_BINARY, b.clone()));
+                entries.push(PregEntry::new(
+                    key,
+                    value_name,
+                    reg_value::REG_BINARY,
+                    b.clone(),
+                ));
             }
             PolicyValue::StringList(list) => {
                 entries.push(PregEntry::new(
@@ -522,8 +527,7 @@ fn plist_value_xml(v: &PolicyValue) -> String {
 /// Minimal RFC 4648 base64 encoder (no external dep — keeps
 /// `adrian-policy-core` lean).
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let chunks = bytes.chunks_exact(3);
     let rem = chunks.remainder();

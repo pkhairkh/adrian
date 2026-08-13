@@ -296,7 +296,10 @@ mod tests {
         let confounder = [0x42u8; CONFOUNDER_LEN];
         let plaintext = b"PA-ENC-TS-ENC payload goes here, 16+ bytes";
         let blob = encrypt_aes256_cts_hmac_sha1_96(&key, &confounder, plaintext).unwrap();
-        assert_eq!(blob.len(), plaintext.len() + CONFOUNDER_LEN + HMAC_SHA1_96_LEN);
+        assert_eq!(
+            blob.len(),
+            plaintext.len() + CONFOUNDER_LEN + HMAC_SHA1_96_LEN
+        );
         let recovered = decrypt_aes256_cts_hmac_sha1_96(&key, &blob).unwrap();
         assert_eq!(&recovered, plaintext);
     }

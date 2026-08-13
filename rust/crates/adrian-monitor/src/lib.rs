@@ -363,16 +363,18 @@ impl MetricsRegistry {
     /// Increment `fdb_operations_total{op_type}` by 1.
     pub async fn inc_fdb_operation(&self, op_type: &str) {
         let mut inner = self.inner.lock().await;
-        *inner.fdb_operations_total.entry(op_type.to_string()).or_insert(0) += 1;
+        *inner
+            .fdb_operations_total
+            .entry(op_type.to_string())
+            .or_insert(0) += 1;
     }
 
     /// Set `replication_lag_seconds{source_dc, target_dc}` (in seconds).
     pub async fn set_replication_lag(&self, source_dc: &str, target_dc: &str, lag_seconds: f64) {
         let mut inner = self.inner.lock().await;
-        inner.replication_lag_seconds.insert(
-            (source_dc.to_string(), target_dc.to_string()),
-            lag_seconds,
-        );
+        inner
+            .replication_lag_seconds
+            .insert((source_dc.to_string(), target_dc.to_string()), lag_seconds);
     }
 
     /// Set `rid_pool_remaining{domain_sid}` (count of unallocated RIDs).
@@ -415,12 +417,15 @@ impl MetricsRegistry {
             "# HELP adrian_as_req_duration_seconds Latency of Kerberos AS-REQ handling.\n",
         );
         out.push_str("# TYPE adrian_as_req_duration_seconds histogram\n");
-        render_histogram(&mut out, "adrian_as_req_duration_seconds", &[], &inner.as_req_duration_seconds);
+        render_histogram(
+            &mut out,
+            "adrian_as_req_duration_seconds",
+            &[],
+            &inner.as_req_duration_seconds,
+        );
 
         // ldap_query_duration_seconds
-        out.push_str(
-            "# HELP adrian_ldap_query_duration_seconds Latency of LDAP query handling.\n",
-        );
+        out.push_str("# HELP adrian_ldap_query_duration_seconds Latency of LDAP query handling.\n");
         out.push_str("# TYPE adrian_ldap_query_duration_seconds histogram\n");
         let mut ldap_entries: Vec<_> = inner.ldap_query_duration_seconds.iter().collect();
         ldap_entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -544,7 +549,10 @@ fn render_histogram(
             .collect::<Vec<_>>()
             .join(",");
         out.push_str(&format!("{name}_sum{{{labels}}} {sum}\n", sum = state.sum));
-        out.push_str(&format!("{name}_count{{{labels}}} {count}\n", count = state.count));
+        out.push_str(&format!(
+            "{name}_count{{{labels}}} {count}\n",
+            count = state.count
+        ));
     }
 }
 
@@ -609,7 +617,10 @@ impl MonitorService {
                     async move {
                         let body = metrics.render_prometheus().await;
                         (
-                            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4; charset=utf-8",
+                            )],
                             body,
                         )
                     }
@@ -732,9 +743,12 @@ mod tests {
         // and renders in Prometheus exposition 0.0.4 format with the
         // `# TYPE ... counter` line.
         let reg = MetricsRegistry::new();
-        reg.inc_as_req("ADRIAN.DEV", "aes256-cts-hmac-sha1-96").await;
-        reg.inc_as_req("ADRIAN.DEV", "aes256-cts-hmac-sha1-96").await;
-        reg.inc_as_req("ADRIAN.DEV", "aes128-cts-hmac-sha1-96").await;
+        reg.inc_as_req("ADRIAN.DEV", "aes256-cts-hmac-sha1-96")
+            .await;
+        reg.inc_as_req("ADRIAN.DEV", "aes256-cts-hmac-sha1-96")
+            .await;
+        reg.inc_as_req("ADRIAN.DEV", "aes128-cts-hmac-sha1-96")
+            .await;
 
         let out = reg.render_prometheus().await;
         assert!(
@@ -742,11 +756,15 @@ mod tests {
             "missing TYPE line: {out}"
         );
         assert!(
-            out.contains(r#"adrian_as_req_total{realm="ADRIAN.DEV",etype="aes256-cts-hmac-sha1-96"} 2"#),
+            out.contains(
+                r#"adrian_as_req_total{realm="ADRIAN.DEV",etype="aes256-cts-hmac-sha1-96"} 2"#
+            ),
             "missing counter line for aes256 (expected count=2): {out}"
         );
         assert!(
-            out.contains(r#"adrian_as_req_total{realm="ADRIAN.DEV",etype="aes128-cts-hmac-sha1-96"} 1"#),
+            out.contains(
+                r#"adrian_as_req_total{realm="ADRIAN.DEV",etype="aes128-cts-hmac-sha1-96"} 1"#
+            ),
             "missing counter line for aes128 (expected count=1): {out}"
         );
     }
@@ -763,10 +781,15 @@ mod tests {
         reg.set_rid_pool_remaining("S-1-5-21-...", 999.0).await;
 
         let out = reg.render_prometheus().await;
-        assert!(out.contains("# TYPE adrian_krbtgt_key_age_seconds gauge"), "{out}");
+        assert!(
+            out.contains("# TYPE adrian_krbtgt_key_age_seconds gauge"),
+            "{out}"
+        );
         assert!(out.contains("adrian_krbtgt_key_age_seconds 86400"), "{out}");
         assert!(
-            out.contains(r#"adrian_replication_lag_seconds{source_dc="dc01",target_dc="dc02"} 12.5"#),
+            out.contains(
+                r#"adrian_replication_lag_seconds{source_dc="dc01",target_dc="dc02"} 12.5"#
+            ),
             "{out}"
         );
         assert!(
@@ -801,11 +824,15 @@ mod tests {
         // LDAP histogram with scope label — cumulative bucket at le=0.01
         // should be 1 (the 0.01 observation falls in le=0.01).
         assert!(
-            out.contains(r#"adrian_ldap_query_duration_seconds_bucket{scope="subtree",le="0.01"} 1"#),
+            out.contains(
+                r#"adrian_ldap_query_duration_seconds_bucket{scope="subtree",le="0.01"} 1"#
+            ),
             "missing LDAP cumulative le=0.01 bucket: {out}"
         );
         assert!(
-            out.contains(r#"adrian_ldap_query_duration_seconds_bucket{scope="subtree",le="+Inf"} 1"#),
+            out.contains(
+                r#"adrian_ldap_query_duration_seconds_bucket{scope="subtree",le="+Inf"} 1"#
+            ),
             "missing LDAP +Inf bucket: {out}"
         );
     }
@@ -860,14 +887,22 @@ mod tests {
         let sink = OtelAuditSink::new();
         assert_eq!(sink.events_seen(), 0, "fresh sink should have 0 events");
         let event = AuditEvent::new(AuditEventType::DcSyncAttempt, AuditOutcome::Denied);
-        sink.write(event).await.expect("otel sink stub should return Ok");
+        sink.write(event)
+            .await
+            .expect("otel sink stub should return Ok");
         assert_eq!(sink.events_seen(), 1, "sink should have seen 1 event");
         // Write a few more.
         for _ in 0..3 {
             let event = AuditEvent::new(AuditEventType::LdapBind, AuditOutcome::Success);
-            sink.write(event).await.expect("otel sink stub should return Ok");
+            sink.write(event)
+                .await
+                .expect("otel sink stub should return Ok");
         }
-        assert_eq!(sink.events_seen(), 4, "sink should have seen 4 events total");
+        assert_eq!(
+            sink.events_seen(),
+            4,
+            "sink should have seen 4 events total"
+        );
     }
 
     #[tokio::test]
@@ -878,11 +913,11 @@ mod tests {
         // is kept so the test can read `events_seen()` directly.
         let otel = Arc::new(OtelAuditSink::new());
         let pipeline = AuditPipeline::new(otel.clone());
-        let event = AuditEvent::new(
-            AuditEventType::KrbtgtRotation,
-            AuditOutcome::Success,
-        );
-        pipeline.emit(event).await.expect("pipeline emit should succeed");
+        let event = AuditEvent::new(AuditEventType::KrbtgtRotation, AuditOutcome::Success);
+        pipeline
+            .emit(event)
+            .await
+            .expect("pipeline emit should succeed");
         assert_eq!(otel.events_seen(), 1, "otel sink should have seen 1 event");
     }
 
@@ -898,7 +933,10 @@ mod tests {
             AuditEventType::SmbShareMount,
             AuditOutcome::Failure("permission denied".into()),
         );
-        monitor.emit_audit(event).await.expect("monitor emit_audit should succeed");
+        monitor
+            .emit_audit(event)
+            .await
+            .expect("monitor emit_audit should succeed");
         assert_eq!(otel.events_seen(), 1);
     }
 
@@ -907,16 +945,31 @@ mod tests {
         // The OTel log-record `Body` field is `adrian.<domain>.<action>`
         // per ADR-060 §Decision. Verify every variant maps to a stable
         // name — SIEM rules key on these names.
-        assert_eq!(AuditEventType::KerberosAsReq.as_event_name(), "adrian.kerberos.as_req");
-        assert_eq!(AuditEventType::KerberosTgsReq.as_event_name(), "adrian.kerberos.tgs_req");
+        assert_eq!(
+            AuditEventType::KerberosAsReq.as_event_name(),
+            "adrian.kerberos.as_req"
+        );
+        assert_eq!(
+            AuditEventType::KerberosTgsReq.as_event_name(),
+            "adrian.kerberos.tgs_req"
+        );
         assert_eq!(AuditEventType::LdapBind.as_event_name(), "adrian.ldap.bind");
-        assert_eq!(AuditEventType::LdapModify.as_event_name(), "adrian.ldap.modify");
+        assert_eq!(
+            AuditEventType::LdapModify.as_event_name(),
+            "adrian.ldap.modify"
+        );
         assert_eq!(
             AuditEventType::PasswordChange.as_event_name(),
             "adrian.identity.password_change"
         );
-        assert_eq!(AuditEventType::CertEnroll.as_event_name(), "adrian.pki.cert_enroll");
-        assert_eq!(AuditEventType::SmbShareMount.as_event_name(), "adrian.file.share_mount");
+        assert_eq!(
+            AuditEventType::CertEnroll.as_event_name(),
+            "adrian.pki.cert_enroll"
+        );
+        assert_eq!(
+            AuditEventType::SmbShareMount.as_event_name(),
+            "adrian.file.share_mount"
+        );
         assert_eq!(
             AuditEventType::KrbtgtRotation.as_event_name(),
             "adrian.kdc.krbtgt_rotation"
@@ -945,9 +998,7 @@ mod tests {
         assert_eq!(back.principal.as_deref(), Some("svc-drs$@ADRIAN.DEV"));
         assert_eq!(back.outcome, AuditOutcome::Denied);
         assert_eq!(
-            back.details
-                .get("control_access")
-                .and_then(|v| v.as_str()),
+            back.details.get("control_access").and_then(|v| v.as_str()),
             Some("{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}")
         );
     }
