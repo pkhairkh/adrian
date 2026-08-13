@@ -18,6 +18,7 @@ use adrian_sid::Sid;
 use async_trait::async_trait;
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -50,12 +51,27 @@ pub struct Privilege {
 }
 
 /// Credential handle returned by `authenticate()` / `delegate()`.
+///
+/// Sensitive byte material (TGT cache, NT hash, OAuth2 JWT bearer token) is
+/// wrapped in [`Zeroizing`] so the underlying heap buffer is securely wiped
+/// when the handle is dropped (Wave 1d — `eval/wave1c-auth-crypto.md`
+/// S-005 / `eval/wave2a-security.md` S-005). The `Certificate` variant's
+/// `der` field is the public cert (no private key material), so it is left
+/// as a plain `Vec<u8>`.
 #[derive(Clone, Debug)]
 pub enum CredentialHandle {
-    KerberosTgt { krb5_ccache: Vec<u8> },
-    NtlmHash { nt_hash: Vec<u8> },
+    /// Kerberos TGT (cached `krb5_ccache` bytes — sensitive, contains the
+    /// user's session key). Wrapped in `Zeroizing` for crypto hygiene.
+    KerberosTgt { krb5_ccache: Zeroizing<Vec<u8>> },
+    /// NTLM hash (16-byte NTOWFv1 — equivalent in sensitivity to a password).
+    /// Wrapped in `Zeroizing` so it is wiped on drop.
+    NtlmHash { nt_hash: Zeroizing<Vec<u8>> },
+    /// X.509 certificate (DER-encoded). Public material — no wrapping.
     Certificate { der: Vec<u8> },
-    OAuth2Token { jwt: String },
+    /// OAuth2 bearer JWT (sensitive — anyone holding it can impersonate the
+    /// principal until expiry). Wrapped in `Zeroizing<String>` so the heap
+    /// buffer is wiped on drop.
+    OAuth2Token { jwt: Zeroizing<String> },
 }
 
 /// Authenticated principal.
@@ -150,17 +166,18 @@ mod tests {
     /// Every `CredentialHandle` variant must construct from its raw fields.
     /// This pins the variant surface so a later wave cannot quietly rename
     /// a field (e.g. `krb5_ccache` → `ccache`) without breaking callers.
+    /// Sensitive fields are wrapped in `Zeroizing` per Wave 1d (S-005).
     #[test]
     fn credential_handle_variants_construct() {
         let _tgt = CredentialHandle::KerberosTgt {
-            krb5_ccache: vec![0x05, 0x04],
+            krb5_ccache: Zeroizing::new(vec![0x05, 0x04]),
         };
         let _ntlm = CredentialHandle::NtlmHash {
-            nt_hash: vec![0u8; 16],
+            nt_hash: Zeroizing::new(vec![0u8; 16]),
         };
         let _cert = CredentialHandle::Certificate { der: vec![0x30] };
         let _oauth = CredentialHandle::OAuth2Token {
-            jwt: "eyJhbGciOiJIUzI1NiJ9.e30".into(),
+            jwt: Zeroizing::new("eyJhbGciOiJIUzI1NiJ9.e30".into()),
         };
         // The variants must be Clone + Debug for token-cache storage.
         let cloned = _tgt.clone();
@@ -192,7 +209,7 @@ mod tests {
             logon_time: chrono::Utc::now(),
             logon_server: "\\\\DC01".into(),
             credential_handle: CredentialHandle::KerberosTgt {
-                krb5_ccache: vec![],
+                krb5_ccache: Zeroizing::new(vec![]),
             },
         };
         assert_eq!(principal.upn, "alice@corp.example.com");
@@ -278,7 +295,7 @@ mod tests {
                     logon_time: chrono::Utc::now(),
                     logon_server: "\\\\DC01".into(),
                     credential_handle: CredentialHandle::KerberosTgt {
-                        krb5_ccache: vec![],
+                        krb5_ccache: Zeroizing::new(vec![]),
                     },
                 },
                 "SeTcbPrivilege",

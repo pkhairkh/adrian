@@ -28,12 +28,22 @@
 //!   The wire format here is a simplified structured binary format (length-
 //!   prefixed fields, not BER/DER). A future wave's `rasn-kerberos` codec
 //!   integration will swap the parser/encoder for the real KRB-PRIV codec.
+//!   However, a `KrbPrivEnvelope` helper (encrypt/decrypt via the HSM's
+//!   AES-256-GCM primitive) is provided so callers can wrap the password
+//!   field before sending; see the docs on `KpasswdRequest::new_password`.
 //! - The authenticator verification is simplified: instead of decoding a
 //!   real Kerberos Authenticator (RFC 4120 §5.5.1), the request includes a
 //!   raw `authenticator_mac: Vec<u8>` which is HMAC-SHA1-96 over the
 //!   request body under the krbtgt key. This is the same crypto primitive
 //!   (HMAC-SHA1-96, RFC 3961 checksum profile) but not the wire-compatible
 //!   ASN.1 structure.
+//! - **Replay defense (added Wave 1d)**: `KpasswdService` holds a
+//!   [`ReplayCache`] keyed by authenticator MAC. Replays within the
+//!   authenticator lifetime window (5 minutes, RFC 4120 §10) are rejected
+//!   with `KRB5KRB_AP_ERR_REPEAT`. This is a server-side defense — the
+//!   authenticator itself still lacks the RFC 4120 §5.5.1 timestamp/
+//!   usec fields, so this cache is the only freshness signal available
+//!   until a real Authenticator codec lands.
 //! - bcrypt is not in the workspace deps; PBKDF2-HMAC-SHA256 (200k
 //!   iterations) is used as a substitute for password hashing. Real bcrypt
 //!   can be added in a future wave.
@@ -49,11 +59,14 @@
 
 use crate::krbtgt::KrbtgtManager;
 use crate::KdcError;
-use adrian_hsm::{Hsm, KeyType};
+use adrian_hsm::{Hsm, KeyHandle, KeyType};
 #[cfg(test)]
 use adrian_storage_core::Object;
 use adrian_storage_core::{DirectoryStore, DistinguishedName};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 /// RFC 3244 result codes (§3.2 / §3.3).
 pub mod result_code {
@@ -69,6 +82,9 @@ pub mod result_code {
     pub const KRB5_KPASSWD_SOFTERROR: u32 = 8;
     /// Bad password change message integrity (KRB5KRB_AP_ERR_BAD_INTEGRITY).
     pub const KRB5KRB_AP_ERR_BAD_INTEGRITY: u32 = 1_000_029;
+    /// Repeated request (KRB5KRB_AP_ERR_REPEAT) — RFC 4120 §10. authenticator
+    /// replay detected by the server's replay cache.
+    pub const KRB5KRB_AP_ERR_REPEAT: u32 = 1_000_031;
     /// Principal unknown (KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN).
     pub const KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN: u32 = 1_000_007;
     /// Policy violation (KRB5KDC_ERR_POLICY).
@@ -133,9 +149,18 @@ pub struct KpasswdRequest {
     /// HMAC-SHA1-96 of the request body under the krbtgt key — proves the
     /// request was authenticated via a TGT (RFC 4120 §5.5.1 Authenticator).
     pub authenticator_mac: Vec<u8>,
-    /// New password (encrypted to the user's TGT session key in real
-    /// RFC 3244 — here it's passed as cleartext bytes for the test
-    /// surface; production code must wrap with KRB-PRIV).
+    /// New password. **PRODUCTION CALLERS MUST wrap this field via
+    /// [`KrbPrivEnvelope::encrypt`] before sending the request on the
+    /// wire** — RFC 3244 §3.2 requires the password change data be wrapped
+    /// in a KRB-PRIV (RFC 4120 §3.5) encrypted to the target principal's
+    /// key. Until the per-principal key derivation path is implemented
+    /// (RFC 3961 §3), the placeholder KRB-PRIV envelope uses the krbtgt
+    /// AES-256 key. See `KrbPrivEnvelope` docs for the gap.
+    ///
+    /// The receiver (`handle_kpasswd`) currently treats this field as
+    /// cleartext (it does NOT call `KrbPrivEnvelope::decrypt`) — this is
+    /// documented as a known v0.6.0 limitation. Wire the decrypt path in
+    /// a future wave once the per-principal key lookup exists.
     pub new_password: Vec<u8>,
 }
 
@@ -178,6 +203,16 @@ impl KpasswdResponse {
     pub fn policy_violation(reason: impl Into<String>) -> Self {
         Self {
             result_code: result_code::KRB5KDC_ERR_POLICY,
+            result_string: reason.into(),
+        }
+    }
+
+    /// Replay-detection response (RFC 4120 §10 — KRB5KRB_AP_ERR_REPEAT).
+    /// Returned when the kpasswd service's [`ReplayCache`] detects that the
+    /// same authenticator was already used within the lifetime window.
+    pub fn replay_detected(reason: impl Into<String>) -> Self {
+        Self {
+            result_code: result_code::KRB5KRB_AP_ERR_REPEAT,
             result_string: reason.into(),
         }
     }
@@ -369,11 +404,173 @@ pub fn hash_password(password: &[u8]) -> Result<Vec<u8>, KdcError> {
     Ok(combined)
 }
 
+// ===== KRB-PRIV envelope (placeholder, RFC 4120 §3.5) =====
+//
+// Real Kerberos wraps the ChangePasswdData (new password) in a KRB-PRIV
+// encrypted to the target principal's key. The full KRB-PRIV ASN.1 structure
+// (EncryptedData + EncAPRepPart) requires a `rasn-kerberos` codec integration
+// that is not yet in place. This envelope provides the *cryptographic*
+// primitive (AES-256-GCM via the HSM) so callers can wrap the password field
+// before sending; the wire-format swap to real ASN.1 is a future wave.
+//
+// The encryption key used here is the krbtgt AES-256 key (since kpasswd
+// already holds a reference to the krbtgt manager). Real production code MUST
+// derive a per-target-principal key (RFC 3961 §3 key-derivation) — using the
+// krbtgt key is a documented v0.6.0 gap.
+
+/// KRB-PRIV envelope helper for wrapping the `new_password` field.
+///
+/// This is a *cryptographic* envelope (AES-256-GCM via the HSM), not the
+/// full RFC 4120 §3.5 ASN.1 KRB-PRIV structure. The HSM produces the
+/// ciphertext in the form `nonce[12] || ciphertext || tag[16]`; the receiver
+/// passes the same opaque blob back to `decrypt`.
+///
+/// ## v0.6.0 gap
+///
+/// Per RFC 4120 §3.5, the KRB-PRIV should be encrypted to the target
+/// principal's key (the user whose password is being changed). This
+/// implementation uses the krbtgt key as a placeholder because the
+/// per-principal key derivation path (RFC 3961 §3) is not yet implemented.
+/// Until that path exists, callers MUST treat the wire as untrusted and
+/// transport kpasswd only over an already-secured channel (TLS, Kerberos
+/// session, etc.). See `eval/wave2a-security.md` S-011.
+pub struct KrbPrivEnvelope;
+
+impl KrbPrivEnvelope {
+    /// Encrypt the cleartext password under the supplied AES-256 key handle
+    /// (typically the krbtgt key in v0.6.0; the target principal's key in
+    /// future waves). Returns the opaque blob `nonce[12] || ciphertext ||
+    /// tag[16]` produced by `Hsm::encrypt`.
+    pub async fn encrypt(
+        hsm: &Arc<dyn Hsm>,
+        key_handle: &KeyHandle,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, KdcError> {
+        hsm.encrypt(key_handle, plaintext)
+            .await
+            .map_err(|e| KdcError::Storage(format!("KRB-PRIV encrypt: {e}")))
+    }
+
+    /// Decrypt a blob produced by [`Self::encrypt`] under the same key
+    /// handle. Returns the cleartext password bytes.
+    pub async fn decrypt(
+        hsm: &Arc<dyn Hsm>,
+        key_handle: &KeyHandle,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, KdcError> {
+        hsm.decrypt(key_handle, ciphertext)
+            .await
+            .map_err(|e| KdcError::Storage(format!("KRB-PRIV decrypt: {e}")))
+    }
+}
+
+// ===== Replay cache (RFC 4120 §10) =====
+//
+// A captured authenticator can be replayed by an attacker to force the same
+// password change repeatedly. RFC 4120 §10 mandates a server-side replay cache
+// keyed by (client principal, authenticator checksum) with a 5-minute TTL
+// (authenticator lifetime window). This struct provides that cache.
+//
+// The cache key here is a u64 hash of the authenticator MAC. A real Kerberos
+// implementation would hash the (client, ctime, cusec) tuple from the
+// RFC 4120 §5.5.1 Authenticator; since this module's authenticator is a raw
+// HMAC-SHA1-96, the MAC bytes themselves are a sufficient unique identifier
+// (any change to client/target/password produces a different MAC).
+
+/// Authenticator replay cache (RFC 4120 §10).
+///
+/// Holds `(checksum → (timestamp, principal))` entries that expire after
+/// [`REPLAY_CACHE_TTL`]. The `check_and_add` method is the single entry point:
+/// it returns `Err` if the checksum was already seen, otherwise inserts the
+/// entry and returns `Ok(())`.
+pub struct ReplayCache {
+    entries: Arc<RwLock<BTreeMap<u64, (Instant, PrincipalName)>>>,
+}
+
+/// Replay-cache entry lifetime (5 minutes — RFC 4120 §10 authenticator
+/// lifetime window).
+pub const REPLAY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+impl ReplayCache {
+    /// Construct an empty replay cache.
+    pub fn new() -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    /// Check whether `authenticator_checksum` is already in the cache. If
+    /// yes, return `Err(KdcError::Storage("replay detected"))`. If no,
+    /// insert the entry and return `Ok(())`. Expired entries are evicted
+    /// lazily on each call.
+    pub async fn check_and_add(
+        &self,
+        authenticator_checksum: u64,
+        principal: PrincipalName,
+    ) -> Result<(), KdcError> {
+        let now = Instant::now();
+        let mut entries = self.entries.write().await;
+        // Evict expired entries (linear scan — the cache is bounded by the
+        // number of unique authenticators in a 5-minute window, which is at
+        // most a few thousand for a single KDC).
+        let expired: Vec<u64> = entries
+            .iter()
+            .filter(|(_, (ts, _))| now.duration_since(*ts) > REPLAY_CACHE_TTL)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in expired {
+            entries.remove(&k);
+        }
+        if entries.contains_key(&authenticator_checksum) {
+            return Err(KdcError::Storage(format!(
+                "kpasswd: replay detected for principal {} (checksum {authenticator_checksum:#018x})",
+                principal.name
+            )));
+        }
+        entries.insert(authenticator_checksum, (now, principal));
+        Ok(())
+    }
+
+    /// Current number of entries (for tests / diagnostics).
+    #[cfg(test)]
+    pub async fn len(&self) -> usize {
+        self.entries.read().await.len()
+    }
+
+    /// Returns true if the cache currently holds no entries.
+    #[cfg(test)]
+    pub async fn is_empty(&self) -> bool {
+        self.entries.read().await.is_empty()
+    }
+}
+
+impl Default for ReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Hash a byte slice to a u64 (FNV-1a, 64-bit). Used to derive a compact
+/// cache key from the variable-length authenticator MAC bytes. FNV-1a is
+/// not cryptographic — its purpose here is only to compress a 12-byte MAC
+/// into a u64 for BTreeMap lookup; collisions would cause a false "replay
+/// detected" error which is a fail-closed (safe) outcome.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// kpasswd service — co-located with the KDC per ADR-019 §Decision.
 pub struct KpasswdService {
     directory: Arc<dyn DirectoryStore>,
     krbtgt: Arc<KrbtgtManager>,
     hsm: Arc<dyn Hsm>,
+    /// Server-side authenticator replay cache (RFC 4120 §10). Added Wave 1d.
+    replay_cache: ReplayCache,
 }
 
 impl KpasswdService {
@@ -386,6 +583,7 @@ impl KpasswdService {
             directory,
             krbtgt,
             hsm,
+            replay_cache: ReplayCache::new(),
         }
     }
 
@@ -400,10 +598,13 @@ impl KpasswdService {
     ///    krbtgt key are accepted — old-key TGTs are rejected at kpasswd
     ///    even though the krbtgt manager retains the previous key for TGT
     ///    validation in TGS-REQ).
-    /// 4. Look up the target principal in the directory.
-    /// 5. Validate password quality (length ≥ 12, ≤ 256).
-    /// 6. Hash + write `unicodePwd` attribute on the target's directory object.
-    /// 7. Return success / failure response.
+    /// 4. **Replay-cache check** (Wave 1d, RFC 4120 §10): the authenticator
+    ///    MAC checksum is looked up in the server-side replay cache. A
+    ///    previously-seen checksum is rejected with `KRB5KRB_AP_ERR_REPEAT`.
+    /// 5. Look up the target principal in the directory.
+    /// 6. Validate password quality (length ≥ 12, ≤ 256).
+    /// 7. Hash + write `unicodePwd` attribute on the target's directory object.
+    /// 8. Return success / failure response.
     pub async fn handle_kpasswd(&self, req_bytes: &[u8]) -> Result<Vec<u8>, KdcError> {
         let req = KpasswdRequest::parse(req_bytes)?;
         // 2. Reject unauthenticated requests.
@@ -425,7 +626,12 @@ impl KpasswdService {
         // derive an HMAC subkey from the krbtgt key by treating it as opaque
         // bytes — but the HSM refuses to sign with Aes256 keys. Real Kerberos
         // derives a separate HMAC key from the krbtgt key (RFC 3961 §3); for
-        // this wave, we generate a sibling HMAC key under id "krbtgt-mac".
+        // this wave, we look up or create a sibling HMAC key under id
+        // "krbtgt-mac". As of Wave 1c, `Hsm::generate_key` is idempotent —
+        // if "krbtgt-mac" already exists (e.g. pre-seeded by the test), the
+        // existing key is returned verbatim without overwrite. The fallback
+        // `rotate_key` + `generate_key` branch is retained for legacy
+        // HSM implementations that lack idempotent generation.
         let mac_kh = match self.hsm.generate_key("krbtgt-mac", KeyType::HmacSha1).await {
             Ok(kh) => kh,
             Err(_) => {
@@ -451,7 +657,26 @@ impl KpasswdService {
             );
             return Ok(resp.encode());
         }
-        // 4. Look up the target principal.
+        // 4. Replay-cache check (RFC 4120 §10). The MAC is a 12-byte
+        // HMAC-SHA1-96; we hash it to a u64 cache key. Only verified
+        // authenticators are cached (we never cache a MAC whose verification
+        // failed — that would let an attacker poison the cache).
+        let checksum = fnv1a_64(&req.authenticator_mac);
+        if let Err(e) = self
+            .replay_cache
+            .check_and_add(checksum, req.client_principal.clone())
+            .await
+        {
+            // Surface the replay as a wire response (KRB5KRB_AP_ERR_REPEAT
+            // is mapped to SOFTERROR on the 16-bit wire field by
+            // `KpasswdResponse::encode`).
+            tracing::warn!(error = %e, "kpasswd replay detected");
+            let resp = KpasswdResponse::replay_detected(
+                "kpasswd: authenticator replay detected (RFC 4120 §10)",
+            );
+            return Ok(resp.encode());
+        }
+        // 5. Look up the target principal.
         let target_dn = req.target_principal.to_dn();
         let dn = DistinguishedName {
             dn: target_dn.clone(),
@@ -469,7 +694,7 @@ impl KpasswdService {
                 )));
             }
         };
-        // 5. Password quality validation.
+        // 6. Password quality validation.
         let pwd = &req.new_password;
         if pwd.len() < MIN_PASSWORD_LEN {
             let resp = KpasswdResponse::policy_violation(format!(
@@ -483,7 +708,7 @@ impl KpasswdService {
             ));
             return Ok(resp.encode());
         }
-        // 6. Hash + write unicodePwd.
+        // 7. Hash + write unicodePwd.
         let hash = hash_password(pwd)?;
         // Replace any existing unicodePwd attribute; otherwise add.
         if let Some(attr) = target_obj
@@ -507,7 +732,7 @@ impl KpasswdService {
             .put(&target_obj)
             .await
             .map_err(|e| KdcError::Storage(format!("directory put unicodePwd: {e}")))?;
-        // 7. Success.
+        // 8. Success.
         Ok(KpasswdResponse::success().encode())
     }
 
@@ -597,9 +822,11 @@ mod tests {
 
     /// Unauthenticated request (empty authenticator MAC) is rejected with
     /// `KRB5KRB_AP_ERR_BAD_INTEGRITY` — this is the RFC 3244 §3.2 requirement
-    /// that requests be KRB-PRIV-wrapped.
+    /// that requests be KRB-PRIV-wrapped. The wire-encoding maps the KRB5
+    /// error code (>u16::MAX) down to `KRB5_KPASSWD_SOFTERROR` (8) on the
+    /// 16-bit wire field, so the parsed response carries SOFTERROR plus a
+    /// result-string containing the diagnostic.
     #[tokio::test]
-    #[ignore = "kpasswd authenticated flow depends on AES-256-CTS bug; see Wave 6 follow-up."]
     async fn unauthenticated_request_rejected() {
         let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
         let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
@@ -613,13 +840,23 @@ mod tests {
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse resp");
-        assert_eq!(resp.result_code, result_code::KRB5KRB_AP_ERR_BAD_INTEGRITY);
+        // BAD_INTEGRITY (1_000_029) > u16::MAX → wire maps to SOFTERROR(8).
+        assert_eq!(
+            resp.result_code,
+            result_code::KRB5_KPASSWD_SOFTERROR,
+            "unauthenticated request must be rejected (wire-mapped to SOFTERROR)"
+        );
+        assert!(
+            resp.result_string.contains("missing authenticator MAC"),
+            "result={}",
+            resp.result_string
+        );
     }
 
     /// Authenticated request with a tampered MAC is rejected (golden-ticket
     /// defense — only MACs verifiable under the krbtgt key are accepted).
+    /// Same wire-mapping caveat as `unauthenticated_request_rejected`.
     #[tokio::test]
-    #[ignore = "kpasswd authenticated flow depends on AES-256-CTS bug; see Wave 6 follow-up."]
     async fn tampered_authenticator_rejected() {
         let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
         let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
@@ -646,17 +883,22 @@ mod tests {
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
+        // BAD_INTEGRITY (1_000_029) > u16::MAX → wire maps to SOFTERROR(8).
         assert_eq!(
             resp.result_code,
-            result_code::KRB5KRB_AP_ERR_BAD_INTEGRITY,
-            "tampered MAC must be rejected"
+            result_code::KRB5_KPASSWD_SOFTERROR,
+            "tampered MAC must be rejected (wire-mapped to SOFTERROR)"
+        );
+        assert!(
+            resp.result_string.contains("MAC verification failed"),
+            "result={}",
+            resp.result_string
         );
     }
 
     /// Authenticated request with a valid MAC succeeds: the password is
     /// updated in the directory and the response is `KRB5_KPASSWD_SUCCESS`.
     #[tokio::test]
-    #[ignore = "kpasswd authenticated flow depends on AES-256-CTS bug; see Wave 6 follow-up."]
     async fn authenticated_request_succeeds_and_updates_directory() {
         let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
         let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
@@ -673,7 +915,10 @@ mod tests {
         dir.put(&obj).await.unwrap();
         let svc = KpasswdService::new(dir.clone(), krbtgt, hsm.clone());
         // Pre-generate the krbtgt-mac HMAC key so we can sign the request
-        // with the same key the service will use to verify.
+        // with the same key the service will use to verify. As of Wave 1c,
+        // `Hsm::generate_key` is idempotent — the call below seeds the key,
+        // and `handle_kpasswd`'s subsequent `generate_key("krbtgt-mac", ...)`
+        // returns the same handle without overwriting material.
         let mac_kh = hsm
             .generate_key("krbtgt-mac", KeyType::HmacSha1)
             .await
@@ -717,7 +962,6 @@ mod tests {
 
     /// Unknown principal → `KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN` (RFC 3244 §3.3).
     #[tokio::test]
-    #[ignore = "kpasswd authenticated flow depends on AES-256-CTS bug; see Wave 6 follow-up."]
     async fn unknown_principal_returns_principal_unknown() {
         let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
         let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
@@ -755,7 +999,6 @@ mod tests {
     /// Too-short password → `KRB5KDC_ERR_POLICY` (ADR-019 §Decision:
     /// "Password too short (minimum 12 characters)").
     #[tokio::test]
-    #[ignore = "kpasswd authenticated flow depends on AES-256-CTS bug; see Wave 6 follow-up."]
     async fn short_password_rejected_with_policy_violation() {
         let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
         let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
@@ -799,6 +1042,164 @@ mod tests {
             "result={}",
             resp.result_string
         );
+    }
+
+    /// Replay cache rejects a duplicate authenticator MAC. The first request
+    /// succeeds (KRB5_KPASSWD_SUCCESS); the second request, replaying the
+    /// same MAC, is rejected with `KRB5KRB_AP_ERR_REPEAT` (mapped to
+    /// SOFTERROR on the wire per the 16-bit field constraint). Wave 1d.
+    #[tokio::test]
+    async fn replayed_authenticator_is_rejected() {
+        let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
+        let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
+        let dir: Arc<dyn DirectoryStore> = Arc::new(InMemoryDirectoryStore::new());
+        dir.put(&Object {
+            uuid: Uuid::from_u128(0xDDDD),
+            dn: DistinguishedName {
+                dn: "CN=alice,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            },
+            attributes: vec![],
+            dnt: UNASSIGNED_DNT,
+        })
+        .await
+        .unwrap();
+        let svc = KpasswdService::new(dir.clone(), krbtgt, hsm.clone());
+        let mac_kh = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .unwrap();
+        let client = "alice@ADRIAN.EXAMPLE.COM";
+        let pwd = b"new-strong-password!";
+        let mut mac_input = Vec::new();
+        mac_input.extend_from_slice(client.as_bytes());
+        mac_input.extend_from_slice(client.as_bytes());
+        mac_input.extend_from_slice(pwd);
+        let mac = hsm.sign(&mac_kh, &mac_input).await.unwrap();
+        let req = KpasswdRequest {
+            client_principal: PrincipalName::new(client),
+            target_principal: PrincipalName::new(client),
+            authenticator_mac: mac.clone(),
+            new_password: pwd.to_vec(),
+        };
+        // First request: success.
+        let bytes = req.encode();
+        let resp1_bytes = svc.handle_kpasswd(&bytes).await.expect("handle1");
+        let resp1 = KpasswdResponse::parse(&resp1_bytes).expect("parse1");
+        assert_eq!(
+            resp1.result_code,
+            result_code::KRB5_KPASSWD_SUCCESS,
+            "first request must succeed"
+        );
+        // Second request (replay): KRB5KRB_AP_ERR_REPEAT (1_000_031) > u16::MAX
+        // → wire-mapped to SOFTERROR(8); result-string carries "replay detected".
+        let resp2_bytes = svc.handle_kpasswd(&bytes).await.expect("handle2");
+        let resp2 = KpasswdResponse::parse(&resp2_bytes).expect("parse2");
+        assert_eq!(
+            resp2.result_code,
+            result_code::KRB5_KPASSWD_SOFTERROR,
+            "replay must be rejected with SOFTERROR wire code"
+        );
+        assert!(
+            resp2.result_string.contains("replay"),
+            "result_string should mention replay, got: {}",
+            resp2.result_string
+        );
+        // Cache now holds 1 entry (the replayed authenticator).
+        assert_eq!(
+            svc.replay_cache.len().await,
+            1,
+            "cache should hold the replayed MAC"
+        );
+        assert!(!svc.replay_cache.is_empty().await);
+    }
+
+    /// `ReplayCache::check_and_add` returns Ok for a fresh checksum and
+    /// Err (replay) for a duplicate. Distinct principals with distinct
+    /// checksums coexist in the cache.
+    #[tokio::test]
+    async fn replay_cache_check_and_add_semantics() {
+        let cache = ReplayCache::new();
+        assert!(cache.is_empty().await);
+        // Fresh checksum → Ok, inserted.
+        cache
+            .check_and_add(0x1234_5678, PrincipalName::new("alice@REALM"))
+            .await
+            .expect("first insert");
+        assert_eq!(cache.len().await, 1);
+        // Same checksum, even with a different principal name → rejected
+        // (the cache is keyed by checksum only — principal is metadata).
+        let err = cache
+            .check_and_add(0x1234_5678, PrincipalName::new("alice@REALM"))
+            .await;
+        assert!(err.is_err(), "duplicate checksum must be rejected");
+        assert_eq!(
+            cache.len().await,
+            1,
+            "rejected entry must not be inserted again"
+        );
+        // A distinct checksum for a different principal → Ok, second entry.
+        cache
+            .check_and_add(0x9ABC_DEF0, PrincipalName::new("bob@REALM"))
+            .await
+            .expect("second insert");
+        assert_eq!(cache.len().await, 2);
+    }
+
+    /// `KrbPrivEnvelope` encrypt/decrypt round-trips under the krbtgt key
+    /// (placeholder per the v0.6.0 doc gap — uses the krbtgt AES-256 key
+    /// until the per-target-principal key derivation lands). Wave 1d.
+    #[tokio::test]
+    async fn krb_priv_envelope_round_trips_under_krbtgt_key() {
+        let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
+        let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
+        let key = krbtgt.current_key().await;
+        assert_eq!(key.key_type, KeyType::Aes256, "krbtgt key must be AES-256");
+        let plaintext = b"new-strong-password!";
+        let ciphertext = KrbPrivEnvelope::encrypt(&hsm, &key, plaintext)
+            .await
+            .expect("encrypt");
+        // HSM AES-256-GCM format: nonce[12] || ciphertext || tag[16].
+        assert!(
+            ciphertext.len() >= 12 + 16 + plaintext.len(),
+            "ciphertext must include nonce + ciphertext + tag, got {}",
+            ciphertext.len()
+        );
+        assert_ne!(
+            &ciphertext[..],
+            plaintext,
+            "ciphertext must not equal plaintext"
+        );
+        let decrypted = KrbPrivEnvelope::decrypt(&hsm, &key, &ciphertext)
+            .await
+            .expect("decrypt");
+        assert_eq!(
+            decrypted.as_slice(),
+            plaintext,
+            "round-trip must preserve plaintext"
+        );
+        // A different key must fail to decrypt (auth-tag mismatch).
+        let other_hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
+        let _ = KrbtgtManager::new(other_hsm.clone()).await.unwrap();
+        let other_key = other_hsm
+            .generate_key("krbtgt-other", KeyType::Aes256)
+            .await
+            .unwrap();
+        let err = KrbPrivEnvelope::decrypt(&other_hsm, &other_key, &ciphertext).await;
+        assert!(err.is_err(), "decrypt under wrong key must fail");
+    }
+
+    /// FNV-1a hash is deterministic and order-sensitive (different byte
+    /// sequences produce different hashes). The cache relies on this to
+    /// distinguish authenticators whose MAC bytes differ.
+    #[test]
+    fn fnv1a_64_is_deterministic_and_input_sensitive() {
+        let a = fnv1a_64(b"\xDE\xAD\xBE\xEF\x00\x11\x22\x33\x44\x55\x66\x77");
+        let a2 = fnv1a_64(b"\xDE\xAD\xBE\xEF\x00\x11\x22\x33\x44\x55\x66\x77");
+        assert_eq!(a, a2, "same input → same hash");
+        let b = fnv1a_64(b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF");
+        assert_ne!(a, b, "different input → different hash");
+        // Empty input is the FNV offset basis.
+        assert_eq!(fnv1a_64(b""), 0xcbf29ce484222325);
     }
 
     /// FAST armor TGT: `fast_required=true` + `pkinit_available=false` →
