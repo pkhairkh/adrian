@@ -20,4 +20,5 @@ openraft.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

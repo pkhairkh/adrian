@@ -166,3 +166,172 @@ impl RaftNetworkTransport {
 // TODO: implement openraft RaftNetwork over tokio::net::TcpStream per Decision 1.
 // TODO: implement Raft snapshot transfer for new-peer join per ADR-008.
 // TODO: implement UTD-vector synthesis from Raft commit index per ADR-071.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adrian_repl_core::ReplOperation;
+    use std::net::SocketAddr;
+
+    fn dummy_invocation_id() -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x_42)
+    }
+
+    fn dummy_socket_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn raft_log_entry_serialises_roundtrip() {
+        let entry = RaftLogEntry {
+            origin_invocation_id: dummy_invocation_id(),
+            origin_usn: 12345,
+            operation: ReplOperation::TombstoneGC { cutoff: 1337 },
+        };
+        let json = serde_json::to_string(&entry).expect("serialise");
+        let back: RaftLogEntry = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.origin_invocation_id, entry.origin_invocation_id);
+        assert_eq!(back.origin_usn, entry.origin_usn);
+        // ReplOperation doesn't derive PartialEq, so verify via re-serialisation.
+        let json2 = serde_json::to_string(&back).expect("re-serialise");
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn raft_log_entry_carries_modify_attribute_operation() {
+        let metadata = adrian_repl_core::PropertyMetaDataExt {
+            origin_invocation_id: dummy_invocation_id(),
+            origin_usn: 7,
+            version: 2,
+            last_write_timestamp: 1000,
+        };
+        let entry = RaftLogEntry {
+            origin_invocation_id: dummy_invocation_id(),
+            origin_usn: 7,
+            operation: ReplOperation::ModifyAttribute {
+                uuid: dummy_invocation_id(),
+                attribute: "cn".into(),
+                value: b"alice".to_vec(),
+                metadata,
+            },
+        };
+        let json = serde_json::to_string(&entry).expect("serialise");
+        // Verify the operation variant tag is preserved in the JSON, plus
+        // the attribute name and the value bytes (alice = [97, 108, 105,
+        // 99, 101]).
+        assert!(json.contains("ModifyAttribute"), "json={}", json);
+        assert!(json.contains("\"attribute\":\"cn\""), "json={}", json);
+        assert!(json.contains("[97,108,105,99,101]"), "json={}", json);
+    }
+
+    #[test]
+    fn raft_replicator_new_sets_fields() {
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let inv = dummy_invocation_id();
+        let replicator = RaftReplicator::new(inv, store, "cluster-a");
+        assert_eq!(replicator.invocation_id, inv);
+        assert_eq!(replicator.cluster_id, "cluster-a");
+        assert!(replicator.store.cluster_file.is_none());
+    }
+
+    #[test]
+    fn raft_replicator_new_accepts_string_and_str() {
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let _r1 = RaftReplicator::new(dummy_invocation_id(), store.clone(), "literal");
+        let owned = String::from("owned");
+        let _r2 = RaftReplicator::new(dummy_invocation_id(), store, owned);
+    }
+
+    #[tokio::test]
+    async fn raft_replicator_get_changes_is_not_yet_implemented() {
+        // The Raft log tail query is gated on openraft integration (TODO).
+        // Until then, get_changes MUST surface a Backend error so callers
+        // fall back to AD-interop mode or fail loudly.
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let replicator = RaftReplicator::new(dummy_invocation_id(), store, "c");
+        let cursor = UtdVector::default();
+        let result = replicator.get_changes(NcHead::nil(), &cursor).await;
+        assert!(
+            matches!(result, Err(ReplicationError::Backend(_))),
+            "{:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_replicator_apply_changes_is_not_yet_implemented() {
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let replicator = RaftReplicator::new(dummy_invocation_id(), store, "c");
+        let payload = ReplicationPayload {
+            nc_head: NcHead::nil(),
+            operations: vec![],
+            origin_invocation_id: dummy_invocation_id(),
+            highest_usn: 0,
+        };
+        let result = replicator.apply_changes(payload).await;
+        assert!(
+            matches!(result, Err(ReplicationError::Backend(_))),
+            "{:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_replicator_resolve_conflict_reports_split_brain() {
+        // Per ADR-071 / Decision 1: in native Raft mode conflicts should
+        // never occur because Raft serialises writes. resolve_conflict MUST
+        // return a Permanent error (not transient), surfacing possible
+        // split-brain to admins.
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let replicator = RaftReplicator::new(dummy_invocation_id(), store, "c");
+        let metadata = adrian_repl_core::PropertyMetaDataExt {
+            origin_invocation_id: dummy_invocation_id(),
+            origin_usn: 1,
+            version: 1,
+            last_write_timestamp: 0,
+        };
+        let conflict = ConflictRecord {
+            uuid: uuid::Uuid::nil(),
+            attribute: "cn".into(),
+            local: (b"local".to_vec(), metadata.clone()),
+            incoming: (b"incoming".to_vec(), metadata),
+        };
+        let result = replicator.resolve_conflict(conflict).await;
+        assert!(
+            matches!(result, Err(ReplicationError::Permanent(_))),
+            "{:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_replicator_sync_metadata_is_not_yet_implemented() {
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let replicator = RaftReplicator::new(dummy_invocation_id(), store, "c");
+        let result = replicator.sync_metadata("partner-dc").await;
+        assert!(
+            matches!(result, Err(ReplicationError::Backend(_))),
+            "{:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn raft_network_transport_new_sets_fields() {
+        let bind = dummy_socket_addr(389);
+        let peers = vec![dummy_socket_addr(390), dummy_socket_addr(391)];
+        let transport = RaftNetworkTransport::new(bind, peers.clone());
+        assert_eq!(transport.bind_addr, bind);
+        assert_eq!(transport.peers, peers);
+    }
+
+    #[test]
+    fn raft_network_transport_supports_empty_peers() {
+        // A bootstrap node starts with no peers (per ADR-008 — declarative
+        // topology; the first DSA boots, then others join via snapshot
+        // transfer).
+        let bind = dummy_socket_addr(389);
+        let transport = RaftNetworkTransport::new(bind, vec![]);
+        assert!(transport.peers.is_empty());
+    }
+}

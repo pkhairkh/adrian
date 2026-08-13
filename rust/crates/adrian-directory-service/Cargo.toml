@@ -28,3 +28,6 @@ ldap3.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+adrian-storage-testkit = { workspace = true }
+adrian-identity-testkit = { workspace = true }
+adrian-repl-testkit = { workspace = true }

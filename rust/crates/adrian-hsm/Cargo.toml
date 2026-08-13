@@ -12,3 +12,6 @@ thiserror.workspace = true
 cryptoki.workspace = true
 ring.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

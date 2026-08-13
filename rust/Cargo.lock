@@ -115,12 +115,15 @@ version = "0.1.0"
 dependencies = [
  "adrian-identity-core",
  "adrian-identity-fdb",
+ "adrian-identity-testkit",
  "adrian-repl-core",
+ "adrian-repl-testkit",
  "adrian-schema-compiler",
  "adrian-schema-traits",
  "adrian-sid",
  "adrian-storage-core",
  "adrian-storage-fdb",
+ "adrian-storage-testkit",
  "async-trait",
  "bytes",
  "ldap3",
@@ -195,6 +198,7 @@ dependencies = [
  "ring",
  "sha2",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -242,6 +246,7 @@ dependencies = [
  "foundationdb",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -472,6 +477,7 @@ dependencies = [
  "openraft",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
