@@ -565,6 +565,7 @@ version = "0.1.0"
 dependencies = [
  "adrian-auth-core",
  "adrian-identity-core",
+ "adrian-kdc",
  "adrian-policy-core",
  "adrian-smb-client",
  "adrian-storage-core",

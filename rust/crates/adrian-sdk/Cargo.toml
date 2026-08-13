@@ -19,6 +19,10 @@ adrian-storage-core = { path = "../adrian-storage-core" }
 adrian-identity-core = { path = "../adrian-identity-core" }
 adrian-policy-core = { path = "../adrian-policy-core" }
 adrian-smb-client = { path = "../adrian-smb-client" }
+# adrian-kdc is wired by `KerberosAuthModule::with_kdc` (Wave 3c, ADR-108).
+# The SDK drives an AS-REQ via `adrian_kdc::handlers::handle_as_req` when the
+# caller injects a `PrincipalStore` + krbtgt key.
+adrian-kdc = { path = "../adrian-kdc" }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

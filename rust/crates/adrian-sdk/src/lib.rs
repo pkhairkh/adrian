@@ -290,6 +290,7 @@ impl SdkBuilder {
 pub mod sdk {
     use super::SdkError;
     use async_trait::async_trait;
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------
     // Data types
@@ -493,13 +494,115 @@ pub mod sdk {
     /// Stub auth module — would delegate to `adrian-kdc` for Kerberos,
     /// `adrian-ntlm-client` for NTLM, the platform key store for cert,
     /// and the framework's OAuth2 validator for OAuth2.
-    #[derive(Debug, Default)]
-    pub struct KerberosAuthModule;
+    ///
+    /// ## Wave 3c wiring (ADR-108)
+    ///
+    /// `KerberosAuthModule::new()` returns an unwired module (preserves
+    /// backward compat with v0.5.0 callers). To actually drive an AS-REQ
+    /// against the in-workspace `adrian-kdc`, construct via
+    /// [`KerberosAuthModule::with_kdc`]:
+    ///
+    /// ```ignore
+    /// use adrian_kdc::store::{InMemoryPrincipalStore, PrincipalRecord};
+    /// use adrian_sdk::sdk::KerberosAuthModule;
+    ///
+    /// let store = std::sync::Arc::new(InMemoryPrincipalStore::new());
+    /// // store.insert(PrincipalRecord::new(...));
+    /// let krbtgt_key = [0u8; 32]; // production: from KrbtgtManager
+    /// let module = KerberosAuthModule::with_kdc(store, krbtgt_key);
+    /// ```
+    ///
+    /// When `with_kdc` was not called, `authenticate_kerberos` returns a
+    /// specific `SdkError::Auth` (NOT a generic "not yet wired" stub):
+    /// the error names the principal and points the caller at the
+    /// `with_kdc(...)` method so the wiring gap is actionable.
+    ///
+    /// When `with_kdc` was called, `authenticate_kerberos` actually drives
+    /// an AS-REQ via `adrian_kdc::handlers::handle_as_req`. The v0.6.0
+    /// SDK cannot encrypt the PA-ENC-TIMESTAMP pre-auth blob (the
+    /// `encrypt_for_usage` helper is `pub(crate)` in `adrian-kdc`), so the
+    /// KDC will respond with `KdcError::PreauthRequired`. The SDK surfaces
+    /// this as an `SdkError::Auth` carrying the KDC's typed error message;
+    /// v0.7.0 will add a public `encrypt_for_usage` (or an SDK-side
+    /// pre-auth helper) and complete the round-trip.
+    #[derive(Debug)]
+    pub struct KerberosAuthModule {
+        /// Injected KDC backend. `None` after `new()`; `Some` after
+        /// `with_kdc(...)`. Held as `Arc<dyn PrincipalStore>` so the same
+        /// store can be shared with the KDC service's other handlers.
+        kdc: Option<KdcBackend>,
+    }
+
+    /// Wired KDC backend held inside [`KerberosAuthModule`].
+    ///
+    /// Carries the principal store (any impl of
+    /// `adrian_kdc::store::PrincipalStore` — typically the in-memory
+    /// testkit store or, in production, a DirectoryStore adapter) and the
+    /// raw AES-256 krbtgt key used to encrypt TGT enc-parts.
+    ///
+    /// Note: v0.6.0 takes the raw `Aes256Key` directly because
+    /// `KrbtgtManager` cannot export its HSM-bound key material. v0.7.0
+    /// will add a `with_kdc_manager(Arc<KrbtgtManager>)` entry point once
+    /// the HSM exposes an etype-18 encrypt operation (or a key-export
+    /// escape hatch for development).
+    #[derive(Clone)]
+    pub struct KdcBackend {
+        /// Shared principal store — same trait object the KDC's
+        /// `handle_as_req` consults.
+        pub store: Arc<dyn adrian_kdc::store::PrincipalStore>,
+        /// Raw AES-256 krbtgt key (32 bytes). Caller is responsible for
+        /// key provenance.
+        pub krbtgt_key: adrian_kdc::crypto::Aes256Key,
+    }
+
+    impl std::fmt::Debug for KdcBackend {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // Don't print the krbtgt key material — key hygiene.
+            f.debug_struct("KdcBackend")
+                .field("store", &"<dyn PrincipalStore>")
+                .field("krbtgt_key", &"[redacted; 32 bytes]")
+                .finish()
+        }
+    }
 
     impl KerberosAuthModule {
-        /// Construct a stub auth module. No network / disk I/O.
+        /// Construct an unwired auth module. No network / disk I/O.
+        ///
+        /// `authenticate_kerberos` on the returned module will return a
+        /// specific `SdkError::Auth` pointing the caller at
+        /// [`KerberosAuthModule::with_kdc`].
         pub fn new() -> Self {
-            Self
+            Self { kdc: None }
+        }
+
+        /// Construct a wired auth module that drives an AS-REQ against
+        /// `adrian-kdc`'s real `handle_as_req`.
+        ///
+        /// Production callers should inject the workspace's shared
+        /// `PrincipalStore` (FDB-backed in production, in-memory in tests)
+        /// and the current krbtgt key (typically snapshotted from
+        /// `KrbtgtManager::current_key().await`).
+        pub fn with_kdc(
+            store: Arc<dyn adrian_kdc::store::PrincipalStore>,
+            krbtgt_key: adrian_kdc::crypto::Aes256Key,
+        ) -> Self {
+            Self {
+                kdc: Some(KdcBackend {
+                    store,
+                    krbtgt_key,
+                }),
+            }
+        }
+
+        /// True iff a KDC backend has been injected via `with_kdc(...)`.
+        pub fn is_kdc_wired(&self) -> bool {
+            self.kdc.is_some()
+        }
+    }
+
+    impl Default for KerberosAuthModule {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -514,9 +617,82 @@ pub mod sdk {
             // FAST-armored per ADR-012, returns a TGT in a
             // platform-native ticket cache (ADR-111). Stub returns
             // SdkError::Auth so callers don't mistake a stub for a TGT.
-            Err(SdkError::Auth(format!(
-                "Kerberos auth for {principal} not yet wired to adrian-kdc (ADR-108)"
-            )))
+            //
+            // Wave 3c: when the caller has injected a KDC backend via
+            // `with_kdc(...)`, actually drive the AS-REQ. The v0.6.0 SDK
+            // cannot encrypt the PA-ENC-TIMESTAMP pre-auth blob (the
+            // `encrypt_for_usage` helper is `pub(crate)` in
+            // `adrian-kdc`), so the KDC will respond with
+            // `KdcError::PreauthRequired`. Surface that error verbatim —
+            // it proves the wiring is alive and identifies the next
+            // concrete step (v0.7.0: expose encrypt_for_usage or add an
+            // SDK-side pre-auth helper).
+            let kdc = match &self.kdc {
+                None => {
+                    return Err(SdkError::Auth(format!(
+                        "Kerberos auth for {principal}: adrian-kdc handler not configured — \
+                         call KerberosAuthModule::with_kdc(store, krbtgt_key) to inject the \
+                         KDC backend (ADR-108)"
+                    )));
+                }
+                Some(b) => b.clone(),
+            };
+
+            // Parse `principal` into (realm, components). Accept the
+            // standard `user@REALM` form. SPN-style `host/foo.example.com`
+            // is rejected here for v0.6.0 simplicity (kinit-style usage
+            // only).
+            let (realm, cname) = crate::parse_kerberos_principal(principal).ok_or_else(|| {
+                SdkError::Auth(format!(
+                    "Kerberos auth for {principal}: invalid principal form (expected \
+                     `name@REALM`)"
+                ))
+            })?;
+
+            // Build an AS-REQ with empty padata. The KDC will respond
+            // with KDC_ERR_PREAUTH_REQUIRED (surfaced as
+            // `KdcError::PreauthRequired`) per RFC 4120 §3.1.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let req = adrian_kdc::handlers::AsReq {
+                pvno: adrian_kdc::handlers::PVNO,
+                msg_type: adrian_kdc::handlers::MSG_TYPE_AS_REQ,
+                realm,
+                cname,
+                nonce: 1,
+                etypes: vec![adrian_kdc::EType::Aes256CtsHmacSha1_96],
+                padata: Vec::new(),
+                till: now + 3600,
+            };
+            let req_bytes = adrian_kdc::handlers::encode_as_req(&req);
+
+            let rep_bytes = adrian_kdc::handlers::handle_as_req(
+                kdc.store.as_ref(),
+                &kdc.krbtgt_key,
+                &req_bytes,
+            )
+            .await
+            .map_err(|e| {
+                SdkError::Auth(format!(
+                    "Kerberos auth for {principal}: adrian-kdc AS-REQ failed: {e} \
+                     (ADR-108; pre-auth encryption wiring pending v0.7.0)"
+                ))
+            })?;
+
+            // On success, parse the AS-REP and return an AuthToken
+            // carrying the TGT. (Reachable once v0.7.0 adds pre-auth.)
+            let rep = adrian_kdc::handlers::decode_as_rep(&rep_bytes).map_err(|e| {
+                SdkError::Auth(format!(
+                    "Kerberos auth for {principal}: AS-REP decode failed: {e} (ADR-108)"
+                ))
+            })?;
+            Ok(AuthToken {
+                principal: rep.cname.join("/"),
+                expiry: Some(rep.ticket.kvno as u64),
+                kind: AuthTokenKind::Kerberos,
+            })
         }
         async fn authenticate_ntlm(
             &self,
@@ -665,9 +841,39 @@ pub mod sdk {
 // `sdk::*` to avoid the name collision.
 pub use sdk::{
     AcmeCertModule, AppliedPolicy, AuthToken, AuthTokenKind, CertEnrollRequest, DeclarativePolicy,
-    DeclarativePolicyModule, DirEntry, KerberosAuthModule, LdapDirectoryModule, ModifyEntry,
-    ModifyOp, MountedShare, SmbFileModule,
+    DeclarativePolicyModule, DirEntry, KdcBackend, KerberosAuthModule, LdapDirectoryModule,
+    ModifyEntry, ModifyOp, MountedShare, SmbFileModule,
 };
+
+// =========================================================================
+// Internal helpers (free functions)
+// =========================================================================
+
+/// Parse a Kerberos principal of the form `user@REALM` into `(realm, [user])`.
+///
+/// Returns `None` if the principal lacks `@`, has an empty realm, or has
+/// an empty name component. Multi-component SPNs (`host/foo.example.com`)
+/// are rejected for v0.6.0 simplicity — only `user@REALM` (kinit-style) is
+/// accepted by `KerberosAuthModule::authenticate_kerberos`.
+///
+/// Realm case is normalized to uppercase per RFC 4120 §6.1 (Kerberos realms
+/// are case-sensitive but conventionally uppercase; the KDC's
+/// `InMemoryPrincipalStore` normalizes on lookup, so the SDK matches that
+/// convention).
+fn parse_kerberos_principal(principal: &str) -> Option<(String, Vec<String>)> {
+    let at = principal.rfind('@')?;
+    let name = &principal[..at];
+    let realm = &principal[at + 1..];
+    if name.is_empty() || realm.is_empty() {
+        return None;
+    }
+    // Reject SPN-style (`host/foo`) — only single-component `user@REALM`
+    // for v0.6.0.
+    if name.contains('/') {
+        return None;
+    }
+    Some((realm.to_ascii_uppercase(), vec![name.to_string()]))
+}
 
 // =========================================================================
 // Tests
@@ -914,6 +1120,111 @@ mod api_tests {
                 assert!(msg.contains("adrian-kdc"), "got: {msg}");
             }
             other => panic!("expected SdkError::Auth, got {other:?}"),
+        }
+    }
+
+    /// Wave 3c (W6-3c): the unwired `KerberosAuthModule::new()` must NOT
+    /// return the v0.5.0 "not yet wired" stub message — it must return a
+    /// specific, actionable error that names the `with_kdc(...)` method
+    /// callers should use to inject the KDC backend.
+    #[tokio::test]
+    async fn kerberos_auth_module_returns_real_error_when_kdc_not_configured() {
+        let m = sdk::KerberosAuthModule::new();
+        assert!(!m.is_kdc_wired(), "new() must produce an unwired module");
+        let err = m
+            .authenticate_kerberos("alice@ADRIAN.EXAMPLE", "pw")
+            .await
+            .expect_err("unwired module must return Err");
+        match err {
+            SdkError::Auth(msg) => {
+                // Must NOT carry the v0.5.0 "not yet wired" stub phrase.
+                assert!(
+                    !msg.contains("not yet wired"),
+                    "error message must evolve past v0.5.0 stub; got: {msg}"
+                );
+                // Must name the principal.
+                assert!(msg.contains("alice@ADRIAN.EXAMPLE"), "got: {msg}");
+                // Must name the backend.
+                assert!(msg.contains("adrian-kdc"), "got: {msg}");
+                // Must point at the `with_kdc(...)` method.
+                assert!(msg.contains("with_kdc"), "got: {msg}");
+            }
+            other => panic!("expected SdkError::Auth, got {other:?}"),
+        }
+    }
+
+    /// Wave 3c (W6-3c): when `with_kdc(...)` IS called, the SDK must
+    /// actually drive an AS-REQ via `adrian_kdc::handlers::handle_as_req`.
+    /// The v0.6.0 SDK cannot encrypt the PA-ENC-TIMESTAMP pre-auth blob
+    /// (the `encrypt_for_usage` helper is `pub(crate)` in `adrian-kdc`),
+    /// so the KDC must respond with `KdcError::PreauthRequired`. The SDK
+    /// surfaces that as `SdkError::Auth(...)` carrying the KDC's typed
+    /// error message — proving the wiring is alive.
+    #[tokio::test]
+    async fn kerberos_auth_module_with_kdc_calls_handler_and_surfaces_preauth_required() {
+        use adrian_kdc::store::{InMemoryPrincipalStore, PrincipalRecord};
+
+        let store = std::sync::Arc::new(InMemoryPrincipalStore::new());
+        // Insert a principal so the KDC gets past "principal not found"
+        // and reaches the pre-auth check.
+        let alice_key = [0x42u8; 32];
+        let alice = PrincipalRecord::new(
+            uuid::Uuid::nil(),
+            "ADRIAN.EXAMPLE",
+            vec!["alice".into()],
+            alice_key,
+        );
+        store.insert(alice);
+        let krbtgt_key = [0x11u8; 32];
+
+        let m = sdk::KerberosAuthModule::with_kdc(store, krbtgt_key);
+        assert!(m.is_kdc_wired(), "with_kdc must mark the module as wired");
+
+        let err = m
+            .authenticate_kerberos("alice@ADRIAN.EXAMPLE", "pw")
+            .await
+            .expect_err(
+                "wired module must surface the KDC's PreauthRequired error (pre-auth encryption \
+                 is a v0.7.0 task)",
+            );
+        match err {
+            SdkError::Auth(msg) => {
+                // KDC returned `KdcError::PreauthRequired`; the SDK
+                // surfaces it via Display. The exact wording ("preauth
+                // required") is stable because `KdcError`'s Display impl
+                // is pinned by `kdc_error_display_messages`.
+                assert!(
+                    msg.contains("preauth required"),
+                    "expected KDC PreauthRequired to surface in error; got: {msg}"
+                );
+                assert!(msg.contains("alice@ADRIAN.EXAMPLE"), "got: {msg}");
+            }
+            other => panic!("expected SdkError::Auth, got {other:?}"),
+        }
+    }
+
+    /// Wave 3c (W6-3c): invalid principal forms (`user` without realm,
+    /// SPN-style `host/foo`, empty realm `user@`) must surface a
+    /// parse error rather than being passed to the KDC.
+    #[tokio::test]
+    async fn kerberos_auth_module_rejects_invalid_principal_form() {
+        let store = std::sync::Arc::new(adrian_kdc::store::InMemoryPrincipalStore::new());
+        let m = sdk::KerberosAuthModule::with_kdc(store, [0u8; 32]);
+
+        for bad in ["alice", "alice@", "@ADRIAN.EXAMPLE", "host/foo.adrian.example@ADRIAN"] {
+            let err = m
+                .authenticate_kerberos(bad, "pw")
+                .await
+                .expect_err("invalid principal form must be rejected");
+            match err {
+                SdkError::Auth(msg) => {
+                    assert!(
+                        msg.contains("invalid principal form"),
+                        "expected 'invalid principal form' for {bad:?}; got: {msg}"
+                    );
+                }
+                other => panic!("expected SdkError::Auth for {bad:?}, got {other:?}"),
+            }
         }
     }
 
