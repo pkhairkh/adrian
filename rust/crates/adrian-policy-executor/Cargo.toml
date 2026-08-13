@@ -8,6 +8,7 @@ description = "PolicyExecutor trait + 3 platform implementations (Windows, macOS
 
 [dependencies]
 adrian-policy-core = { workspace = true }
+adrian-policy-preg = { workspace = true }
 adrian-schema-traits = { workspace = true }
 adrian-sid = { workspace = true }
 async-trait.workspace = true

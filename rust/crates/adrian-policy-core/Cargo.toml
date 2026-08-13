@@ -8,6 +8,7 @@ description = "Canonical policy document model (PolicyDoc, PolicyArea) for the A
 
 [dependencies]
 adrian-schema-traits = { workspace = true }
+adrian-policy-preg = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
