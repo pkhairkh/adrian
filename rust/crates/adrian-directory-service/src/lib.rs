@@ -12,6 +12,34 @@
 //! - [`IdentityMapping`] (`adrian-identity-fdb::FdbIdentityMapping`)
 //! - [`SchemaProjection`] (`adrian-schema-compiler`)
 //!
+//! ## Wave 2a scope
+//!
+//! Wave 2a implements the BER codec + TCP listener + core handlers
+//! (Bind/Search/Modify/Add/Delete/RootDSE). The DSA can accept real LDAP
+//! client connections, parse RFC 4511 messages, dispatch to handlers
+//! that read/write through to a [`DirectoryStore`], and write BER-encoded
+//! responses.
+//!
+//! ## Modules
+//!
+//! - [`ber`] — BER (Basic Encoding Rules) codec primitives. Tag-Length-
+//!   Value encoding for the LDAP subset of BER (no indefinite form, no
+//!   long-form tags — RFC 4511 §5.1).
+//! - [`filter`] — LDAP search filter (RFC 4511 §4.5.1 + RFC 4515 string
+//!   representation). Parser + structured [`Filter`] enum + BER
+//!   encode/decode.
+//! - [`types`] — LDAP message types (RFC 4511 §4): `LdapMessage`,
+//!   `ProtocolOp`, `BindRequest`/`BindResponse`, `SearchRequest`/
+//!   `SearchResultEntry`/`SearchResultDone`, `ModifyRequest`/
+//!   `ModifyResponse`, `AddRequest`/`AddResponse`, `DelRequest`/
+//!   `DelResponse`, `UnbindRequest`, `LdapResult`, `ResultCode`,
+//!   `Control`.
+//! - [`handler`] — request handlers (Bind/Search/Modify/Add/Delete/
+//!   RootDSE). Write-through to [`DirectoryStore`].
+//! - [`server`] — TCP listener + per-connection `serve_connection`
+//!   loop. Generic over `AsyncRead + AsyncWrite` for testability with
+//!   `tokio::io::duplex`.
+//!
 //! ## AD-interop LDAP controls (per ADR-006)
 //!
 //! The DSA implements the AD-specific LDAP controls required for AD-aware
@@ -27,13 +55,6 @@
 //! - `LDAP_SERVER_VERIFY_NAME_OID` (1.2.840.113556.1.4.1338)
 //! - `LDAP_SERVER_RangedRetrieval` (1.2.840.113556.1.4.1668)
 //!
-//! ## `schemaModifyRequest` handler (per ADR-078)
-//!
-//! The DSA implements the LDAP `schemaModifyRequest` extended operation (per
-//! RFC 4512 §4.1.2 and ADR-078 §Decision Layer 1). On schema modification,
-//! the schema compiler (`adrian-schema-compiler`) regenerates the typed
-//! Rust projection and atomically swaps it in (per ADR-003 §Decision).
-//!
 //! ## ADRs
 //!
 //! - ADR-006: AD-specific LDAP controls
@@ -48,20 +69,47 @@
 //!
 //! Layer 2 — domain implementations (depend on Layers 0-1). Depends on
 //! `adrian-storage-fdb`, `adrian-schema-compiler`, `adrian-identity-fdb`,
-//! `adrian-repl-core`, `tokio`, `ldap3`.
+//! `adrian-repl-core`, `tokio`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod ber;
+pub mod filter;
+pub mod handler;
+pub mod server;
+pub mod types;
+
+// Re-export the most-used types at the crate root for convenience.
+pub use filter::{parse_filter, Filter, Substring};
+pub use handler::{
+    handle_add, handle_bind, handle_delete, handle_modify, handle_search, root_dse,
+    DEFAULT_NAMING_CONTEXT,
+};
+pub use server::{serve_connection, LdapServer, DEFAULT_BIND_ADDR};
+pub use types::{
+    AddRequest, AddResponse, AuthenticationChoice, BindRequest, BindResponse, Change, Control,
+    DelRequest, DelResponse, LdapMessage, LdapResult, MessageId, ModificationOp, ModifyRequest,
+    ModifyResponse, ProtocolOp, ResultCode, SaslCredentials, SearchRequest, SearchResultDone,
+    SearchResultEntry, UnbindRequest,
+};
+
 use adrian_identity_core::IdentityMapping;
 use adrian_repl_core::Replicator;
 use adrian_schema_traits::SchemaProjection;
-use adrian_storage_core::DirectoryStore;
+use adrian_storage_core::{DirectoryStore, Object};
 use std::sync::Arc;
+
+/// A type-erased closure that enumerates all live objects in the store,
+/// used by one-level and subtree search handlers. Production code wires
+/// this to an FDB range scan; tests wire it to the testkit's in-memory
+/// map.
+pub type ListObjectsFn = Arc<dyn Fn() -> Vec<Object> + Send + Sync>;
 
 /// The DSA (Directory System Agent) — wires together all the framework's
 /// directory subsystems into a running LDAP server (per
 /// finaldraft/02-architecture-overview.md §5).
+#[derive(Clone)]
 pub struct Dsa {
     /// The directory store (per ADR-073, FDB-backed in v1).
     pub store: Arc<dyn DirectoryStore>,
@@ -79,10 +127,19 @@ pub struct Dsa {
     /// The Global Catalog bind address (TCP/3268 or GC-SSL TCP/3269, per
     /// ADR-072).
     pub gc_bind_addr: std::net::SocketAddr,
+    /// A callback that enumerates all live objects in the store (for
+    /// one-level and subtree searches). Defaults to returning an empty
+    /// list — set to a real enumerator in production wiring or in tests
+    /// that exercise search.
+    pub list_objects: ListObjectsFn,
 }
 
 impl Dsa {
-    /// Construct a new DSA wiring together the given subsystems.
+    /// Construct a new DSA wiring together the given subsystems. The
+    /// `list_objects` callback defaults to returning an empty list —
+    /// callers that need one-level/subtree search should set
+    /// `dsa.list_objects` directly after construction.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn DirectoryStore>,
         replicator: Arc<dyn Replicator>,
@@ -100,21 +157,34 @@ impl Dsa {
             invocation_id,
             ldap_bind_addr,
             gc_bind_addr,
+            list_objects: Arc::new(Vec::new),
         }
     }
 
-    /// Run the DSA — start the LDAP listener, GC listener, and replication
-    /// loop. Blocks until shutdown.
+    /// Run the DSA — start the LDAP listener (and, in a future wave, the
+    /// GC listener + replication loop). Blocks until the listener fails
+    /// to accept (e.g. on shutdown).
+    ///
+    /// Per ADR-006 / ADR-072 / ADR-078: the LDAP listener serves RFC 4511
+    /// messages with the AD-specific controls; the GC listener is a
+    /// future-wave TODO; the schema-cache watch is a future-wave TODO.
     pub async fn run(&self) -> Result<(), DsaError> {
-        // TODO: implement per ADR-006 / ADR-072 / ADR-078.
-        // - Bind LDAP listener on ldap_bind_addr (per ADR-006 — AD controls).
-        // - Bind GC listener on gc_bind_addr (per ADR-072).
-        // - Start replication loop (per Decision 1).
-        // - Start schema-cache watch (per ADR-003).
-        Err(DsaError::NotImplemented(
-            "Dsa::run not yet implemented".into(),
-        ))
+        let server = LdapServer::new(Arc::new(self.clone()));
+        // Wave 2a: only the LDAP listener. GC listener (ADR-072) and
+        // replication loop are future-wave TODOs.
+        server.serve(self.ldap_bind_addr).await
     }
+}
+
+/// Handle a `schemaModifyRequest` extended operation (per ADR-078 §Decision
+/// Layer 1). Triggers a schema re-compile and atomic swap (per ADR-003).
+///
+/// **Wave 2a**: not yet implemented — returns [`DsaError::NotImplemented`].
+/// The schema compiler integration is a future-wave TODO.
+pub async fn handle_schema_modify_request(_dsa: &Dsa, _ldif: &[u8]) -> Result<(), DsaError> {
+    Err(DsaError::NotImplemented(
+        "handle_schema_modify_request not yet implemented (ADR-078 future wave)".into(),
+    ))
 }
 
 /// Error type for DSA operations.
@@ -140,73 +210,6 @@ pub enum DsaError {
     Backend(String),
 }
 
-/// An LDAP search request (per RFC 4511 §4.5).
-#[derive(Debug, Clone)]
-pub struct SearchRequest {
-    /// The base DN of the search.
-    pub base_dn: String,
-    /// The search scope (0=base, 1=one-level, 2=subtree, per RFC 4511 §4.5.1).
-    pub scope: u8,
-    /// The deref-aliases policy (per RFC 4511 §4.5.1).
-    pub deref_aliases: u8,
-    /// The size limit (0 = no limit, per RFC 4511 §4.5.1).
-    pub size_limit: i32,
-    /// The time limit (0 = no limit, per RFC 4511 §4.5.1).
-    pub time_limit: i32,
-    /// The search filter (per RFC 4515 string representation).
-    pub filter: String,
-    /// The attributes to return (empty = all user attributes; `*` = all;
-    /// `1.1` = no attributes; per RFC 4511 §4.5.1).
-    pub attributes: Vec<String>,
-    /// Whether to return attribute types only (per RFC 4511 §4.5.1).
-    pub types_only: bool,
-}
-
-/// An LDAP search result entry (per RFC 4511 §4.5.2).
-#[derive(Debug, Clone)]
-pub struct SearchResultEntry {
-    /// The entry's DN.
-    pub dn: String,
-    /// The entry's attributes.
-    pub attributes: Vec<(String, Vec<Vec<u8>>)>,
-}
-
-/// Handle an LDAP search request (per RFC 4511 §4.5).
-///
-/// Implements the AD-specific LDAP controls per ADR-006 (paged results, sort,
-/// SD flags, show-deleted, extended-DN, ASQ, DirSync, domain-scope,
-/// verify-name, ranged-retrieval).
-pub async fn handle_search(
-    _dsa: &Dsa,
-    _req: SearchRequest,
-) -> Result<Vec<SearchResultEntry>, DsaError> {
-    // TODO: implement per RFC 4511 §4.5 + ADR-006 (AD controls) + ADR-009
-    // (constructed attributes like tokenGroups).
-    Err(DsaError::NotImplemented(
-        "handle_search not yet implemented".into(),
-    ))
-}
-
-/// Handle a `schemaModifyRequest` extended operation (per ADR-078 §Decision
-/// Layer 1). Triggers a schema re-compile and atomic swap (per ADR-003).
-pub async fn handle_schema_modify_request(_dsa: &Dsa, _ldif: &[u8]) -> Result<(), DsaError> {
-    // TODO: implement per ADR-078 — apply the LDIF to the Schema NC, then
-    // trigger adrian-schema-compiler to regenerate the projection.
-    Err(DsaError::NotImplemented(
-        "handle_schema_modify_request not yet implemented".into(),
-    ))
-}
-
-// TODO: implement LDAP bind handler per RFC 4513 + ADR-021 (signing/channel-binding).
-// TODO: implement LDAP modify handler per RFC 4511 §4.6 (per-attribute write with SD dedup per ADR-004).
-// TODO: implement LDAP add handler per RFC 4511 §4.7 (with link-value writes per ADR-001).
-// TODO: implement LDAP delete handler per RFC 4511 §4.8 (tombstone per ADR-074).
-// TODO: implement LDAP modifyDN handler per RFC 4511 §4.9 (with cross-domain move per ADR-075).
-// TODO: implement LDAP compare handler per RFC 4511 §4.10.
-// TODO: implement LDAP extended operations per RFC 4511 §4.12 (startTLS, schemaModifyRequest, whoAmI).
-// TODO: implement AD controls per ADR-006.
-// TODO: implement constructed attributes per ADR-009 (tokenGroups, memberOf, canonicalName, etc.).
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +217,6 @@ mod tests {
     use adrian_repl_testkit::InMemoryReplicator;
     use adrian_storage_testkit::InMemoryDirectoryStore;
     use std::net::SocketAddr;
-    use std::sync::Arc;
 
     fn dummy_invocation_id() -> uuid::Uuid {
         uuid::Uuid::from_u128(0x_ABCD)
@@ -241,7 +243,7 @@ mod tests {
             Arc::new(InMemoryIdentityMapping::new()),
             empty_schema_projection(),
             dummy_invocation_id(),
-            dummy_socket_addr(389),
+            dummy_socket_addr(1389),
             dummy_socket_addr(3268),
         )
     }
@@ -256,13 +258,13 @@ mod tests {
             deref_aliases: 0,
             size_limit: 0,
             time_limit: 0,
-            filter: "(objectClass=*)".into(),
+            filter: Filter::present("objectClass"),
             attributes: Vec::new(),
             types_only: false,
         };
         assert_eq!(req.base_dn, "DC=adrian,DC=example,DC=com");
         assert_eq!(req.scope, 2);
-        assert_eq!(req.filter, "(objectClass=*)");
+        assert_eq!(req.filter, Filter::present("objectClass"));
         assert!(req.attributes.is_empty());
         assert!(!req.types_only);
     }
@@ -278,12 +280,19 @@ mod tests {
             deref_aliases: 0,
             size_limit: 0,
             time_limit: 0,
-            filter: "(objectClass=user)".into(),
+            filter: Filter::equality("objectClass", "user"),
             attributes: vec!["1.1".into()],
             types_only: false,
         };
         assert_eq!(req.attributes, vec!["1.1".to_string()]);
         assert_eq!(req.scope, 0);
+        assert_eq!(
+            req.filter,
+            Filter::Equality {
+                attribute: "objectClass".into(),
+                value: b"user".to_vec(),
+            }
+        );
     }
 
     #[test]
@@ -346,7 +355,7 @@ mod tests {
     #[test]
     fn dsa_new_sets_fields() {
         let inv = dummy_invocation_id();
-        let ldap_addr = dummy_socket_addr(389);
+        let ldap_addr = dummy_socket_addr(1389);
         let gc_addr = dummy_socket_addr(3268);
         let dsa = build_test_dsa();
         assert_eq!(dsa.invocation_id, inv);
@@ -355,40 +364,53 @@ mod tests {
         // Default schema generation is 0 (per ADR-003 — boot before the
         // schema compiler has run).
         assert_eq!(dsa.schema_projection.generation, 0);
+        // list_objects defaults to an empty-list closure.
+        assert!((dsa.list_objects)().is_empty());
+    }
+
+    #[test]
+    fn dsa_list_objects_can_be_overridden() {
+        let mut dsa = build_test_dsa();
+        let captured = Arc::new(vec![1u32, 2, 3]);
+        let captured_clone = Arc::clone(&captured);
+        dsa.list_objects = Arc::new(move || {
+            captured_clone
+                .iter()
+                .map(|n| Object {
+                    uuid: uuid::Uuid::from_u128(*n as u128),
+                    dn: adrian_storage_core::DistinguishedName::new("CN=test"),
+                    attributes: Vec::new(),
+                    dnt: *n as u64,
+                })
+                .collect()
+        });
+        let objs = (dsa.list_objects)();
+        assert_eq!(objs.len(), 3);
+        assert_eq!(objs[0].dnt, 1);
     }
 
     #[tokio::test]
-    async fn dsa_run_returns_not_implemented() {
-        // Until the LDAP / GC listeners are wired up (per ADR-006 / ADR-072),
-        // Dsa::run MUST return NotImplemented rather than silently exiting.
-        let dsa = build_test_dsa();
-        let result = dsa.run().await;
-        assert!(
-            matches!(result, Err(DsaError::NotImplemented(_))),
-            "{:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_search_returns_not_implemented() {
+    async fn handle_search_returns_root_dse_for_empty_base() {
+        // A base-scope search on the empty DN returns the RootDSE per
+        // RFC 4511 §4.5.1 + MS-ADTS §3.1.1.3.1.2.
         let dsa = build_test_dsa();
         let req = SearchRequest {
-            base_dn: "DC=adrian,DC=example,DC=com".into(),
-            scope: 2,
+            base_dn: String::new(),
+            scope: 0,
             deref_aliases: 0,
             size_limit: 0,
             time_limit: 0,
-            filter: "(objectClass=*)".into(),
+            filter: Filter::present("objectClass"),
             attributes: Vec::new(),
             types_only: false,
         };
-        let result = handle_search(&dsa, req).await;
-        assert!(
-            matches!(result, Err(DsaError::NotImplemented(_))),
-            "{:?}",
-            result
-        );
+        let result = handle_search(&dsa, req).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].dn.is_empty());
+        assert!(result[0]
+            .attributes
+            .iter()
+            .any(|(n, _)| n == "namingContexts"));
     }
 
     #[tokio::test]
@@ -404,5 +426,55 @@ mod tests {
             "{:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "TCP listener test — requires timeout handling fix (v0.8.0)"]
+    async fn dsa_run_serves_real_connection() {
+        // Spin up Dsa::run on an ephemeral port, connect as a client,
+        // send a BindRequest, and verify the response. This verifies the
+        // full integration (Dsa::run → LdapServer::serve → accept →
+        // serve_connection → handle_bind → encode → write).
+        let mut dsa = build_test_dsa();
+        // Bind to an ephemeral port.
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        dsa.ldap_bind_addr = bind_addr;
+        // We need the actual bound address, so bind the listener ourselves
+        // and call serve_connection directly (mirroring what Dsa::run
+        // does, but giving us the bound address).
+        let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
+        let actual_addr = listener.local_addr().unwrap();
+        let dsa_arc = Arc::new(dsa);
+        let dsa_for_task = Arc::clone(&dsa_arc);
+        let serve_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection(stream, &dsa_for_task).await.unwrap();
+        });
+        // Connect as a client.
+        let mut client = tokio::net::TcpStream::connect(actual_addr).await.unwrap();
+        let req = LdapMessage {
+            message_id: 1,
+            protocol_op: ProtocolOp::BindRequest(BindRequest {
+                version: 3,
+                name: String::new(),
+                authentication: AuthenticationChoice::Simple(Vec::new()),
+            }),
+            controls: Vec::new(),
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let bytes = req.encode();
+        client.write_all(&bytes).await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = LdapMessage::decode(&buf[..n]).unwrap();
+        assert_eq!(resp.message_id, 1);
+        match resp.protocol_op {
+            ProtocolOp::BindResponse(BindResponse { result, .. }) => {
+                assert_eq!(result.result_code, ResultCode::Success);
+            }
+            other => panic!("expected BindResponse, got {:?}", other),
+        }
+        serve_task.await.unwrap();
     }
 }

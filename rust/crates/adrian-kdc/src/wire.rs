@@ -38,8 +38,8 @@ use rasn_kerberos as rk;
 use uuid::Uuid;
 
 use crate::handlers::{
-    AsRep, AsReq, Authenticator, EncKdcRepPart, EncTicketPart, PaData, PaEncTsEnc, Ticket, TgsRep,
-    TgsReq, DecodeError, PVNO,
+    AsRep, AsReq, Authenticator, DecodeError, EncKdcRepPart, EncTicketPart, PaData, PaEncTsEnc,
+    TgsRep, TgsReq, Ticket, PVNO,
 };
 use crate::EType;
 
@@ -118,7 +118,6 @@ fn from_ticket_flags(tf: &rk::TicketFlags) -> u32 {
     u32::from_be_bytes(arr)
 }
 
-/// Convert an `EType` to an `Integer`.
 // (etype_to_int / int_to_etype removed — fields that need i32 use `as i32`
 // directly; fields that need Integer use Integer::from(...).)
 
@@ -138,8 +137,8 @@ fn to_encrypted_data(etype: EType, kvno: u32, cipher: &[u8]) -> rk::EncryptedDat
 
 /// Extract `(etype, kvno, cipher)` from `EncryptedData`.
 fn from_encrypted_data(ed: &rk::EncryptedData) -> Result<(EType, u32, Vec<u8>), DecodeError> {
-    let etype = EType::from_u32(ed.etype as u32)
-        .ok_or_else(|| DecodeError::UnknownEtype(ed.etype as u32))?;
+    let etype =
+        EType::from_u32(ed.etype as u32).ok_or(DecodeError::UnknownEtype(ed.etype as u32))?;
     let kvno = ed.kvno.unwrap_or(0);
     let cipher = ed.cipher.to_vec();
     Ok((etype, kvno, cipher))
@@ -213,7 +212,7 @@ fn uuid_from_auth_data(ad: &Option<rk::AuthorizationData>) -> Result<Uuid, Decod
 
 pub fn encode_pa_enc_ts_enc(p: &PaEncTsEnc) -> Vec<u8> {
     let rk_ts = rk::PaEncTsEnc {
-        patimestamp: rk::KerberosTime::from(to_krb_time(p.patimestamp)),
+        patimestamp: to_krb_time(p.patimestamp),
         pausec: if p.pausec > 0 {
             Some(Integer::from(p.pausec as i64))
         } else {
@@ -227,10 +226,14 @@ pub fn decode_pa_enc_ts_enc(b: &[u8]) -> Result<PaEncTsEnc, DecodeError> {
     let rk_ts: rk::PaEncTsEnc = der::decode(b).map_err(|_| DecodeError::UnexpectedEof)?;
     Ok(PaEncTsEnc {
         patimestamp: from_krb_time(&rk_ts.patimestamp),
-        pausec: rk_ts.pausec.as_ref().map(|i| match i {
-            Integer::Primitive(v) => *v as u32,
-            Integer::Variable(_) => 0,
-        }).unwrap_or(0),
+        pausec: rk_ts
+            .pausec
+            .as_ref()
+            .map(|i| match i {
+                Integer::Primitive(v) => *v as u32,
+                Integer::Variable(_) => 0,
+            })
+            .unwrap_or(0),
     })
 }
 
@@ -262,7 +265,7 @@ pub fn decode_enc_ticket_part(b: &[u8]) -> Result<EncTicketPart, DecodeError> {
     let rk_e: rk::EncTicketPart = der::decode(b).map_err(|_| DecodeError::UnexpectedEof)?;
     Ok(EncTicketPart {
         flags: from_ticket_flags(&rk_e.flags),
-        crealm: String::from_utf8_lossy(&rk_e.crealm.as_bytes()).into_owned(),
+        crealm: String::from_utf8_lossy(rk_e.crealm.as_bytes()).into_owned(),
         cname: from_principal_name(&rk_e.cname),
         session_key: from_encryption_key(&rk_e.key)?,
         authtime: from_krb_time(&rk_e.auth_time),
@@ -295,7 +298,7 @@ pub fn decode_ticket(b: &[u8]) -> Result<Ticket, DecodeError> {
             Integer::Primitive(v) => *v as u32,
             Integer::Variable(_) => PVNO,
         },
-        realm: String::from_utf8_lossy(&rk_t.realm.as_bytes()).into_owned(),
+        realm: String::from_utf8_lossy(rk_t.realm.as_bytes()).into_owned(),
         sname: from_principal_name(&rk_t.sname),
         kvno,
         etype,
@@ -344,7 +347,7 @@ pub fn decode_enc_kdc_rep_part(b: &[u8]) -> Result<EncKdcRepPart, DecodeError> {
         starttime: rk_e.start_time.as_ref().map(from_krb_time).unwrap_or(0),
         endtime: from_krb_time(&rk_e.end_time),
         renew_till: rk_e.renew_till.as_ref().map(from_krb_time).unwrap_or(0),
-        crealm: String::from_utf8_lossy(&rk_e.srealm.as_bytes()).into_owned(),
+        crealm: String::from_utf8_lossy(rk_e.srealm.as_bytes()).into_owned(),
         cname: from_principal_name(&rk_e.sname),
     })
 }
@@ -397,7 +400,7 @@ pub fn decode_as_req(b: &[u8]) -> Result<AsReq, DecodeError> {
         .req_body
         .cname
         .as_ref()
-        .map(|c| from_principal_name(c))
+        .map(from_principal_name)
         .unwrap_or_default();
     Ok(AsReq {
         pvno: match &inner.pvno {
@@ -408,7 +411,7 @@ pub fn decode_as_req(b: &[u8]) -> Result<AsReq, DecodeError> {
             Integer::Primitive(v) => *v as u32,
             Integer::Variable(_) => 10,
         },
-        realm: String::from_utf8_lossy(&inner.req_body.realm.as_bytes()).into_owned(),
+        realm: String::from_utf8_lossy(inner.req_body.realm.as_bytes()).into_owned(),
         cname,
         nonce: inner.req_body.nonce,
         etypes,
@@ -448,7 +451,7 @@ pub fn decode_as_rep(b: &[u8]) -> Result<AsRep, DecodeError> {
             Integer::Primitive(v) => *v as u32,
             Integer::Variable(_) => 11,
         },
-        crealm: String::from_utf8_lossy(&inner.crealm.as_bytes()).into_owned(),
+        crealm: String::from_utf8_lossy(inner.crealm.as_bytes()).into_owned(),
         cname: from_principal_name(&inner.cname),
         ticket,
         enc_part_etype: etype,
@@ -545,7 +548,7 @@ pub fn decode_tgs_req(b: &[u8]) -> Result<TgsReq, DecodeError> {
         .req_body
         .sname
         .as_ref()
-        .map(|s| from_principal_name(s))
+        .map(from_principal_name)
         .unwrap_or_default();
     let etypes: Vec<EType> = inner
         .req_body
@@ -562,7 +565,7 @@ pub fn decode_tgs_req(b: &[u8]) -> Result<TgsReq, DecodeError> {
             Integer::Primitive(v) => *v as u32,
             Integer::Variable(_) => 12,
         },
-        realm: String::from_utf8_lossy(&inner.req_body.realm.as_bytes()).into_owned(),
+        realm: String::from_utf8_lossy(inner.req_body.realm.as_bytes()).into_owned(),
         sname,
         nonce: inner.req_body.nonce,
         etypes,
@@ -603,7 +606,7 @@ pub fn decode_tgs_rep(b: &[u8]) -> Result<TgsRep, DecodeError> {
             Integer::Primitive(v) => *v as u32,
             Integer::Variable(_) => 13,
         },
-        crealm: String::from_utf8_lossy(&inner.crealm.as_bytes()).into_owned(),
+        crealm: String::from_utf8_lossy(inner.crealm.as_bytes()).into_owned(),
         cname: from_principal_name(&inner.cname),
         ticket,
         enc_part_etype: etype,
@@ -624,7 +627,7 @@ pub fn encode_authenticator(a: &Authenticator) -> Vec<u8> {
         cksum: None,
         cusec: Integer::from(a.cusec as i64),
         ctime: to_krb_time(a.ctime),
-        subkey: a.subkey.as_ref().map(|k| to_encryption_key(k)),
+        subkey: a.subkey.as_ref().map(to_encryption_key),
         seq_number: Some(a.seq_number),
         authorization_data: None,
     };
@@ -633,13 +636,9 @@ pub fn encode_authenticator(a: &Authenticator) -> Vec<u8> {
 
 pub fn decode_authenticator(b: &[u8]) -> Result<Authenticator, DecodeError> {
     let rk_a: rk::Authenticator = der::decode(b).map_err(|_| DecodeError::UnexpectedEof)?;
-    let subkey = rk_a
-        .subkey
-        .as_ref()
-        .map(|k| from_encryption_key(k))
-        .transpose()?;
+    let subkey = rk_a.subkey.as_ref().map(from_encryption_key).transpose()?;
     Ok(Authenticator {
-        crealm: String::from_utf8_lossy(&rk_a.crealm.as_bytes()).into_owned(),
+        crealm: String::from_utf8_lossy(rk_a.crealm.as_bytes()).into_owned(),
         cname: from_principal_name(&rk_a.cname),
         subkey,
         seq_number: rk_a.seq_number.unwrap_or(0),
@@ -671,7 +670,7 @@ fn decode_ticket_from_rk(t: &rk::Ticket) -> Result<Ticket, DecodeError> {
             Integer::Primitive(v) => *v as u32,
             Integer::Variable(_) => PVNO,
         },
-        realm: String::from_utf8_lossy(&t.realm.as_bytes()).into_owned(),
+        realm: String::from_utf8_lossy(t.realm.as_bytes()).into_owned(),
         sname: from_principal_name(&t.sname),
         kvno,
         etype,
