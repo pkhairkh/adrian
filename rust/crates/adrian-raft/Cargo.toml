@@ -1,0 +1,23 @@
+[package]
+name = "adrian-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "openraft-based native replication for the Adrian framework"
+
+[dependencies]
+adrian-repl-core = { workspace = true }
+adrian-storage-core = { workspace = true }
+adrian-storage-fdb = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+openraft.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

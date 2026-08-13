@@ -1,0 +1,18 @@
+[package]
+name = "adrian-policy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Canonical policy document model (PolicyDoc, PolicyArea) for the Adrian framework"
+
+[dependencies]
+adrian-schema-traits = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

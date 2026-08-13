@@ -1,0 +1,21 @@
+[package]
+name = "adrian-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Observability — Prometheus + OpenTelemetry"
+
+[dependencies]
+adrian-storage-fdb = { path = "../adrian-storage-fdb" }
+adrian-repl-core = { path = "../adrian-repl-core" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true

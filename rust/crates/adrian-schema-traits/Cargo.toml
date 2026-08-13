@@ -1,0 +1,15 @@
+[package]
+name = "adrian-schema-traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Schema trait definitions and Projectable derive macro target for the Adrian framework"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

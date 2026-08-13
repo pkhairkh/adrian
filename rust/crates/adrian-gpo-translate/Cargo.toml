@@ -1,0 +1,22 @@
+[package]
+name = "adrian-gpo-translate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "GPO translation — ADMX/PReg/GptTmpl → declarative"
+
+[features]
+default = []
+ad-interop = []
+
+[dependencies]
+adrian-admx-compiler = { path = "../adrian-admx-compiler" }
+adrian-policy-preg = { path = "../adrian-policy-preg" }
+adrian-policy-core = { path = "../adrian-policy-core" }
+clap.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

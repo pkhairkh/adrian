@@ -1,0 +1,47 @@
+[package]
+name = "adrian-kdc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Fresh Rust Kerberos KDC for the Adrian framework"
+
+[features]
+default = []
+ad-interop = []
+enterprise-hsm = ["adrian-hsm"]
+pkinit-smartcard = []
+pkinit-fido2 = []
+
+[dependencies]
+adrian-storage-core = { path = "../adrian-storage-core" }
+adrian-storage-fdb = { path = "../adrian-storage-fdb" }
+adrian-identity-core = { path = "../adrian-identity-core" }
+adrian-identity-fdb = { path = "../adrian-identity-fdb" }
+adrian-schema-traits = { path = "../adrian-schema-traits" }
+adrian-schema-compiler = { path = "../adrian-schema-compiler" }
+adrian-pac-validator = { path = "../adrian-pac-validator" }
+adrian-hsm = { path = "../adrian-hsm", optional = true }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rasn.workspace = true
+rasn-kerberos.workspace = true
+ring.workspace = true
+aes.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+md4.workspace = true
+cryptoki.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

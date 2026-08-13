@@ -1,0 +1,16 @@
+[package]
+name = "adrian-smb-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SMB client — part of unified SDK (FileModule)"
+
+[dependencies]
+adrian-smb-core = { path = "../adrian-smb-core" }
+adrian-auth-core = { path = "../adrian-auth-core" }
+tokio.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true

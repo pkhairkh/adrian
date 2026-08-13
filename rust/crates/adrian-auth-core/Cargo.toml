@@ -1,0 +1,15 @@
+[package]
+name = "adrian-auth-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified AuthContext trait — Kerberos + NTLM + cert + OAuth2"
+
+[dependencies]
+adrian-sid = { path = "../adrian-sid" }
+async-trait.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true

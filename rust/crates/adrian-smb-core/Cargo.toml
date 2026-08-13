@@ -1,0 +1,13 @@
+[package]
+name = "adrian-smb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SMB protocol primitives — shared client/server (Layer 3)"
+
+[dependencies]
+rasn.workspace = true
+rasn-kerberos.workspace = true
+thiserror.workspace = true
+bytes.workspace = true

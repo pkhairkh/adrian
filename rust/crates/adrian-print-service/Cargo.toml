@@ -1,0 +1,16 @@
+[package]
+name = "adrian-print-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "IPP Everywhere print service (RFC 8011) + CUPS integration"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+bytes.workspace = true

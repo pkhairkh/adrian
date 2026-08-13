@@ -1,0 +1,23 @@
+[package]
+name = "adrian-pac-validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified PAC validator (libframework_pac_validator) — MS-KILE buffer parsing + 2-layer checksum validation"
+
+[dependencies]
+adrian-sid = { workspace = true }
+rasn.workspace = true
+rasn-kerberos.workspace = true
+ring.workspace = true
+md4.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

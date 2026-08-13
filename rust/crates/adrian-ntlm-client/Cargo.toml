@@ -1,0 +1,23 @@
+[package]
+name = "adrian-ntlm-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "NTLM client-only (NTLMv2 with channel binding) — ad-interop"
+
+[features]
+default = []
+ad-interop = []
+
+[dependencies]
+adrian-auth-core = { path = "../adrian-auth-core" }
+adrian-sid = { path = "../adrian-sid" }
+md4.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rasn.workspace = true
+rasn-pkix.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+keyring.workspace = true

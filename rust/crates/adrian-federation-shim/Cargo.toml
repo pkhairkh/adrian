@@ -1,0 +1,20 @@
+[package]
+name = "adrian-federation-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Keycloak wrapper + Rust sidecar (WS-Trust bridge)"
+
+[dependencies]
+adrian-claims-engine = { path = "../adrian-claims-engine" }
+adrian-policy-cel = { path = "../adrian-policy-cel" }
+adrian-auth-core = { path = "../adrian-auth-core" }
+axum.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+moka.workspace = true

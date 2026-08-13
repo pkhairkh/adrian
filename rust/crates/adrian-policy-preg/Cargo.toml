@@ -1,0 +1,14 @@
+[package]
+name = "adrian-policy-preg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PReg adapter — Registry.pol read/write (Layer 2, ad-interop)"
+
+[dependencies]
+adrian-schema-traits = { path = "../adrian-schema-traits" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true

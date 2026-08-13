@@ -1,0 +1,245 @@
+# Adrian framework — Cargo workspace root.
+#
+# Per finaldraft/04-rust-workspace-design.md, the workspace is organised in 5
+# dependency layers (Layer 0 foundation → Layer 4 ops+tooling). This file
+# declares the shared dependency versions, the shared package metadata, and the
+# list of member crates.
+#
+# Wave 4a scope: Layer 0-2 crate stubs (20 crates).
+# Wave 4b scope: Layer 3-4 crate stubs (25 crates) + 4 supporting Layer 0-2
+# extras (adrian-hsm, adrian-smb-core, adrian-policy-cel, adrian-policy-preg).
+
+[workspace]
+resolver = "2"
+members = [
+    # Layer 0 — foundation (no internal deps)
+    "crates/adrian-storage-core",
+    "crates/adrian-sid",
+    "crates/adrian-schema-traits",
+    # Layer 1 — abstractions (depend on Layer 0)
+    "crates/adrian-storage-fdb",
+    "crates/adrian-identity-core",
+    "crates/adrian-repl-core",
+    # Layer 2 — domain implementations (depend on Layers 0-1)
+    "crates/adrian-identity-fdb",
+    "crates/adrian-identity-ridpool",
+    "crates/adrian-drsuapi",
+    "crates/adrian-raft",
+    "crates/adrian-directory-service",
+    "crates/adrian-schema-compiler",
+    "crates/adrian-dcerpc",
+    "crates/adrian-policy-core",
+    "crates/adrian-policy-executor",
+    "crates/adrian-pac-validator",
+    "crates/adrian-storage-testkit",
+    "crates/adrian-identity-testkit",
+    "crates/adrian-repl-testkit",
+    "crates/adrian-test-harness",
+    # Layer 2 extras (Wave 4b — supporting crates for Layer 3-4 services).
+    "crates/adrian-hsm",
+    "crates/adrian-smb-core",
+    "crates/adrian-policy-cel",
+    "crates/adrian-policy-preg",
+    # Layer 3 — services (depend on Layers 0-2)
+    "crates/adrian-kdc",
+    "crates/adrian-kdc-interop",
+    "crates/adrian-ntlm-client",
+    "crates/adrian-auth-core",
+    "crates/adrian-admx-compiler",
+    "crates/adrian-ca",
+    "crates/adrian-acme-server",
+    "crates/adrian-wcce-bridge",
+    "crates/adrian-federation-shim",
+    "crates/adrian-claims-engine",
+    "crates/adrian-smb-server",
+    "crates/adrian-smb-client",
+    "crates/adrian-print-service",
+    "crates/adrian-sdk",
+    "crates/adrian-sdk-c",
+    "crates/adrian-sdk-jni",
+    "crates/adrian-sdk-swift",
+    "crates/adrian-sdk-python",
+    # Layer 4 — operations & tooling (depend on Layers 0-3)
+    "crates/adrian-operator",
+    "crates/adrian-cli",
+    "crates/adrian-monitor",
+    "crates/adrian-migrate",
+    "crates/adrian-gpo-translate",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Adrian Architecture Team"]
+repository = "https://github.com/pkhairkh/adrian"
+
+[workspace.dependencies]
+# Async runtime (per Decision 1 §Async runtime: tokio multi-threaded only).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
+# Serialisation.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# Error handling (thiserror for libraries, anyhow for binary entry points).
+thiserror = "2"
+anyhow = "1"
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Identifiers — UUIDv7 is the framework's primary key (per Decision 3).
+uuid = { version = "1", features = ["v7", "serde"] }
+# Date / time — used by audit, KDC, CA, federation.
+chrono = { version = "0.4", features = ["serde"] }
+# Storage engine (per Decision 2 / ADR-073). NOTE: foundationdb-sys requires
+# libclang at build time; crate-level Cargo.toml files declare it as
+# `optional = true` and gate actual usage behind a `fdb` feature flag so that
+# `cargo check` passes on systems without libclang.
+foundationdb = { version = "0.9", default-features = false }
+# Native Raft consensus (per Decision 1).
+openraft = "0.9"
+# ASN.1 codecs for Kerberos, LDAP, DRSUAPI NDR, X.509 PKIX (per Decision 1, 5, 8).
+rasn = "0.22"
+rasn-kerberos = "0.22"
+rasn-ldap = "0.22"
+rasn-pkix = "0.22"
+# Cryptography (per Decision 5 / ADR-011/014/015).
+ring = "0.17"
+aes = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+md4 = "0.10"
+# HSM bindings (per ADR-015/032/037; `enterprise-hsm` feature).
+cryptoki = "0.8"
+# LDAP client (used by adrian-directory-service for client-side testing and
+# by adrian-sdk for the cross-platform LDAP module).
+ldap3 = "0.11"
+# Async trait support (the framework's traits are async + Send + Sync).
+async-trait = "0.1"
+# Byte buffer primitives.
+bytes = "1"
+# Bitflag enums (used for LDAP search-flags, SD control-access bits, etc.).
+bitflags = "2"
+# Property-based testing (per Decision 2 §Testing strategy).
+proptest = "1"
+# libc FFI (used by Linux/macOS policy executors, SSSD cdylib, SDK FFI).
+libc = "0.2"
+# Compile-time maps (used by schema compiler for well-known SIDs/GUIDs).
+phf = { version = "0.11", features = ["macros"] }
+# Concurrent cache (federation shim JWKS / replay, monitor metrics).
+moka = { version = "0.12", features = ["future"] }
+# Retry with backoff (transient-error retry policy per Decision 2 §Error handling).
+backon = "1"
+
+# --- HTTP / networking (Layer 3 services: ACME, OCSP, federation, print) ---
+axum = "0.8"
+hyper = "1"
+rustls = "0.23"
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.30"
+http = "1"
+
+# --- CLI (Layer 4: adrian-cli, adrian-migrate, adrian-gpo-translate) ---
+clap = { version = "4", features = ["derive", "env"] }
+
+# --- XML / INI / plist (Layer 3: ADMX compiler, PReg adapter, macOS MDM) ---
+quick-xml = "0.36"
+plist = "1"
+rust-ini = "0.21"
+
+# --- Observability stack (Layer 4: adrian-monitor, audit) ---
+prometheus = "0.13"
+opentelemetry = "0.27"
+opentelemetry-otlp = "0.27"
+tracing-opentelemetry = "0.28"
+
+# --- Kubernetes operator (Layer 4: adrian-operator) ---
+kube = { version = "0.98", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+
+# --- Git (Layer 3: adrian-policy-distribution — SYSVOL git-backed) ---
+git2 = "0.19"
+
+# --- FFI / bindings (Layer 3: SDK language bindings) ---
+pyo3 = { version = "0.22", features = ["extension-module"] }
+jni = "0.21"
+cbindgen = "0.27"
+
+# --- Auth / identity (Layer 3: federation, NTLM, PKINIT) ---
+keyring = "3"
+openidconnect = "3"
+webauthn-rs = "0.5"
+x509-cert = "0.2"
+
+# Layer 0-2 internal crates (path-published so siblings can depend on them).
+adrian-storage-core = { path = "crates/adrian-storage-core" }
+adrian-sid = { path = "crates/adrian-sid" }
+adrian-schema-traits = { path = "crates/adrian-schema-traits" }
+adrian-storage-fdb = { path = "crates/adrian-storage-fdb" }
+adrian-identity-core = { path = "crates/adrian-identity-core" }
+adrian-repl-core = { path = "crates/adrian-repl-core" }
+adrian-identity-fdb = { path = "crates/adrian-identity-fdb" }
+adrian-identity-ridpool = { path = "crates/adrian-identity-ridpool" }
+adrian-drsuapi = { path = "crates/adrian-drsuapi" }
+adrian-raft = { path = "crates/adrian-raft" }
+adrian-directory-service = { path = "crates/adrian-directory-service" }
+adrian-schema-compiler = { path = "crates/adrian-schema-compiler" }
+adrian-dcerpc = { path = "crates/adrian-dcerpc" }
+adrian-policy-core = { path = "crates/adrian-policy-core" }
+adrian-policy-executor = { path = "crates/adrian-policy-executor" }
+adrian-pac-validator = { path = "crates/adrian-pac-validator" }
+adrian-storage-testkit = { path = "crates/adrian-storage-testkit" }
+adrian-identity-testkit = { path = "crates/adrian-identity-testkit" }
+adrian-repl-testkit = { path = "crates/adrian-repl-testkit" }
+adrian-test-harness = { path = "crates/adrian-test-harness" }
+
+# Layer 2 extras (Wave 4b — supporting crates for Layer 3-4 services).
+adrian-hsm = { path = "crates/adrian-hsm" }
+adrian-smb-core = { path = "crates/adrian-smb-core" }
+adrian-policy-cel = { path = "crates/adrian-policy-cel" }
+adrian-policy-preg = { path = "crates/adrian-policy-preg" }
+
+# Layer 3-4 internal crates (Wave 4b).
+adrian-kdc = { path = "crates/adrian-kdc" }
+adrian-kdc-interop = { path = "crates/adrian-kdc-interop" }
+adrian-ntlm-client = { path = "crates/adrian-ntlm-client" }
+adrian-auth-core = { path = "crates/adrian-auth-core" }
+adrian-admx-compiler = { path = "crates/adrian-admx-compiler" }
+adrian-ca = { path = "crates/adrian-ca" }
+adrian-acme-server = { path = "crates/adrian-acme-server" }
+adrian-wcce-bridge = { path = "crates/adrian-wcce-bridge" }
+adrian-federation-shim = { path = "crates/adrian-federation-shim" }
+adrian-claims-engine = { path = "crates/adrian-claims-engine" }
+adrian-smb-server = { path = "crates/adrian-smb-server" }
+adrian-smb-client = { path = "crates/adrian-smb-client" }
+adrian-print-service = { path = "crates/adrian-print-service" }
+adrian-sdk = { path = "crates/adrian-sdk" }
+adrian-sdk-c = { path = "crates/adrian-sdk-c" }
+adrian-sdk-jni = { path = "crates/adrian-sdk-jni" }
+adrian-sdk-swift = { path = "crates/adrian-sdk-swift" }
+adrian-sdk-python = { path = "crates/adrian-sdk-python" }
+adrian-operator = { path = "crates/adrian-operator" }
+adrian-cli = { path = "crates/adrian-cli" }
+adrian-monitor = { path = "crates/adrian-monitor" }
+adrian-migrate = { path = "crates/adrian-migrate" }
+adrian-gpo-translate = { path = "crates/adrian-gpo-translate" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "line-tables-only"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

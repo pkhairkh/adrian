@@ -1,0 +1,29 @@
+[package]
+name = "adrian-ca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CA service — cert issuance, revocation, HSM-bound keys"
+
+[features]
+default = []
+enterprise-hsm = ["adrian-hsm"]
+
+[dependencies]
+adrian-storage-core = { path = "../adrian-storage-core" }
+adrian-storage-fdb = { path = "../adrian-storage-fdb" }
+adrian-hsm = { path = "../adrian-hsm", optional = true }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+rasn.workspace = true
+rasn-pkix.workspace = true
+ring.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+chrono.workspace = true

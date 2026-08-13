@@ -1,0 +1,20 @@
+[package]
+name = "adrian-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AD-to-framework migration tools"
+
+[dependencies]
+adrian-sdk = { path = "../adrian-sdk" }
+adrian-gpo-translate = { path = "../adrian-gpo-translate" }
+adrian-policy-core = { path = "../adrian-policy-core" }
+adrian-sid = { path = "../adrian-sid" }
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

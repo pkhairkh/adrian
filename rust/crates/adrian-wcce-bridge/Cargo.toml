@@ -1,0 +1,21 @@
+[package]
+name = "adrian-wcce-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MS-WCCE → ACME bridge for Windows autoenroll (ad-interop)"
+
+[features]
+default = []
+ad-interop = []
+
+[dependencies]
+adrian-acme-server = { workspace = true }
+adrian-ca = { workspace = true }
+rasn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true

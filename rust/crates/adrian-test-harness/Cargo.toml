@@ -1,0 +1,27 @@
+[package]
+name = "adrian-test-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared test fixtures and interop test utilities for the Adrian framework"
+
+[dependencies]
+adrian-storage-core = { workspace = true }
+adrian-storage-testkit = { workspace = true }
+adrian-identity-core = { workspace = true }
+adrian-identity-testkit = { workspace = true }
+adrian-repl-core = { workspace = true }
+adrian-repl-testkit = { workspace = true }
+adrian-sid = { workspace = true }
+adrian-schema-traits = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

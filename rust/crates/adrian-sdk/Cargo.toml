@@ -1,0 +1,30 @@
+[package]
+name = "adrian-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified Rust client SDK core — AdrianClient"
+
+[features]
+default = []
+c-abi = []
+jni = []
+swift = []
+python = []
+
+[dependencies]
+adrian-auth-core = { path = "../adrian-auth-core" }
+adrian-storage-core = { path = "../adrian-storage-core" }
+adrian-identity-core = { path = "../adrian-identity-core" }
+adrian-policy-core = { path = "../adrian-policy-core" }
+adrian-smb-client = { path = "../adrian-smb-client" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ldap3.workspace = true
+rustls.workspace = true
+uuid.workspace = true

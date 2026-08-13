@@ -1,0 +1,22 @@
+[package]
+name = "adrian-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Kubernetes operator — DomainController CRD + StatefulSet"
+
+[dependencies]
+adrian-directory-service = { path = "../adrian-directory-service" }
+adrian-kdc = { path = "../adrian-kdc" }
+adrian-storage-fdb = { path = "../adrian-storage-fdb" }
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
+async-trait.workspace = true

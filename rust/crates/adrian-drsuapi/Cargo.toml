@@ -1,0 +1,27 @@
+[package]
+name = "adrian-drsuapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DRSUAPI server (MS-DRSR) for the Adrian framework — fresh Rust implementation"
+
+[dependencies]
+adrian-repl-core = { workspace = true }
+adrian-storage-core = { workspace = true }
+adrian-storage-fdb = { workspace = true }
+adrian-schema-traits = { workspace = true }
+adrian-identity-core = { workspace = true }
+adrian-dcerpc = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+bytes.workspace = true
+rasn.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

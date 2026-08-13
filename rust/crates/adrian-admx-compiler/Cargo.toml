@@ -1,0 +1,20 @@
+[package]
+name = "adrian-admx-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "admx2adrian — ADMX-to-declarative JSON compiler (ad-interop)"
+
+[features]
+default = []
+ad-interop = []
+
+[dependencies]
+adrian-policy-core = { path = "../adrian-policy-core" }
+adrian-schema-traits = { path = "../adrian-schema-traits" }
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+clap.workspace = true

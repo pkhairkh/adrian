@@ -1,0 +1,25 @@
+[package]
+name = "adrian-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified cross-platform CLI (clap)"
+
+[[bin]]
+name = "adrian"
+path = "src/main.rs"
+
+[dependencies]
+adrian-sdk = { path = "../adrian-sdk" }
+adrian-migrate = { path = "../adrian-migrate" }
+adrian-policy-core = { path = "../adrian-policy-core" }
+adrian-gpo-translate = { path = "../adrian-gpo-translate" }
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

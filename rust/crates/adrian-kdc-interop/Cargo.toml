@@ -1,0 +1,18 @@
+[package]
+name = "adrian-kdc-interop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MS-KILE conformance tests vs MIT/Heimdal/Windows"
+
+[dependencies]
+adrian-kdc = { path = "../adrian-kdc" }
+tokio.workspace = true
+rasn-kerberos.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

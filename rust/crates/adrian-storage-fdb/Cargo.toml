@@ -1,0 +1,32 @@
+[package]
+name = "adrian-storage-fdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FoundationDB implementation of DirectoryStore for the Adrian framework"
+
+[dependencies]
+adrian-storage-core = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true }
+bytes.workspace = true
+tracing.workspace = true
+# `foundationdb` is declared as optional so that `cargo check` passes on
+# systems without libclang (foundationdb-sys requires it for bindgen). The
+# `fdb` feature flag enables the real backend; the stub `FdbDirectoryStore`
+# type below does not use the FDB client API. See ADR-073.
+foundationdb = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable the real FoundationDB backend. Requires libclang at build time (for
+# foundationdb-sys's bindgen step) and the FDB C client library at runtime.
+fdb = ["dep:foundationdb"]
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

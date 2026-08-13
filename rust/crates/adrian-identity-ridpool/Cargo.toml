@@ -1,0 +1,30 @@
+[package]
+name = "adrian-identity-ridpool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RID pool allocator for the Adrian framework (AD-interop mode)"
+
+[dependencies]
+adrian-identity-core = { workspace = true }
+adrian-sid = { workspace = true }
+adrian-storage-core = { workspace = true }
+adrian-storage-fdb = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+# `foundationdb` is optional — see adrian-storage-fdb/Cargo.toml for rationale.
+foundationdb = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable the real FoundationDB backend. Requires libclang at build time.
+fdb = ["dep:foundationdb", "adrian-storage-fdb/fdb"]
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
