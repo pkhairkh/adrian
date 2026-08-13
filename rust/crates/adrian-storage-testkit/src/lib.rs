@@ -776,4 +776,141 @@ mod tests {
             Some(b"w4".as_slice())
         );
     }
+
+    // ----- Wave 1c extra behavioral tests -----
+
+    #[tokio::test]
+    async fn two_sequential_atomic_adds_on_same_key_aggregate() {
+        // Two transactions each stage an `atomic_add(k, 1)` against the same
+        // counter key, then both commit in sequence. The net effect must be
+        // +2 — matching FDB's `MutationType::Add` aggregation semantics
+        // (each atomic_add reads the committed value at commit time and
+        // writes back the sum, so the second commit sees the first's
+        // effect).
+        let store = InMemoryDirectoryStore::new();
+        store
+            .kv
+            .write()
+            .unwrap()
+            .insert(b"counter".to_vec(), 0i64.to_be_bytes().to_vec());
+
+        let txn1 = store.begin_write().await.unwrap();
+        txn1.atomic_add(b"counter", 1).await.unwrap();
+        txn1.commit().await.unwrap();
+
+        let txn2 = store.begin_write().await.unwrap();
+        txn2.atomic_add(b"counter", 1).await.unwrap();
+        txn2.commit().await.unwrap();
+
+        let read = store.begin_read().await.unwrap();
+        let v = read.get(b"counter").await.unwrap().unwrap();
+        let n = i64::from_be_bytes(v[..].try_into().unwrap());
+        assert_eq!(n, 2, "two sequential atomic_add(1)s must aggregate to +2");
+    }
+
+    #[tokio::test]
+    async fn atomic_add_with_negative_delta_decrements() {
+        // `atomic_add` must support negative deltas (i.e. decrement) just
+        // like FDB's `MutationType::Add` (which is defined for any i64).
+        let store = InMemoryDirectoryStore::new();
+        store
+            .kv
+            .write()
+            .unwrap()
+            .insert(b"counter".to_vec(), 100i64.to_be_bytes().to_vec());
+
+        let txn = store.begin_write().await.unwrap();
+        txn.atomic_add(b"counter", -42).await.unwrap();
+        txn.commit().await.unwrap();
+
+        let read = store.begin_read().await.unwrap();
+        let v = read.get(b"counter").await.unwrap().unwrap();
+        let n = i64::from_be_bytes(v[..].try_into().unwrap());
+        assert_eq!(n, 58, "atomic_add(-42) on 100 must yield 58");
+    }
+
+    #[tokio::test]
+    async fn large_batch_put_round_trips_via_get_and_by_dn() {
+        // Insert 100 objects and verify each is retrievable by both UUID
+        // and DN — exercises the index consistency under load (catches
+        // off-by-one or wrong-key bugs that only manifest at scale).
+        let store = InMemoryDirectoryStore::new();
+        let mut uuids = Vec::with_capacity(100);
+        let mut dns = Vec::with_capacity(100);
+        for i in 0..100u128 {
+            let uuid = Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000 + i);
+            let dn_str = format!("CN=user-{i},OU=Eng,DC=corp,DC=com");
+            store
+                .put(&make_obj(
+                    uuid,
+                    &dn_str,
+                    UNASSIGNED_DNT,
+                ))
+                .await
+                .unwrap();
+            uuids.push(uuid);
+            dns.push((dn_str, uuid));
+        }
+        assert_eq!(store.len(), 100, "all 100 inserts must be live");
+        assert_eq!(store.next_dnt(), 101, "counter must advance exactly 100 times");
+
+        // Verify every UUID lookup returns the right UUID.
+        for uuid in &uuids {
+            let got = store.get(*uuid).await.unwrap().expect("uuid must resolve");
+            assert_eq!(got.uuid, *uuid);
+        }
+        // Verify every DN lookup returns the right UUID.
+        for (dn_str, expected_uuid) in &dns {
+            let dn = DistinguishedName::new(dn_str);
+            let got = store
+                .get_by_dn(&dn)
+                .await
+                .unwrap()
+                .expect("dn must resolve");
+            assert_eq!(got.uuid, *expected_uuid, "DN lookup mismatch for {dn_str}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_txn_put_then_delete_same_key_in_one_txn_yields_absent() {
+        // Within a single txn, putting then deleting the same key must
+        // result in the key being absent from the read-your-writes view
+        // (last-writer-wins within a txn, with delete winning over put).
+        let store = InMemoryDirectoryStore::new();
+        let txn = store.begin_write().await.unwrap();
+        txn.put(b"transient", b"v1").await.unwrap();
+        txn.delete(b"transient").await.unwrap();
+        assert_eq!(txn.get(b"transient").await.unwrap(), None);
+        txn.commit().await.unwrap();
+        let read = store.begin_read().await.unwrap();
+        assert_eq!(read.get(b"transient").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn put_then_delete_then_reput_same_uuid_round_trips() {
+        // Insert an object, delete it, then re-insert the same UUID with a
+        // new DN — the re-inserted object must be retrievable by both UUID
+        // and the new DN, and must receive a fresh DNT (because the
+        // original DNT was freed on delete and `put` with
+        // `UNASSIGNED_DNT` allocates from the counter).
+        let store = InMemoryDirectoryStore::new();
+        let uuid = test_uuid(42);
+        store
+            .put(&make_obj(uuid, "CN=first,DC=corp,DC=com", UNASSIGNED_DNT))
+            .await
+            .unwrap();
+        assert_eq!(store.next_dnt(), 2);
+        store.delete(uuid).await.unwrap();
+        assert_eq!(store.len(), 0);
+        store
+            .put(&make_obj(uuid, "CN=second,DC=corp,DC=com", UNASSIGNED_DNT))
+            .await
+            .unwrap();
+        // Counter advances again on re-insert.
+        assert_eq!(store.next_dnt(), 3);
+        assert_eq!(store.len(), 1);
+        let got = store.get(uuid).await.unwrap().expect("re-insert must resolve");
+        assert_eq!(got.dn.dn, "CN=second,DC=corp,DC=com");
+        assert_eq!(got.dnt, 2, "re-inserted object gets the next free DNT");
+    }
 }
