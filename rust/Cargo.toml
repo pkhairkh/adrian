@@ -128,7 +128,7 @@ async-trait = "0.1"
 # Byte buffer primitives.
 bytes = "1"
 # Bitflag enums (used for LDAP search-flags, SD control-access bits, etc.).
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }
 # Property-based testing (per Decision 2 §Testing strategy).
 proptest = "1"
 # libc FFI (used by Linux/macOS policy executors, SSSD cdylib, SDK FFI).

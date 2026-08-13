@@ -201,3 +201,65 @@ pub trait Projectable: Send + Sync {
 // TODO: implement #[derive(Projectable)] proc-macro in adrian-schema-traits-derive (gated to Wave 4b).
 // TODO: implement SchemaProjection::build in adrian-schema-compiler per ADR-078.
 // TODO: add native-class trait library (ServiceAccount, ManagedDevice, PolicySet, CertificateTemplate) per ADR-078 §Decision Layer 2.
+
+bitflags::bitflags! {
+    /// The `searchFlags` bitmask on `attributeSchema` (per MS-ADTS §3.1.1.3.2.5
+    /// and ADR-080).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SearchFlags: u32 {
+        /// fANR (0x01) — attribute is included in ANR (ambiguous name resolution).
+        const ANR = 0x01;
+        /// fATTINDEX (0x02) — an index is created on the attribute.
+        const ATTINDEX = 0x02;
+        /// fPRESERVEATON (0x04) — preserve on tombstone.
+        const PRESERVEATON = 0x04;
+        /// fCOPY (0x08) — copy the value when the object is copied.
+        const COPY = 0x08;
+        /// fTUPLEINDEX (0x10) — a tuple index is created (for substring searches).
+        const TUPLEINDEX = 0x10;
+        /// fSUBTREEATTRINDEX (0x20) — a subtree index is created.
+        const SUBTREEATTRINDEX = 0x20;
+        /// fCONFIDENTIAL (0x80) — attribute is confidential (requires
+        /// CONTROL_ACCESS right to read, per ADR-066).
+        const CONFIDENTIAL = 0x80;
+        /// fNEVERVALUEAUDIT (0x100) — do not audit value reads.
+        const NEVERVALUEAUDIT = 0x100;
+    }
+
+    /// The `systemFlags` bitmask on `attributeSchema` and `classSchema` (per
+    /// MS-ADTS §3.1.1.2.4 and ADR-080).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SystemFlags: u32 {
+        /// FLAG_ATTR_NOT_REPLICATED (0x01) — attribute is not replicated.
+        const ATTR_NOT_REPLICATED = 0x01;
+        /// FLAG_ATTR_IS_CONSTRUCTED (0x02) — attribute is constructed (per ADR-009).
+        const ATTR_IS_CONSTRUCTED = 0x02;
+        /// FLAG_DOMAIN_DISALLOW_RENAME (0x04000000) — domain object cannot be renamed.
+        const DOMAIN_DISALLOW_RENAME = 0x0400_0000;
+        /// FLAG_DOMAIN_DISALLOW_MOVE (0x08000000) — domain object cannot be moved.
+        const DOMAIN_DISALLOW_MOVE = 0x0800_0000;
+        /// FLAG_DISALLOW_DELETE (0x80000000) — object cannot be deleted.
+        const DISALLOW_DELETE = 0x8000_0000;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_flags_decoding() {
+        // fANR = 0x01, fATTINDEX = 0x02, fPRESERVEATON = 0x04
+        let flags = SearchFlags::ANR | SearchFlags::ATTINDEX;
+        assert!(flags.contains(SearchFlags::ANR));
+        assert!(flags.contains(SearchFlags::ATTINDEX));
+        assert!(!flags.contains(SearchFlags::CONFIDENTIAL));
+    }
+
+    #[test]
+    fn system_flags_decoding() {
+        let flags = SystemFlags::ATTR_NOT_REPLICATED | SystemFlags::ATTR_IS_CONSTRUCTED;
+        assert!(flags.contains(SystemFlags::ATTR_NOT_REPLICATED));
+        assert!(flags.contains(SystemFlags::ATTR_IS_CONSTRUCTED));
+    }
+}

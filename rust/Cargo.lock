@@ -528,6 +528,7 @@ dependencies = [
 name = "adrian-schema-traits"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.13.1",
  "proptest",
  "serde",
  "thiserror 2.0.20",
@@ -656,6 +657,7 @@ dependencies = [
  "bytes",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
@@ -1119,6 +1121,9 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bitvec"

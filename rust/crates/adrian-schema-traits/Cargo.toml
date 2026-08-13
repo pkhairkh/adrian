@@ -10,6 +10,7 @@ description = "Schema trait definitions and Projectable derive macro target for 
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+bitflags.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

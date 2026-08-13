@@ -187,7 +187,7 @@ impl std::str::FromStr for Sid {
             .parse()
             .map_err(|_| SidError::InvalidString(s.to_string()))?;
         let mut identifier_authority = [0u8; 6];
-        identifier_authority[2..].copy_from_slice(&auth.to_be_bytes()[2..]);
+        identifier_authority.copy_from_slice(&auth.to_be_bytes()[2..]);
         let mut sub_authorities = Vec::with_capacity(parts.len() - 3);
         for p in &parts[3..] {
             sub_authorities.push(
@@ -235,5 +235,78 @@ mod tests {
             sid.domain_sid().unwrap().to_string(),
             "S-1-5-21-3623811015-3361044348-30300820"
         );
+    }
+
+    #[test]
+    fn well_known_sids() {
+        // Everyone (S-1-1-0)
+        let sid: Sid = "S-1-1-0".parse().unwrap();
+        assert_eq!(sid.sub_authorities, vec![0]);
+        assert_eq!(sid.rid(), Some(0));
+
+        // Local System (S-1-5-18)
+        let sid: Sid = "S-1-5-18".parse().unwrap();
+        assert_eq!(sid.sub_authorities, vec![18]);
+
+        // Administrators (S-1-5-32-544)
+        let sid: Sid = "S-1-5-32-544".parse().unwrap();
+        assert_eq!(sid.sub_authorities, vec![32, 544]);
+        assert_eq!(sid.rid(), Some(544));
+
+        // Domain Admins (S-1-5-21-<domain>-512)
+        let sid: Sid = "S-1-5-21-3623811015-3361044348-30300820-512"
+            .parse()
+            .unwrap();
+        assert_eq!(sid.rid(), Some(512));
+    }
+
+    #[test]
+    fn wire_form_structure() {
+        // S-1-5-21-<3 sub-auths>-<rid> = 5 sub-authorities (21, 100, 200, 300, 1000)
+        let sid: Sid = "S-1-5-21-100-200-300-1000".parse().unwrap();
+        let bytes = sid.to_bytes();
+        // Header: revision (1) + sub-auth-count (1) + authority (6) = 8 bytes
+        // + 5 sub-auths × 4 bytes = 20 bytes → total 28
+        assert_eq!(bytes.len(), 8 + 4 * 5);
+        assert_eq!(bytes[0], SID_REVISION);
+        assert_eq!(bytes[1], 5); // sub-authority count
+                                 // Authority 5 = [0,0,0,0,0,5] in 6-byte big-endian
+        assert_eq!(&bytes[2..8], &[0, 0, 0, 0, 0, 5]);
+    }
+
+    #[test]
+    fn from_bytes_truncated() {
+        assert!(Sid::from_bytes(&[]).is_err());
+        assert!(Sid::from_bytes(&[1, 1, 0, 0, 0, 0, 0, 5]).is_err()); // 8 header but 1 sub-auth claimed
+    }
+
+    #[test]
+    fn from_bytes_bad_revision() {
+        let buf = [2u8, 0, 0, 0, 0, 0, 0, 5]; // revision 2
+        assert!(matches!(
+            Sid::from_bytes(&buf),
+            Err(SidError::UnsupportedRevision(2))
+        ));
+    }
+
+    #[test]
+    fn domain_sid_no_rid() {
+        // S-1-5-21 has only 1 sub-authority — no domain SID
+        let sid: Sid = "S-1-5-21".parse().unwrap();
+        assert!(sid.domain_sid().is_none());
+    }
+
+    #[test]
+    fn display_matches_string_parse() {
+        let sids = [
+            "S-1-1-0",
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-5-21-3623811015-3361044348-30300820-1013",
+        ];
+        for s in sids {
+            let sid: Sid = s.parse().unwrap();
+            assert_eq!(sid.to_string(), s, "round-trip failed for {}", s);
+        }
     }
 }

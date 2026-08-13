@@ -268,3 +268,53 @@ pub trait DirectoryStore: Send + Sync {
 // TODO: implement FdbDirectoryStore in adrian-storage-fdb per ADR-073.
 // TODO: implement InMemoryDirectoryStore in adrian-storage-testkit per Decision 2 §Rust implementation implications.
 // TODO: add tuple-layer key encoding types per ADR-073 §Decision (LinkValueForwardKey, SdTableKey, SchemaCacheGenerationKey).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dn_parent() {
+        let dn = DistinguishedName::new("CN=Admin,CN=Users,DC=corp,DC=com");
+        let parent = dn.parent().unwrap();
+        assert_eq!(parent.dn, "CN=Users,DC=corp,DC=com");
+    }
+
+    #[test]
+    fn dn_parent_domain_root() {
+        let dn = DistinguishedName::new("DC=com");
+        assert!(dn.parent().is_none());
+    }
+
+    #[test]
+    fn dn_display() {
+        let dn = DistinguishedName::new("CN=Admin,DC=corp,DC=com");
+        assert_eq!(dn.to_string(), "CN=Admin,DC=corp,DC=com");
+    }
+
+    #[test]
+    fn subspace_values() {
+        assert_eq!(Subspace::Objects as u8, 0x01);
+        assert_eq!(Subspace::LinkTable as u8, 0x02);
+        assert_eq!(Subspace::IdentityMapping as u8, 0x0D);
+    }
+
+    #[test]
+    fn object_serialization() {
+        let obj = Object {
+            uuid: Uuid::nil(),
+            dn: DistinguishedName::new("CN=Test,DC=corp,DC=com"),
+            attributes: vec![Attribute {
+                attribute_id: 3,
+                name: "cn".to_string(),
+                value: b"Test".to_vec(),
+            }],
+            dnt: 42,
+        };
+        let json = serde_json::to_string(&obj).unwrap();
+        let obj2: Object = serde_json::from_str(&json).unwrap();
+        assert_eq!(obj.uuid, obj2.uuid);
+        assert_eq!(obj.dn, obj2.dn);
+        assert_eq!(obj.dnt, obj2.dnt);
+    }
+}
