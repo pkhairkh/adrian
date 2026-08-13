@@ -163,8 +163,8 @@ fn aes256_cbc_cts_encrypt(key: &Aes256Key, plaintext: &[u8]) -> Result<Vec<u8>, 
 
     // Output: C_1 || ... || C_{N-2} || C_N (full) || C_{N-1}[0..rem]
     let mut out = Vec::with_capacity(plaintext.len());
-    for i in 0..(n_blocks - 2) {
-        out.extend_from_slice(&ct_blocks[i]);
+    for block in ct_blocks.iter().take(n_blocks - 2) {
+        out.extend_from_slice(block);
     }
     out.extend_from_slice(&ct_blocks[n_blocks - 1]);
     out.extend_from_slice(&ct_blocks[n_blocks - 2][..rem]);
@@ -256,14 +256,13 @@ fn aes256_cbc_cts_decrypt(key: &Aes256Key, ciphertext: &[u8]) -> Result<Vec<u8>,
 
     // Decrypt C_1 .. C_{N-2} (standard CBC with IV=0).
     let mut prev = iv;
-    for i in 0..n_full {
-        let mut block = ct_full[i];
-        let ct_save = block;
-        cipher.decrypt_block(&mut block);
+    for block in ct_full.iter_mut().take(n_full) {
+        let ct_save = *block;
+        cipher.decrypt_block(block);
         for j in 0..AES_BLOCK_LEN {
             block[j] ^= prev[j];
         }
-        out.extend_from_slice(&block);
+        out.extend_from_slice(block);
         prev = ct_save;
     }
 
