@@ -10,6 +10,7 @@ description = "ACME endpoint — RFC 8555 + 8737 + 8823 ARI"
 adrian-ca = { path = "../adrian-ca" }
 tokio.workspace = true
 axum.workspace = true
+hyper.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -17,3 +18,14 @@ serde_json.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+ring.workspace = true
+sha2.workspace = true
+bytes = "1"
+base64 = "0.22"
+http-body-util = "0.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+rasn.workspace = true
+rasn-pkix.workspace = true
+bitvec = "1"

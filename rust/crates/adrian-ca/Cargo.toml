@@ -27,3 +27,5 @@ ring.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+bytes = "1"
+bitvec = "1"
