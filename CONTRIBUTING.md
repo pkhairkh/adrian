@@ -157,6 +157,78 @@ The `draft/` directory is a synthesis. Update it when:
 - New cross-cutting findings emerge
 - Roadmap phases shift
 
+## CI requirements
+
+All pull requests targeting `main` must pass the GitHub Actions CI pipeline
+defined in `.github/workflows/ci.yml`. The pipeline runs five parallel jobs
+against the Rust workspace at `rust/Cargo.toml`:
+
+1. **`cargo check`** — workspace compiles cleanly.
+2. **`cargo test`** — every test in every crate passes.
+3. **`cargo clippy --all-targets -- -D warnings`** — zero clippy warnings,
+   including in tests, examples, and benches.
+4. **`cargo fmt --all --check`** — formatting is idempotent (run
+   `cargo fmt --manifest-path rust/Cargo.toml --all` before pushing).
+5. **`cargo audit`** — no known RUSTSEC advisories in the dependency graph.
+
+If any job fails, the PR is blocked from merge. Re-run the failing job
+locally with the exact same invocation before pushing again.
+
+### Code review gates
+
+In addition to the CI pipeline, the following gates apply to all Rust
+contributions:
+
+- **No `unsafe` code.** The workspace has `#![forbid(unsafe_code)]` at the
+  crate root of every member crate. Any PR that introduces `unsafe` will fail
+  to compile and will not be reviewed. If a genuinely `unsafe` primitive is
+  required (e.g. a new FFI binding), open an ADR first and propose a
+  narrowly-scoped allow-list; the workspace-wide forbid attribute must not be
+  removed.
+- **New code must have tests.** Every new public function or trait method
+  must ship with at least one unit test or integration test that exercises
+  the happy path and at least one failure mode. Property-based tests
+  (`proptest`) are preferred for parsers, codecs, and SID/UUID math. Test
+  coverage is not enforced by a hard threshold, but reviewers will request
+  tests for any untested code path.
+- **Workspace hygiene.** New crates must be added to the `members` list in
+  `rust/Cargo.toml`, must declare `#![forbid(unsafe_code)]`, and must use the
+  `workspace = true` form for `version`/`edition`/`license`/`authors` so the
+  shared metadata stays in sync.
+- **Dependency policy.** Add new external dependencies via
+  `[workspace.dependencies]` in `rust/Cargo.toml` and reference them with
+  `dep.workspace = true` in the crate manifest. Avoid `git` dependencies
+  unless covered by an ADR. `cargo audit` (CI job #5) must stay green.
+
+### Running CI checks locally
+
+```bash
+# From the repo root — mirrors the CI pipeline exactly.
+cargo check  --manifest-path rust/Cargo.toml --workspace
+cargo test   --manifest-path rust/Cargo.toml --workspace
+cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+cargo fmt    --manifest-path rust/Cargo.toml --all --check
+cargo audit  --manifest-path rust/Cargo.toml   # cargo install cargo-audit first
+```
+
+### Release pipeline
+
+Version tags matching `v*` (e.g. `v0.6.0`) trigger the release pipeline at
+`.github/workflows/release.yml`, which builds `adrian-cli` in release mode and
+uploads the stripped `adrian` binary as a GitHub Actions artifact. Cut a
+release by:
+
+```bash
+git tag -a v0.6.0 -m "Adrian 0.6.0"
+git push origin v0.6.0
+```
+
+The release pipeline does not publish to a registry — the artifact is the
+binary itself, suitable for downstream packaging (Docker, Debian package,
+Homebrew formula, etc.). A multi-stage `Dockerfile` at the repo root builds
+the same binary inside an image; see the `docker build .` instructions in the
+top-level README.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT license.
