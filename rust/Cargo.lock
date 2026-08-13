@@ -287,6 +287,7 @@ dependencies = [
  "adrian-pac-validator",
  "adrian-schema-compiler",
  "adrian-schema-traits",
+ "adrian-sid",
  "adrian-storage-core",
  "adrian-storage-fdb",
  "adrian-storage-testkit",

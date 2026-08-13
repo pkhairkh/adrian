@@ -167,6 +167,9 @@ pub mod kpasswd;
 /// lookups (principal-by-name, keytab lookup, etc.).
 pub mod store;
 
+/// MS-KILE PAC builder — 9 buffer types per ADR-082 (Wave 2b).
+pub mod pac;
+
 #[cfg(test)]
 mod tests {
     use super::*;
