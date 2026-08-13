@@ -21,3 +21,19 @@ kube.workspace = true
 k8s-openapi.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+# Operator reconcile loop uses futures::StreamExt to drive the
+# kube::runtime::Controller stream to completion.
+futures = "0.3"
+# kube::CustomResource derive adds `#[derive(::schemars::JsonSchema)]` to
+# the spec struct (default schema mode) so the CRD's openAPIV3Schema can
+# be generated. The crate is already in the dep tree (transitive via
+# kube); listing it directly makes the `::schemars` path resolve.
+schemars = "0.8"
+
+[dev-dependencies]
+# Used by the operator_new_stores_client test to construct a mock
+# kube::Client (via kube::Client::new(tower::service_fn(...))).
+bytes.workspace = true
+http.workspace = true
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

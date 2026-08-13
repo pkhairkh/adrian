@@ -16,8 +16,15 @@
 //! - ADR-081: Multi-tenancy (per-tenant CRD namespace)
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+
+// ===========================================================================
+// Error type
+// ===========================================================================
 
 #[derive(Debug, Error)]
 pub enum OperatorError {
@@ -29,26 +36,513 @@ pub enum OperatorError {
     CrdValidation(String),
 }
 
-// ===========================================================================
-// Legacy CRD spec (backward-compat with Wave 4c tests).
-// ===========================================================================
+impl From<kube::Error> for OperatorError {
+    fn from(e: kube::Error) -> Self {
+        Self::Kube(e.to_string())
+    }
+}
 
-/// `DomainController` CRD spec (sketch — full type derives CustomResource).
-///
-/// **Deprecated** in favour of [`DcSpec`] (per the Wave 5b task spec).
-/// Retained so existing callers (Wave 4c tests) continue to compile.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DomainControllerSpec {
-    pub domain: String,
-    pub realm: String,
-    pub netbios_name: String,
-    pub replicas: i32,
-    pub fdb_cluster: String,
-    pub features: Vec<String>,
+impl From<serde_json::Error> for OperatorError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Reconcile(format!("json: {e}"))
+    }
 }
 
 // ===========================================================================
-// New CRD types (Wave 5b — ADR-058 §Decision).
+// DomainController CRD (Wave 4b — real kube::CustomResource derive)
+// ===========================================================================
+
+/// `DomainController` custom resource — reconciled to a StatefulSet that
+/// runs the Adrian DSA (directory service + KDC + SMB + print).
+///
+/// Per ADR-058 (container-native DCs) + ADR-018 (stateless DC pool):
+/// all DCs are stateless behind the FDB cluster — the operator manages a
+/// horizontally-scalable StatefulSet, not primary/secondaries.
+///
+/// The `#[derive(kube::CustomResource)]` macro generates the wrapping
+/// `DomainController` struct (with `metadata` + `spec` fields) plus a
+/// `kube::Resource` impl so the controller-runtime can watch/patch it
+/// via a typed `kube::Api<DomainController>`.
+#[derive(kube::CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "adrian.io",
+    version = "v1alpha1",
+    kind = "DomainController",
+    namespaced
+)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainControllerSpec {
+    /// Number of DC replicas to run (ADR-018: stateless pool, scale freely).
+    pub replicas: i32,
+    /// Container image reference, e.g. `ghcr.io/adrian/dc:0.1.0`.
+    pub image: String,
+    /// Volume size for the DIT PVC, e.g. `"50Gi"` (ADR-058 §Decision).
+    pub storage_size: String,
+    /// DNS domain name, e.g. `adrian.dev`.
+    pub domain_name: String,
+    /// NetBIOS name (single-label, uppercased), e.g. `ADRIAN`.
+    pub netbios_name: String,
+}
+
+// ===========================================================================
+// Reconcile types + pure decision logic (testable without a cluster)
+// ===========================================================================
+
+/// Outcome of a reconcile pass — reported back to the controller-runtime
+/// for logging and requeue accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileResult {
+    /// StatefulSet was created.
+    Created,
+    /// StatefulSet was updated to match the new spec.
+    Updated,
+    /// StatefulSet was deleted (CRD is being deleted).
+    Deleted,
+    /// No-op — the StatefulSet already matches the spec.
+    NoOp,
+    /// Requeue this object for another reconcile pass (e.g. waiting for
+    /// the StatefulSet to become Ready).
+    Requeue,
+}
+
+/// Internal reconcile decision — what the operator should DO. This is the
+/// output of the pure [`decide_reconcile_action`] function; the
+/// [`AdrianOperator::reconcile`] wrapper translates it into the
+/// appropriate kube API calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileAction {
+    /// Create a new StatefulSet from the desired spec.
+    Create,
+    /// Update the existing StatefulSet to match the desired spec.
+    Update,
+    /// Delete the existing StatefulSet (the CRD is being deleted).
+    Delete,
+    /// No-op — the StatefulSet already matches the spec.
+    NoOp,
+}
+
+/// A minimal projection of a `StatefulSet` — the fields the operator
+/// cares about for drift detection. Built from either a desired
+/// `DomainControllerSpec` (via [`StatefulSetSnapshot::from_spec`]) or a
+/// live `k8s_openapi::StatefulSet` (via
+/// [`StatefulSetSnapshot::from_statefulset`]).
+///
+/// This is intentionally a small, comparable struct so that drift
+/// detection is a simple `!=` check rather than a deep object-tree walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatefulSetSnapshot {
+    /// `spec.replicas` from the StatefulSet.
+    pub replicas: i32,
+    /// `spec.template.spec.containers[0].image`.
+    pub image: String,
+    /// `spec.volumeClaimTemplates[0].spec.resources.requests["storage"]`.
+    pub storage_size: String,
+    /// Env var `ADRIAN_DOMAIN_NAME` on the container.
+    pub domain_name: String,
+    /// Env var `ADRIAN_NETBIOS_NAME` on the container.
+    pub netbios_name: String,
+}
+
+impl StatefulSetSnapshot {
+    /// Build the desired snapshot from a `DomainControllerSpec`. This is
+    /// what the operator thinks the StatefulSet SHOULD look like.
+    pub fn from_spec(spec: &DomainControllerSpec) -> Self {
+        Self {
+            replicas: spec.replicas,
+            image: spec.image.clone(),
+            storage_size: spec.storage_size.clone(),
+            domain_name: spec.domain_name.clone(),
+            netbios_name: spec.netbios_name.clone(),
+        }
+    }
+
+    /// Extract the observed snapshot from a live `k8s_openapi::StatefulSet`.
+    /// Returns `None` if any required field is missing (the StatefulSet is
+    /// malformed or was not created by this operator).
+    ///
+    /// Reads:
+    /// - `spec.replicas` (defaults to 0 if unset — the k8s default).
+    /// - `spec.template.spec.containers[0].image`.
+    /// - `ADRIAN_DOMAIN_NAME` / `ADRIAN_NETBIOS_NAME` env vars on the
+    ///   first container.
+    /// - `spec.volumeClaimTemplates[0]`'s `storage` request.
+    pub fn from_statefulset(ss: &k8s_openapi::api::apps::v1::StatefulSet) -> Option<Self> {
+        let spec = ss.spec.as_ref()?;
+        let replicas = spec.replicas.unwrap_or(0);
+        let container = spec.template.spec.as_ref()?.containers.first()?;
+        let image = container.image.clone()?;
+        let env = container.env.clone().unwrap_or_default();
+        let domain_name = env
+            .iter()
+            .find(|e| e.name == "ADRIAN_DOMAIN_NAME")
+            .and_then(|e| e.value.clone())?;
+        let netbios_name = env
+            .iter()
+            .find(|e| e.name == "ADRIAN_NETBIOS_NAME")
+            .and_then(|e| e.value.clone())?;
+        let storage_size = spec
+            .volume_claim_templates
+            .as_ref()
+            .and_then(|vcts| vcts.first())
+            .and_then(|vc| vc.spec.as_ref())
+            .and_then(|s| s.resources.as_ref())
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|reqs| reqs.get("storage"))
+            .map(|q| q.0.clone())?;
+        Some(Self {
+            replicas,
+            image,
+            storage_size,
+            domain_name,
+            netbios_name,
+        })
+    }
+}
+
+/// Decide what the reconcile loop should do, given the current
+/// StatefulSet snapshot (if any), the desired DomainController spec, and
+/// the CRD's deletion timestamp (if any).
+///
+/// This is a **pure function** — it does not touch the kube API. The
+/// [`AdrianOperator::reconcile`] wrapper translates the returned
+/// [`ReconcileAction`] into the appropriate kube API call(s). Splitting
+/// the decision from the I/O keeps the logic unit-testable without a
+/// running Kubernetes cluster (per Wave 4b task hint).
+///
+/// # Decision matrix
+///
+/// | deletion_timestamp | current StatefulSet | Action   |
+/// |--------------------|---------------------|----------|
+/// | Some                | _                   | `Delete` |
+/// | None                | None                | `Create` |
+/// | None                | Some (drift)        | `Update` |
+/// | None                | Some (in sync)      | `NoOp`   |
+pub fn decide_reconcile_action(
+    current: Option<&StatefulSetSnapshot>,
+    desired: &DomainControllerSpec,
+    deletion_timestamp: Option<&DateTime<Utc>>,
+) -> ReconcileAction {
+    if deletion_timestamp.is_some() {
+        return ReconcileAction::Delete;
+    }
+    let desired_snapshot = StatefulSetSnapshot::from_spec(desired);
+    match current {
+        None => ReconcileAction::Create,
+        Some(current) if current != &desired_snapshot => ReconcileAction::Update,
+        Some(_) => ReconcileAction::NoOp,
+    }
+}
+
+/// Translate a `kube::Error` into `Ok(None)` if it's a 404 NotFound, or
+/// `Err(error)` otherwise. Used by the reconcile loop to convert the
+/// StatefulSet delete result (which returns `Either<K, Status>`) into
+/// `Option` form for the decision function.
+///
+/// Note: `kube::Api::get_opt` already handles this for fetches; this
+/// helper is for the delete path (and for callers that want a uniform
+/// `Option<T>` shape regardless of the API method).
+pub fn not_found_to_none<T>(result: Result<T, kube::Error>) -> Result<Option<T>, OperatorError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(kube::Error::Api(err)) if err.code == 404 => Ok(None),
+        Err(e) => Err(OperatorError::from(e)),
+    }
+}
+
+/// Derive the StatefulSet name for a `DomainController` CRD. Namespaced
+/// resources in Kubernetes must have unique names within a namespace; we
+/// prefix with `adrian-dc-` to avoid collisions with non-Adrian resources
+/// and to make operator-owned StatefulSets greppable.
+///
+/// If the CRD has no `metadata.name` (which shouldn't happen for a
+/// persisted CRD but can happen for an in-memory test fixture), falls
+/// back to the bare name `adrian-dc`.
+pub fn statefulset_name(dc: &DomainController) -> String {
+    match dc.metadata.name.as_deref() {
+        Some(base) if !base.is_empty() => format!("adrian-dc-{base}"),
+        _ => "adrian-dc".to_string(),
+    }
+}
+
+/// Build the desired `StatefulSet` for a `DomainController` CRD. The
+/// StatefulSet runs the Adrian DSA container with the spec's image,
+/// configured for the domain via env vars, and a PVC for the DIT volume.
+///
+/// The container exposes LDAP (389), LDAPS (636), Kerberos (88), kpasswd
+/// (464), DNS (53), SMB (445), and metrics (9100) ports. Liveness,
+/// readiness, and startup probes are wired per ADR-058 §Decision:
+/// liveness on TCP/389 (LDAP), readiness on TCP/88 (Kerberos), startup
+/// on TCP/389.
+///
+/// Returns `Err(OperatorError::Reconcile)` if the constructed JSON fails
+/// to deserialize as a `StatefulSet` — this would indicate a bug in the
+/// JSON template (since `k8s_openapi::StatefulSet` is permissive about
+/// unknown fields).
+pub fn build_statefulset_for(
+    dc: &DomainController,
+) -> Result<k8s_openapi::api::apps::v1::StatefulSet, OperatorError> {
+    let name = statefulset_name(dc);
+    let namespace = dc
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let dc_name = dc.metadata.name.clone().unwrap_or_default();
+    let headless_service = if dc_name.is_empty() {
+        "adrian-dc-headless".to_string()
+    } else {
+        format!("adrian-dc-{dc_name}-headless")
+    };
+    let ss_json = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "adrian-dc",
+                "app.kubernetes.io/managed-by": "adrian-operator",
+                "adrian.io/domain-controller": dc_name
+            }
+        },
+        "spec": {
+            "replicas": dc.spec.replicas,
+            "serviceName": headless_service,
+            "selector": {
+                "matchLabels": {
+                    "app.kubernetes.io/name": "adrian-dc",
+                    "adrian.io/domain-controller": dc_name
+                }
+            },
+            "template": {
+                "metadata": {
+                    "labels": {
+                        "app.kubernetes.io/name": "adrian-dc",
+                        "adrian.io/domain-controller": dc_name
+                    }
+                },
+                "spec": {
+                    "securityContext": {
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "fsGroup": 10001
+                    },
+                    "containers": [{
+                        "name": "adrian-dc",
+                        "image": dc.spec.image,
+                        "ports": [
+                            {"name": "ldap", "containerPort": 389},
+                            {"name": "ldaps", "containerPort": 636},
+                            {"name": "kerberos", "containerPort": 88},
+                            {"name": "kpasswd", "containerPort": 464},
+                            {"name": "dns", "containerPort": 53},
+                            {"name": "smb", "containerPort": 445},
+                            {"name": "metrics", "containerPort": 9100}
+                        ],
+                        "env": [
+                            {"name": "ADRIAN_DOMAIN_NAME", "value": dc.spec.domain_name},
+                            {"name": "ADRIAN_NETBIOS_NAME", "value": dc.spec.netbios_name}
+                        ],
+                        "volumeMounts": [
+                            {"name": "dit", "mountPath": "/var/lib/adrian/dit"}
+                        ],
+                        "livenessProbe": {
+                            "tcpSocket": {"port": "ldap"},
+                            "initialDelaySeconds": 30,
+                            "periodSeconds": 10,
+                            "failureThreshold": 6
+                        },
+                        "readinessProbe": {
+                            "tcpSocket": {"port": "kerberos"},
+                            "periodSeconds": 5
+                        },
+                        "startupProbe": {
+                            "tcpSocket": {"port": "ldap"},
+                            "failureThreshold": 30,
+                            "periodSeconds": 10
+                        }
+                    }]
+                }
+            },
+            "volumeClaimTemplates": [{
+                "name": "dit",
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": dc.spec.storage_size}}
+                }
+            }]
+        }
+    });
+    serde_json::from_value(ss_json).map_err(OperatorError::from)
+}
+
+// ===========================================================================
+// Operator controller — real kube::Client + controller-runtime loop
+// ===========================================================================
+
+/// The Adrian operator — reconciles `DomainController` CRDs to
+/// StatefulSets that run the Adrian DSA. Construct with
+/// [`AdrianOperator::new`], drive the reconcile loop with
+/// [`AdrianOperator::run`], or reconcile a single object with
+/// [`AdrianOperator::reconcile`].
+///
+/// Per ADR-058: container-native DCs managed by this operator.
+/// Per ADR-018: stateless pool — no primary/secondary semantics.
+pub struct AdrianOperator {
+    client: kube::Client,
+}
+
+/// Operator context shared across reconcile invocations (passed to
+/// `Controller::run` as the `Arc<Ctx>`).
+struct OperatorContext {
+    client: kube::Client,
+}
+
+impl AdrianOperator {
+    /// Construct an operator with a real `kube::Client`. The client must
+    /// be configured with cluster credentials — typically via
+    /// `Client::try_default().await?` (which reads kubeconfig or
+    /// in-cluster service-account env vars).
+    pub fn new(client: kube::Client) -> Self {
+        Self { client }
+    }
+
+    /// Returns a reference to the underlying `kube::Client`. Used by
+    /// tests (and external callers) to verify the operator holds the
+    /// client it was constructed with, and to issue their own API calls
+    /// against the same cluster.
+    pub fn client(&self) -> &kube::Client {
+        &self.client
+    }
+
+    /// Run the reconcile loop. Subscribes to `DomainController` CRD
+    /// changes (and owned StatefulSet changes) in the operator's
+    /// default namespace and drives [`AdrianOperator::reconcile`] on each
+    /// event.
+    ///
+    /// Blocks until graceful shutdown. Errors are logged but do not halt
+    /// the loop — the controller-runtime requeues failed objects with a
+    /// 30-second backoff.
+    ///
+    /// Per the kube controller-runtime pattern: the `Controller` watches
+    /// the main resource (`DomainController`) plus owned children
+    /// (`StatefulSet`) — changes to either trigger a reconcile of the
+    /// owning `DomainController`.
+    pub async fn run(&self) -> Result<(), OperatorError> {
+        use futures::StreamExt;
+        use kube::runtime::{watcher, Controller};
+
+        let namespace = self.client.default_namespace().to_string();
+        let dc_api: kube::Api<DomainController> =
+            kube::Api::namespaced(self.client.clone(), &namespace);
+        let ss_api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
+            kube::Api::namespaced(self.client.clone(), &namespace);
+        let ctrl = Controller::new(dc_api, watcher::Config::default())
+            .owns(ss_api, watcher::Config::default());
+        let ctx = Arc::new(OperatorContext {
+            client: self.client.clone(),
+        });
+        ctrl.run(
+            |dc, ctx| async move {
+                let operator = AdrianOperator {
+                    client: ctx.client.clone(),
+                };
+                let result = operator.reconcile(&dc).await?;
+                Ok::<kube::runtime::controller::Action, OperatorError>(match result {
+                    ReconcileResult::Requeue => {
+                        kube::runtime::controller::Action::requeue(Duration::from_secs(30))
+                    }
+                    _ => kube::runtime::controller::Action::await_change(),
+                })
+            },
+            |_dc, err, _ctx| {
+                tracing::error!(?err, "reconcile failed; requeuing with backoff");
+                kube::runtime::controller::Action::requeue(Duration::from_secs(30))
+            },
+            ctx,
+        )
+        .for_each(|res| async {
+            match res {
+                Ok((obj, action)) => tracing::info!(?obj, ?action, "reconciled"),
+                Err(err) => tracing::error!(?err, "reconcile stream error"),
+            }
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Reconcile a single `DomainController` CRD instance. Idempotent —
+    /// safe to call on every CRD change. Returns the
+    /// [`ReconcileResult`] for logging/requeue accounting.
+    ///
+    /// # Decision matrix
+    ///
+    /// - CRD has a `deletionTimestamp` → delete the StatefulSet (if it
+    ///   still exists; a 404 is treated as `NoOp` since the StatefulSet
+    ///   is already gone). Finalizer-based deletion is deferred to a
+    ///   future wave (TODO:Wave 5+).
+    /// - StatefulSet not found → create it via `Api::create`.
+    /// - StatefulSet found but snapshot differs → patch via
+    ///   `Api::patch` with a strategic-merge patch.
+    /// - else → `NoOp`.
+    pub async fn reconcile(
+        &self,
+        obj: &DomainController,
+    ) -> Result<ReconcileResult, OperatorError> {
+        use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+
+        let namespace = obj
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let ss_api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
+            kube::Api::namespaced(self.client.clone(), &namespace);
+        let ss_name = statefulset_name(obj);
+
+        // Fetch the current StatefulSet (if any). Api::get_opt returns
+        // Ok(None) for HTTP 404 NotFound — no error handling needed.
+        let current_opt: Option<k8s_openapi::api::apps::v1::StatefulSet> =
+            ss_api.get_opt(&ss_name).await?;
+        let current_snapshot = current_opt
+            .as_ref()
+            .and_then(StatefulSetSnapshot::from_statefulset);
+
+        // Pure decision: what should we do?
+        let deletion_ts: Option<&DateTime<Utc>> =
+            obj.metadata.deletion_timestamp.as_ref().map(|t| &t.0);
+        let action = decide_reconcile_action(current_snapshot.as_ref(), &obj.spec, deletion_ts);
+
+        match action {
+            ReconcileAction::Delete => {
+                // CRD is being deleted — delete the StatefulSet.
+                // A 404 here means the StatefulSet is already gone —
+                // treat as NoOp (no work to do).
+                let _ = not_found_to_none(ss_api.delete(&ss_name, &DeleteParams::default()).await)?;
+                Ok(ReconcileResult::Deleted)
+            }
+            ReconcileAction::Create => {
+                let ss = build_statefulset_for(obj)?;
+                ss_api.create(&PostParams::default(), &ss).await?;
+                Ok(ReconcileResult::Created)
+            }
+            ReconcileAction::Update => {
+                let ss = build_statefulset_for(obj)?;
+                ss_api
+                    .patch(&ss_name, &PatchParams::default(), &Patch::Merge(&ss))
+                    .await?;
+                Ok(ReconcileResult::Updated)
+            }
+            ReconcileAction::NoOp => Ok(ReconcileResult::NoOp),
+        }
+    }
+}
+
+// ===========================================================================
+// Wave 5b CRD scaffolding — ADR-058 §Decision (DcSpec / DcStatus /
+// Helm chart generation). Retained alongside the new kube::CustomResource
+// DomainController CRD for the YAML/Helm-generation surface that
+// downstream tooling (adrian-cli, adrian-monitor) consumes.
 // ===========================================================================
 
 /// Kubernetes-standard `ObjectMeta` (minimal subset — name, namespace,
@@ -383,56 +877,285 @@ spec:
     }
 }
 
-// ===========================================================================
-// Operator controller
-// ===========================================================================
-
-/// Operator controller.
-///
-/// **Loud stub** — the operator's reconcile loop is not yet wired to a
-/// `kube::Client`. Per the Wave 5b task spec, the CRD / StatefulSet /
-/// Helm generation functions ARE implemented; the actual watch-loop that
-/// subscribes to CRD changes and drives reconciliation is deferred to a
-/// future wave (it requires a running Kubernetes API server for
-/// integration tests).
-pub struct AdrianOperator {
-    // Held empty intentionally — once the reconcile loop is wired, this
-    // will hold `kube::Client` + the CRD watch stream. For now, the
-    // CRD-generation surface (above) is what callers consume.
-}
-
-impl AdrianOperator {
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    /// Run the reconciliation loop until shutdown.
-    ///
-    /// **Loud stub** — until the CRD watch + reconcile loop is wired to
-    /// a `kube::Client`, this returns `OperatorError::Reconcile("not yet
-    /// implemented")` so callers see the explicit "framework not yet
-    /// implemented" signal. CRD / StatefulSet / Helm generation are
-    /// implemented as standalone functions (see [`serialize_crd`],
-    /// [`generate_statefulset`], [`generate_helm_chart`]).
-    pub async fn run(&self) -> Result<(), OperatorError> {
-        Err(OperatorError::Reconcile("not yet implemented".into()))
-    }
-}
-
-impl Default for AdrianOperator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `adrian-operator`. Cover type construction (CRD
-    //! spec), error types, serde round-trip of the `DomainController`
-    //! CRD, the loud-stub behaviour of `AdrianOperator::run`, plus the
-    //! new Wave 5b CRD / StatefulSet / Helm chart generation surface.
+    //! Unit tests for `adrian-operator`. Cover:
+    //! - The new Wave 4b surface: DomainController CRD metadata, the
+    //!   pure `decide_reconcile_action` decision matrix, the
+    //!   `not_found_to_none` 404 helper, `StatefulSetSnapshot`
+    //!   extraction, `build_statefulset_for`, `statefulset_name`, and
+    //!   `AdrianOperator::new` (with a mock kube client).
+    //! - The Wave 5b surface: `DcSpec`, `DomainControllerCrd`,
+    //!   `crd_definition`, `generate_statefulset`, `generate_helm_chart`,
+    //!   `Condition` serialization.
 
     use super::*;
+    use chrono::Utc;
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    // Required for `DomainController::api_version(&())` / `kind` / etc.
+    // — the kube::CustomResource derive generates a `kube::Resource`
+    // impl, and trait methods are only callable when the trait is in
+    // scope.
+    use kube::Resource;
+
+    // ========================================================================
+    // Helper: construct a DomainController for tests.
+    // ========================================================================
+
+    fn sample_dc_spec() -> DomainControllerSpec {
+        DomainControllerSpec {
+            replicas: 3,
+            image: "ghcr.io/adrian/dc:0.1.0".to_string(),
+            storage_size: "50Gi".to_string(),
+            domain_name: "adrian.dev".to_string(),
+            netbios_name: "ADRIAN".to_string(),
+        }
+    }
+
+    /// Build a `DomainController` CRD instance for tests (with name +
+    /// namespace set so [`statefulset_name`] is deterministic).
+    fn sample_dc(name: &str) -> DomainController {
+        DomainController::new(name, sample_dc_spec())
+    }
+
+    // ========================================================================
+    // Wave 4b tests — DomainController CRD metadata (1 test).
+    // ========================================================================
+
+    #[test]
+    fn domain_controller_crd_metadata_has_correct_group_version_kind() {
+        // The kube::CustomResource derive must generate the Resource
+        // trait impl with the correct group/version/kind/plural — these
+        // are what the kube::Api<DomainController> uses to construct
+        // the REST path (`/apis/adrian.io/v1alpha1/namespaces/<ns>/domaincontrollers`).
+        // A typo here would silently 404 every watch request.
+        assert_eq!(DomainController::api_version(&()), "adrian.io/v1alpha1");
+        assert_eq!(DomainController::group(&()), "adrian.io");
+        assert_eq!(DomainController::version(&()), "v1alpha1");
+        assert_eq!(DomainController::kind(&()), "DomainController");
+        assert_eq!(DomainController::plural(&()), "domaincontrollers");
+    }
+
+    // ========================================================================
+    // Wave 4b tests — pure reconcile decision logic (4 tests).
+    // ========================================================================
+
+    #[test]
+    fn decide_reconcile_action_creates_when_no_statefulset() {
+        // When the StatefulSet doesn't exist yet (current=None) and the
+        // CRD is not being deleted, the operator must create it.
+        let spec = sample_dc_spec();
+        let action = decide_reconcile_action(None, &spec, None);
+        assert_eq!(action, ReconcileAction::Create);
+    }
+
+    #[test]
+    fn decide_reconcile_action_updates_when_spec_differs() {
+        // When the StatefulSet exists but its snapshot differs from the
+        // desired spec, the operator must update it.
+        let spec = sample_dc_spec();
+        // Stale snapshot — replicas was 2 (desired is 3).
+        let mut stale = StatefulSetSnapshot::from_spec(&spec);
+        stale.replicas = 2;
+        let action = decide_reconcile_action(Some(&stale), &spec, None);
+        assert_eq!(action, ReconcileAction::Update);
+    }
+
+    #[test]
+    fn decide_reconcile_action_deletes_when_crd_has_deletion_timestamp() {
+        // When the CRD has a deletionTimestamp, the operator must
+        // garbage-collect its StatefulSet — even if the StatefulSet is
+        // still in sync with the spec.
+        let spec = sample_dc_spec();
+        let current = StatefulSetSnapshot::from_spec(&spec);
+        let deletion_ts = Utc::now();
+        let action = decide_reconcile_action(Some(&current), &spec, Some(&deletion_ts));
+        assert_eq!(action, ReconcileAction::Delete);
+    }
+
+    #[test]
+    fn not_found_to_none_converts_kube_404_to_ok_none() {
+        // The reconcile loop must treat a 404 NotFound from the kube
+        // API as "object is gone" (Ok(None)), not as a fatal error.
+        // This is the "handles not-found gracefully" contract.
+        let not_found = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "statefulsets.apps \"adrian-dc\" not found".to_string(),
+            reason: "NotFound".to_string(),
+            code: 404,
+        });
+        let result: Result<StatefulSet, kube::Error> = Err(not_found);
+        assert_eq!(not_found_to_none(result).unwrap(), None);
+
+        // A non-404 error must propagate as Err.
+        let conflict = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "already exists".to_string(),
+            reason: "AlreadyExists".to_string(),
+            code: 409,
+        });
+        let result: Result<StatefulSet, kube::Error> = Err(conflict);
+        assert!(not_found_to_none(result).is_err());
+    }
+
+    // ========================================================================
+    // Wave 4b tests — helper functions (every new function gets a test).
+    // ========================================================================
+
+    #[test]
+    fn decide_reconcile_action_noop_when_in_sync() {
+        // When the StatefulSet snapshot matches the desired spec exactly,
+        // the operator must NoOp (don't churn the API with no-op patches).
+        let spec = sample_dc_spec();
+        let current = StatefulSetSnapshot::from_spec(&spec);
+        let action = decide_reconcile_action(Some(&current), &spec, None);
+        assert_eq!(action, ReconcileAction::NoOp);
+    }
+
+    #[test]
+    fn statefulset_snapshot_from_spec_preserves_all_fields() {
+        // The desired snapshot must round-trip every field of the spec —
+        // drift detection compares these snapshots, so any field lost
+        // here would silently mask drift.
+        let spec = sample_dc_spec();
+        let snap = StatefulSetSnapshot::from_spec(&spec);
+        assert_eq!(snap.replicas, 3);
+        assert_eq!(snap.image, "ghcr.io/adrian/dc:0.1.0");
+        assert_eq!(snap.storage_size, "50Gi");
+        assert_eq!(snap.domain_name, "adrian.dev");
+        assert_eq!(snap.netbios_name, "ADRIAN");
+    }
+
+    #[test]
+    fn statefulset_snapshot_from_statefulset_extracts_fields() {
+        // Build a StatefulSet via build_statefulset_for, then verify
+        // that StatefulSetSnapshot::from_statefulset extracts the same
+        // fields we put in. This is the round-trip that drift detection
+        // relies on: build_desired → snapshot_from_spec, fetch_live →
+        // snapshot_from_statefulset, compare.
+        let dc = sample_dc("primary");
+        let ss = build_statefulset_for(&dc).expect("build_statefulset_for");
+        let observed = StatefulSetSnapshot::from_statefulset(&ss)
+            .expect("snapshot should extract from a built StatefulSet");
+        let desired = StatefulSetSnapshot::from_spec(&dc.spec);
+        assert_eq!(observed, desired);
+    }
+
+    #[test]
+    fn statefulset_snapshot_from_statefulset_returns_none_for_malformed() {
+        // An empty (default) StatefulSet has no spec, no containers, no
+        // PVCs — from_statefulset must return None rather than panic.
+        let empty = StatefulSet::default();
+        assert!(StatefulSetSnapshot::from_statefulset(&empty).is_none());
+    }
+
+    #[test]
+    fn build_statefulset_for_returns_valid_statefulset() {
+        // build_statefulset_for must:
+        // - Return Ok (the JSON must deserialize as a StatefulSet).
+        // - Propagate replicas, image, domain_name, netbios_name,
+        //   storage_size into the right StatefulSet fields.
+        // - Set the StatefulSet name to `adrian-dc-<dc-name>`.
+        // - Wire the ADRIAN_DOMAIN_NAME / ADRIAN_NETBIOS_NAME env vars.
+        // - Wire a DIT PVC with the spec's storage_size.
+        let dc = sample_dc("primary");
+        let ss = build_statefulset_for(&dc).expect("build_statefulset_for");
+        assert_eq!(ss.metadata.name.as_deref(), Some("adrian-dc-primary"));
+        assert_eq!(ss.metadata.namespace.as_deref(), Some("default"));
+        let spec = ss.spec.as_ref().expect("StatefulSet.spec");
+        assert_eq!(spec.replicas, Some(3));
+        let container = spec
+            .template
+            .spec
+            .as_ref()
+            .expect("PodSpec")
+            .containers
+            .first()
+            .expect("first container");
+        assert_eq!(container.image.as_deref(), Some("ghcr.io/adrian/dc:0.1.0"));
+        let env = container
+            .env
+            .as_ref()
+            .expect("container.env must be present");
+        let domain_env = env
+            .iter()
+            .find(|e| e.name == "ADRIAN_DOMAIN_NAME")
+            .expect("ADRIAN_DOMAIN_NAME env var");
+        assert_eq!(domain_env.value.as_deref(), Some("adrian.dev"));
+        let netbios_env = env
+            .iter()
+            .find(|e| e.name == "ADRIAN_NETBIOS_NAME")
+            .expect("ADRIAN_NETBIOS_NAME env var");
+        assert_eq!(netbios_env.value.as_deref(), Some("ADRIAN"));
+        // PVC storage size.
+        let pvc = spec
+            .volume_claim_templates
+            .as_ref()
+            .and_then(|vcts| vcts.first())
+            .expect("volume_claim_templates[0]");
+        let storage = pvc
+            .spec
+            .as_ref()
+            .and_then(|s| s.resources.as_ref())
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|reqs| reqs.get("storage"))
+            .expect("storage request");
+        assert_eq!(storage.0, "50Gi");
+        // Probes (ADR-058 §Decision).
+        assert!(container.liveness_probe.is_some(), "livenessProbe required");
+        assert!(
+            container.readiness_probe.is_some(),
+            "readinessProbe required"
+        );
+        assert!(container.startup_probe.is_some(), "startupProbe required");
+    }
+
+    #[test]
+    fn statefulset_name_uses_dc_name() {
+        // statefulset_name must prefix `adrian-dc-` to the CRD's
+        // metadata.name, so operator-owned StatefulSets are greppable.
+        let dc = sample_dc("us-east-1a");
+        assert_eq!(statefulset_name(&dc), "adrian-dc-us-east-1a");
+    }
+
+    #[test]
+    fn statefulset_name_falls_back_when_no_dc_name() {
+        // A CRD with no metadata.name (shouldn't happen for persisted
+        // CRDs but can happen for in-memory test fixtures) must fall
+        // back to the bare name `adrian-dc` rather than panic.
+        let mut dc = sample_dc("ignored");
+        dc.metadata.name = None;
+        assert_eq!(statefulset_name(&dc), "adrian-dc");
+    }
+
+    #[tokio::test]
+    async fn operator_new_stores_client() {
+        // AdrianOperator::new must accept a real kube::Client and
+        // expose it via client(). We construct the Client with a
+        // tower::service_fn mock (no real cluster needed) — this
+        // verifies the type signature compiles and the client is
+        // stored, which is the contract callers depend on.
+        //
+        // Must run inside a tokio runtime because kube::Client::new
+        // internally spawns a buffer task on the current runtime.
+        use bytes::Bytes;
+        use http::{Request, Response};
+        use http_body_util::Empty;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        let svc = service_fn(|_req: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(Response::new(Empty::<Bytes>::new()))
+        });
+        let client = kube::Client::new(svc, "test-ns");
+        let operator = AdrianOperator::new(client);
+        assert_eq!(operator.client().default_namespace(), "test-ns");
+    }
+
+    // ========================================================================
+    // Wave 5b tests (preserved) — error type, DcSpec, CRD serialization,
+    // CRD definition, StatefulSet generation, Helm chart, Condition.
+    // ========================================================================
 
     #[test]
     fn operator_error_variants_render_messages() {
@@ -454,108 +1177,28 @@ mod tests {
     }
 
     #[test]
-    fn domain_controller_spec_constructs_with_expected_fields() {
-        let spec = DomainControllerSpec {
-            domain: "adrian.dev".into(),
-            realm: "ADRIAN.DEV".into(),
-            netbios_name: "ADRIAN".into(),
-            replicas: 3,
-            fdb_cluster: "adrian-fdb:4500".into(),
-            features: vec!["kdc".into(), "ldap".into(), "smb".into()],
-        };
-        assert_eq!(spec.domain, "adrian.dev");
-        assert_eq!(spec.realm, "ADRIAN.DEV");
-        assert_eq!(spec.netbios_name, "ADRIAN");
-        assert_eq!(spec.replicas, 3);
-        assert_eq!(spec.fdb_cluster, "adrian-fdb:4500");
-        assert_eq!(spec.features.len(), 3);
-        assert_eq!(spec.features[0], "kdc");
+    fn operator_error_converts_from_kube_error() {
+        // The From<kube::Error> impl lets `?` propagate kube errors in
+        // the reconcile loop without manual .map_err at every call site.
+        let kube_err = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "boom".to_string(),
+            reason: "InternalError".to_string(),
+            code: 500,
+        });
+        let op_err: OperatorError = kube_err.into();
+        assert!(matches!(op_err, OperatorError::Kube(_)));
+        assert!(op_err.to_string().contains("boom"));
     }
 
     #[test]
-    fn domain_controller_spec_serde_round_trip_preserves_all_fields() {
-        // The `DomainController` CRD spec must round-trip through serde
-        // without loss — the operator's `kube::Api` reads/writes the spec
-        // as JSON via `serde_json`, so any field drift between encode/decode
-        // would silently corrupt the CRD persisted in etcd.
-        let spec = DomainControllerSpec {
-            domain: "adrian.dev".into(),
-            realm: "ADRIAN.DEV".into(),
-            netbios_name: "ADRIAN".into(),
-            replicas: 5,
-            fdb_cluster: "adrian-fdb-cluster:4500".into(),
-            features: vec!["kdc".into(), "ldap".into(), "smb".into(), "print".into()],
-        };
-        let json = serde_json::to_string(&spec).expect("serialize spec");
-        let back: DomainControllerSpec = serde_json::from_str(&json).expect("deserialize spec");
-        assert_eq!(back.domain, spec.domain);
-        assert_eq!(back.realm, spec.realm);
-        assert_eq!(back.netbios_name, spec.netbios_name);
-        assert_eq!(back.replicas, spec.replicas);
-        assert_eq!(back.fdb_cluster, spec.fdb_cluster);
-        assert_eq!(back.features, spec.features);
+    fn operator_error_converts_from_serde_json_error() {
+        // The From<serde_json::Error> impl lets build_statefulset_for
+        // propagate deserialization failures with `?`.
+        let json_err = serde_json::from_str::<i32>("not a number").expect_err("invalid json");
+        let op_err: OperatorError = json_err.into();
+        assert!(matches!(op_err, OperatorError::Reconcile(_)));
     }
-
-    #[test]
-    fn domain_controller_spec_serializes_to_expected_json_keys() {
-        // The CRD field names are part of the operator's public API
-        // (kubectl apply YAML). Verifying the JSON keys guards against
-        // accidentally renaming a field without a serde `rename` attribute.
-        let spec = DomainControllerSpec {
-            domain: "d".into(),
-            realm: "r".into(),
-            netbios_name: "n".into(),
-            replicas: 1,
-            fdb_cluster: "f".into(),
-            features: vec![],
-        };
-        let json = serde_json::to_value(&spec).expect("serialize spec");
-        let obj = json
-            .as_object()
-            .expect("spec must serialize to a JSON object");
-        for key in [
-            "domain",
-            "realm",
-            "netbios_name",
-            "replicas",
-            "fdb_cluster",
-            "features",
-        ] {
-            assert!(obj.contains_key(key), "spec JSON must contain key `{key}`");
-        }
-        assert_eq!(obj.len(), 6, "spec must have exactly 6 fields");
-        // `replicas` is an i32 → JSON number, not a string.
-        assert_eq!(obj.get("replicas").unwrap().as_i64(), Some(1));
-    }
-
-    #[test]
-    fn run_stub_returns_reconcile_error() {
-        // Loud-stub contract (ADR-058): until the CRD watch + reconcile
-        // loop is implemented, `AdrianOperator::run` must surface
-        // `OperatorError::Reconcile` rather than silently succeed or panic.
-        // The CRD / StatefulSet / Helm generation surface IS implemented
-        // as standalone functions; only the watch-loop is deferred.
-        let operator = AdrianOperator::new();
-        let result = operator.run();
-        // `run` is async — drive it on a minimal runtime. Using
-        // `tokio::runtime::Runtime::new` here keeps the test self-contained
-        // (no `#[tokio::test]` attribute needed, and no multi-thread pool
-        // leak across the test suite).
-        let rt = tokio::runtime::Runtime::new().expect("build runtime");
-        let err = rt
-            .block_on(result)
-            .expect_err("expected OperatorError::Reconcile");
-        match err {
-            OperatorError::Reconcile(msg) => {
-                assert!(msg.contains("not yet implemented"), "got: {msg}")
-            }
-            other => panic!("expected OperatorError::Reconcile, got {other:?}"),
-        }
-    }
-
-    // ========================================================================
-    // New tests — Wave 5b CRD / StatefulSet / Helm chart generation.
-    // ========================================================================
 
     #[test]
     fn dc_spec_constructs_with_expected_fields() {
