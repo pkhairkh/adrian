@@ -10,8 +10,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Resolution of the 11 Tier-1 open research questions (see `catalog/13-open-research-questions.md` and `draft/04-open-research-questions.md`)
 - Framework architecture proposal (successor deliverable to the problem catalog)
 - Per-capability design recommendations
+- Superseding ADRs for the 61 deferred problems once Tier-1 ORQs are resolved
+
+## [0.2.0] — 2026-08-13
+
+### Added — Architecture Decision Records (69 ADRs)
+
+- **`adr/` directory** with 69 Architecture Decision Records covering high-confidence decisions across all 12 framework capabilities
+- **`adr/TRIAGE.md`** — triage document assessing all 130 catalog problems for ADR eligibility (60 high-confidence, 9 partial, 61 deferred to Tier-1 ORQ resolution)
+- **`adr/README.md`** — master index with per-capability tables, PC→ADR mapping, cross-ADR cluster analysis
+
+#### ADR breakdown by capability
+
+| Capability | ADRs | Range |
+|-----------|------|-------|
+| Core Directory | 10 | ADR-001 to ADR-010 |
+| KDC | 10 | ADR-011 to ADR-020 |
+| Auth Provider | 3 | ADR-021 to ADR-023 |
+| Policy Engine | 8 | ADR-024 to ADR-031 |
+| Cert Service | 6 | ADR-032 to ADR-037 |
+| Federation Gateway | 5 | ADR-038 to ADR-042 |
+| File Gateway | 5 | ADR-043 to ADR-047 |
+| Client SDK | 4 | ADR-048 to ADR-051 |
+| Cross-Platform Parity | 5 | ADR-052 to ADR-056 |
+| Operations | 7 | ADR-057 to ADR-063 |
+| Security | 4 | ADR-064 to ADR-067 |
+| Migration | 2 | ADR-068 to ADR-069 |
+| **Total** | **69** | |
+
+#### ADR format
+
+Each ADR follows the standard structure: Status, Context (cites PC-NNN), Decision (with concrete specification), Rationale, Consequences (positive/negative/neutral/cost/operational), Alternatives Considered (≥2), Open Questions (cites gating ORQ for PARTIAL ADRs), Cross-capability impact, References (KB files + RFCs + MS-* specs). Security ADRs add a Threat model section (STRIDE + attack vector + AD mitigations + residual risk). Migration ADRs add a Migration state machine section (source/target state + coexistence + cutover + rollback).
+
+#### Statistics
+
+- 69 ADRs totaling ~150,000 words (avg ~2,177 words/ADR)
+- 4 blocker-severity decisions: ADR-015 (krbtgt HSM rotation), ADR-059 (PITR backup DR), ADR-064 (Kerberoasting AES migration), ADR-065 (golden ticket krbtgt HSM)
+- 61 problems deferred to research spikes — gating ORQs: ORQ-001 (replication, 15 problems), ORQ-011 (storage, 9), ORQ-026 (SID/UUID, 9), ORQ-030 (schema, 9), ORQ-042 (KDC, 6), ORQ-072 (NTLM, 4), ORQ-090 (policy, 8), ORQ-110 (PKI, 6), ORQ-132 (federation, 5), ORQ-154 (SMB, 4), ORQ-169 (Client SDK, 8), ORQ-202 (Linux tier, 5)
+
+### Changed
+
+- `adr/README.md` is now auto-generated from ADR YAML frontmatter by `scripts/regenerate_adr_readme.py` (script not yet committed to repo; lives in working directory)
 
 ## [0.1.0] — 2026-08-13
+
 
 ### Added — Initial research deliverable
 

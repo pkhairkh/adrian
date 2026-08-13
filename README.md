@@ -10,6 +10,7 @@ A research deliverable covering Microsoft Active Directory — its services, pro
 |------|----------|
 | [`docs/`](./docs/) | 72-file implementation-level knowledge base (AD overview, protocols, schema, GPO, PKI, federation, file/print, macOS/Linux equivalents, comparison matrices, code examples, references) |
 | [`catalog/`](./catalog/) | 16-file problem catalog (130 problems across 12 framework capabilities, 262 open research questions, cross-platform parity matrix) |
+| [`adr/`](./adr/) | 69 Architecture Decision Records covering high-confidence decisions for 69 of the 130 catalog problems (61 deferred pending Tier-1 ORQ resolution) |
 | [`draft/`](./draft/) | Rough draft synthesis document (executive summary, KB findings, problem catalog synthesis, prioritized research questions, roadmap) |
 | [`scripts/`](./scripts/) | Working scripts and extraction artifacts |
 
