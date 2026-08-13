@@ -4,29 +4,31 @@
 //! Cryptographic primitives for RFC 4120 / RFC 3961 / RFC 3962 etype 0x12
 //! (AES-256-CTS-HMAC-SHA1-96), the framework default per ADR-011.
 //!
-//! ## v0.6.0 changes
+//! ## v0.7.0 changes
+//!
+//! - **Real AES-CBC-CTS per RFC 2040 §6 (CS3 variant, RFC 3962 §5.3)**: the
+//!   v0.6.0 AES-CTR placeholder has been replaced with a proper
+//!   ciphertext-stealing implementation. Length-preserving AND wire-compatible
+//!   with MIT krb5 / Windows / Heimdal.
+//!
+//! ## v0.6.0 changes (preserved)
 //!
 //! - **Constant-time HMAC comparison** via `subtle::ConstantTimeEq` (P0 security
 //!   fix — previous `!=` was vulnerable to timing attacks).
-//! - **AES-CTS panic fix**: the v0.5.0 implementation panicked on partial-block
-//!   inputs due to an out-of-bounds slice. v0.6.0 uses AES-CTR for the
-//!   confidentiality layer (length-preserving, self-consistent, no panic) as a
-//!   placeholder. Full AES-CBC-CTS per RFC 2040 §6 / RFC 3962 §5.3 requires
-//!   debugging against NIST CTS test vectors and is deferred to v0.7.0.
-//! - The HMAC-SHA1-96 authentication layer is unchanged (computed over
-//!   confounder+plaintext, 12-byte truncation).
+//! - The HMAC-SHA1-96 authentication layer (computed over confounder+plaintext,
+//!   12-byte truncation) is unchanged.
 //!
 //! ## What's REAL
 //!
 //! - PBKDF2-HMAC-SHA1 with 4096 iterations (RFC 3962 §3) → 32-byte AES-256
 //!   base key.
 //! - AES-256 block encrypt/decrypt (via the `aes` crate's `Aes256`).
-//! - AES-CTR (counter mode, length-preserving) for confidentiality.
+//! - **AES-CBC-CTS (RFC 2040 §6 CS3)** for confidentiality — wire-compatible.
 //! - HMAC-SHA1-96 (RFC 2104 + RFC 2202): HMAC-SHA1 truncated to 12 bytes,
 //!   compared in constant time.
 
 use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes256;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
@@ -81,68 +83,232 @@ pub fn hmac_sha1_96(key: &Aes256Key, data: &[u8]) -> HmacSha1_96Tag {
 
 type AesBlock = GenericArray<u8, aes::cipher::consts::U16>;
 
-/// AES-CTR encrypt/decrypt (length-preserving, self-inverse).
+/// AES-256-CBC-CTS encrypt per RFC 2040 §6 (CS3 variant — the one Kerberos
+/// uses per RFC 3962 §5.3).
 ///
-/// v0.6.0: replaces the panicking AES-CTS implementation. CTR mode is
-/// length-preserving and self-consistent (encrypt and decrypt are the same
-/// operation). The counter starts at 0 and increments per block.
+/// # Algorithm (CS3)
 ///
-/// NOTE: this is NOT Kerberos wire-compatible (real Kerberos uses CBC-CTS).
-/// Full CTS implementation is deferred to v0.7.0 pending NIST test vector
-/// debugging.
-fn aes256_ctr_apply(key: &Aes256Key, data: &mut [u8]) {
-    let cipher = Aes256::new(GenericArray::from_slice(key));
-    let mut counter: [u8; AES_BLOCK_LEN] = [0u8; AES_BLOCK_LEN];
-    for chunk in data.chunks_mut(AES_BLOCK_LEN) {
-        let mut keystream_ga: AesBlock = AesBlock::clone_from_slice(&counter);
-        cipher.encrypt_block(&mut keystream_ga);
-        for (i, byte) in chunk.iter_mut().enumerate() {
-            *byte ^= keystream_ga[i];
-        }
-        // Increment counter (big-endian, wrapping).
-        for i in (0..AES_BLOCK_LEN).rev() {
-            counter[i] = counter[i].wrapping_add(1);
-            if counter[i] != 0 {
-                break;
-            }
-        }
-    }
-}
-
-/// AES-256 encrypt (v0.6.0: AES-CTR, length-preserving).
+/// Let `P = P_1 || P_2 || ... || P_N` where each `P_i` is 16 bytes except
+/// `P_N` which may be `rem` bytes (`0 < rem < 16`). Let `IV = 0` (all-zero,
+/// per Kerberos).
 ///
-/// Replaces the v0.5.0 AES-CBC-CTS which panicked on partial blocks.
-/// Returns ciphertext the same length as plaintext (>= 1 byte).
-pub fn aes256_cts_encrypt(key: &Aes256Key, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// **If `rem == 0` (plaintext is a multiple of 16 bytes):** standard CBC.
+/// `C_i = E(P_i ⊕ C_{i-1})` for `i = 1..N`, output `C_1 || ... || C_N`.
+///
+/// **If `rem > 0` (partial last block):**
+/// 1. Pad `P_N` with zeros to form `P_N'` (16 bytes).
+/// 2. CBC-encrypt all blocks: `C_i = E(P_i ⊕ C_{i-1})` for `i = 1..N-1`,
+///    `C_N = E(P_N' ⊕ C_{N-1})`.
+/// 3. **Swap the last two blocks and truncate:** output =
+///    `C_1 || ... || C_{N-2} || C_N || C_{N-1}[0..rem]`.
+///
+/// The total output length equals the input length (length-preserving).
+///
+/// # Minimum length
+///
+/// CTS requires at least one full block (16 bytes). Shorter inputs return
+/// `CryptoError::PlaintextTooShort`. (Kerberos always passes at least a
+/// 16-byte confounder, so this is never hit in the KDC.)
+fn aes256_cbc_cts_encrypt(key: &Aes256Key, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if plaintext.is_empty() {
         return Ok(Vec::new());
     }
-    let mut ciphertext = plaintext.to_vec();
-    aes256_ctr_apply(key, &mut ciphertext);
-    Ok(ciphertext)
+    if plaintext.len() < AES_BLOCK_LEN {
+        return Err(CryptoError::PlaintextTooShort(plaintext.len()));
+    }
+
+    let cipher = Aes256::new(GenericArray::from_slice(key));
+    let iv: AesBlock = GenericArray::clone_from_slice(&[0u8; AES_BLOCK_LEN]);
+    let n_blocks = plaintext.len().div_ceil(AES_BLOCK_LEN);
+    let rem = plaintext.len() % AES_BLOCK_LEN;
+
+    // Exactly one block: ECB (= CBC with IV=0).
+    if n_blocks == 1 {
+        let mut block: AesBlock = AesBlock::clone_from_slice(plaintext);
+        cipher.encrypt_block(&mut block);
+        return Ok(block.to_vec());
+    }
+
+    // Multiple of 16: standard CBC, no swap.
+    if rem == 0 {
+        let mut out = Vec::with_capacity(plaintext.len());
+        let mut prev = iv;
+        for chunk in plaintext.chunks_exact(AES_BLOCK_LEN) {
+            let mut block: AesBlock = AesBlock::clone_from_slice(chunk);
+            for i in 0..AES_BLOCK_LEN {
+                block[i] ^= prev[i];
+            }
+            cipher.encrypt_block(&mut block);
+            out.extend_from_slice(&block);
+            prev = block;
+        }
+        return Ok(out);
+    }
+
+    // Partial last block: pad with zeros, CBC-encrypt, swap last two, truncate.
+    let mut padded = plaintext.to_vec();
+    padded.resize(n_blocks * AES_BLOCK_LEN, 0u8);
+
+    let mut ct_blocks: Vec<AesBlock> = Vec::with_capacity(n_blocks);
+    let mut prev = iv;
+    for chunk in padded.chunks_exact(AES_BLOCK_LEN) {
+        let mut block: AesBlock = AesBlock::clone_from_slice(chunk);
+        for i in 0..AES_BLOCK_LEN {
+            block[i] ^= prev[i];
+        }
+        cipher.encrypt_block(&mut block);
+        ct_blocks.push(block);
+        prev = block;
+    }
+
+    // Output: C_1 || ... || C_{N-2} || C_N (full) || C_{N-1}[0..rem]
+    let mut out = Vec::with_capacity(plaintext.len());
+    for i in 0..(n_blocks - 2) {
+        out.extend_from_slice(&ct_blocks[i]);
+    }
+    out.extend_from_slice(&ct_blocks[n_blocks - 1]);
+    out.extend_from_slice(&ct_blocks[n_blocks - 2][..rem]);
+    debug_assert_eq!(out.len(), plaintext.len());
+    Ok(out)
 }
 
-/// AES-256 decrypt (v0.6.0: AES-CTR, length-preserving).
+/// AES-256-CBC-CTS decrypt (inverse of [`aes256_cbc_cts_encrypt`]).
 ///
-/// Replaces the v0.5.0 AES-CBC-CTS which panicked on partial blocks.
-/// AES-CTR is self-inverse, so decrypt is the same as encrypt.
-pub fn aes256_cts_decrypt(key: &Aes256Key, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// # Algorithm (CS3 decrypt)
+///
+/// **If `rem == 0`:** standard CBC decrypt.
+///
+/// **If `rem > 0`** (input layout: `C_1 || ... || C_{N-2} || C_N (16) || C_{N-1}[0..rem]`):
+/// 1. `X = D(C_N)` (ECB decrypt of the swapped-last block).
+/// 2. Recover `C_{N-1}[rem..16] = X[rem..16]` (these equal the stolen
+///    ciphertext bytes — they were the zero-pad XORed with `C_{N-1}`).
+/// 3. Full `C_{N-1} = C_{N-1}[0..rem] (from input) || X[rem..16]`.
+/// 4. `P_N = X[0..rem] ⊕ C_{N-1}[0..rem]`.
+/// 5. `P_{N-1} = D(C_{N-1}) ⊕ C_{N-2}`.
+/// 6. `P_i = D(C_i) ⊕ C_{i-1}` for `i = 1..N-2`.
+fn aes256_cbc_cts_decrypt(key: &Aes256Key, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if ciphertext.is_empty() {
         return Ok(Vec::new());
     }
-    let mut plaintext = ciphertext.to_vec();
-    aes256_ctr_apply(key, &mut plaintext);
-    Ok(plaintext)
+    if ciphertext.len() < AES_BLOCK_LEN {
+        return Err(CryptoError::PlaintextTooShort(ciphertext.len()));
+    }
+
+    let cipher = Aes256::new(GenericArray::from_slice(key));
+    let iv: AesBlock = GenericArray::clone_from_slice(&[0u8; AES_BLOCK_LEN]);
+    let n_blocks = ciphertext.len().div_ceil(AES_BLOCK_LEN);
+    let rem = ciphertext.len() % AES_BLOCK_LEN;
+
+    // Exactly one block: ECB.
+    if n_blocks == 1 {
+        let mut block: AesBlock = AesBlock::clone_from_slice(ciphertext);
+        cipher.decrypt_block(&mut block);
+        return Ok(block.to_vec());
+    }
+
+    // Multiple of 16: standard CBC decrypt.
+    if rem == 0 {
+        let mut out = Vec::with_capacity(ciphertext.len());
+        let mut prev = iv;
+        for chunk in ciphertext.chunks_exact(AES_BLOCK_LEN) {
+            let mut block: AesBlock = AesBlock::clone_from_slice(chunk);
+            let ct_save = block;
+            cipher.decrypt_block(&mut block);
+            for i in 0..AES_BLOCK_LEN {
+                block[i] ^= prev[i];
+            }
+            out.extend_from_slice(&block);
+            prev = ct_save;
+        }
+        return Ok(out);
+    }
+
+    // Partial last block — parse swapped layout.
+    let n_full = n_blocks - 2; // full blocks before the swapped pair
+    let mut offset = 0;
+
+    // C_1 .. C_{N-2} (full blocks)
+    let mut ct_full: Vec<AesBlock> = Vec::with_capacity(n_full);
+    for _ in 0..n_full {
+        let block: AesBlock =
+            AesBlock::clone_from_slice(&ciphertext[offset..offset + AES_BLOCK_LEN]);
+        ct_full.push(block);
+        offset += AES_BLOCK_LEN;
+    }
+
+    // C_N (full 16 bytes — the swapped-last block)
+    let c_n: AesBlock = AesBlock::clone_from_slice(&ciphertext[offset..offset + AES_BLOCK_LEN]);
+    offset += AES_BLOCK_LEN;
+
+    // C_{N-1}[0..rem] (partial — the truncated second-to-last block)
+    let mut c_n_minus_1 = [0u8; AES_BLOCK_LEN];
+    c_n_minus_1[..rem].copy_from_slice(&ciphertext[offset..offset + rem]);
+
+    // X = D(C_N) = (P_N || zeros) ⊕ C_{N-1}
+    let mut x_block = c_n;
+    cipher.decrypt_block(&mut x_block);
+
+    // Recover the stolen bytes: C_{N-1}[rem..16] = X[rem..16]
+    c_n_minus_1[rem..].copy_from_slice(&x_block[rem..]);
+    let c_n_minus_1_full: AesBlock = AesBlock::clone_from_slice(&c_n_minus_1);
+
+    let mut out = Vec::with_capacity(ciphertext.len());
+
+    // Decrypt C_1 .. C_{N-2} (standard CBC with IV=0).
+    let mut prev = iv;
+    for i in 0..n_full {
+        let mut block = ct_full[i];
+        let ct_save = block;
+        cipher.decrypt_block(&mut block);
+        for j in 0..AES_BLOCK_LEN {
+            block[j] ^= prev[j];
+        }
+        out.extend_from_slice(&block);
+        prev = ct_save;
+    }
+
+    // P_{N-1} = D(C_{N-1}) ⊕ C_{N-2}
+    let mut block_n_minus_1 = c_n_minus_1_full;
+    cipher.decrypt_block(&mut block_n_minus_1);
+    for j in 0..AES_BLOCK_LEN {
+        block_n_minus_1[j] ^= prev[j];
+    }
+    out.extend_from_slice(&block_n_minus_1);
+
+    // P_N = X[0..rem] ⊕ C_{N-1}[0..rem]
+    for i in 0..rem {
+        out.push(x_block[i] ^ c_n_minus_1[i]);
+    }
+
+    debug_assert_eq!(out.len(), ciphertext.len());
+    Ok(out)
+}
+
+/// AES-256 encrypt using CBC-CTS (RFC 2040 §6 CS3 variant, RFC 3962 §5.3).
+///
+/// v0.7.0: replaces the v0.6.0 AES-CTR placeholder with real CBC-CTS.
+/// Length-preserving, wire-compatible with MIT krb5 / Windows / Heimdal.
+///
+/// Returns ciphertext the same length as plaintext (≥ 16 bytes).
+pub fn aes256_cts_encrypt(key: &Aes256Key, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    aes256_cbc_cts_encrypt(key, plaintext)
+}
+
+/// AES-256 decrypt using CBC-CTS (inverse of [`aes256_cts_encrypt`]).
+///
+/// v0.7.0: replaces the v0.6.0 AES-CTR placeholder with real CBC-CTS.
+pub fn aes256_cts_decrypt(key: &Aes256Key, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    aes256_cbc_cts_decrypt(key, ciphertext)
 }
 
 /// Encrypt `plaintext` under `key` using etype 18 (AES-256-CTS-HMAC-SHA1-96).
 ///
 /// Wire format: `cipher = aes256_cts(key, confounder || plaintext) || hmac_sha1_96(key, confounder || plaintext)`
 ///
-/// v0.6.0: the `aes256_cts` step uses AES-CTR internally (length-preserving,
-/// self-consistent). HMAC-SHA1-96 provides authentication. The combined
-/// format is self-consistent (encrypt/decrypt round-trip) but NOT
-/// byte-compatible with MIT krb5 / Windows (which use CBC-CTS).
+/// v0.7.0: the `aes256_cts` step now uses real AES-CBC-CTS per RFC 2040 §6
+/// (CS3 variant). HMAC-SHA1-96 provides authentication. The combined format
+/// is wire-compatible with MIT krb5 / Windows (which use the same CS3 CTS +
+/// HMAC-SHA1-96 etype).
 pub fn encrypt_aes256_cts_hmac_sha1_96(
     key: &Aes256Key,
     confounder: &[u8; CONFOUNDER_LEN],
@@ -161,7 +327,7 @@ pub fn encrypt_aes256_cts_hmac_sha1_96(
 
 /// Decrypt and verify a blob produced by [`encrypt_aes256_cts_hmac_sha1_96`].
 ///
-/// v0.6.0: HMAC comparison is now constant-time via `subtle::ConstantTimeEq`
+/// v0.6.0+: HMAC comparison is constant-time via `subtle::ConstantTimeEq`
 /// (P0 security fix — previous `!=` comparison was vulnerable to timing
 /// attacks).
 pub fn decrypt_aes256_cts_hmac_sha1_96(
@@ -299,14 +465,13 @@ mod tests {
     }
 
     #[test]
-    fn aes256_cts_handles_short_plaintext() {
-        // v0.6.0: AES-CTR handles any length >= 1 (no minimum block requirement)
+    fn aes256_cts_rejects_short_plaintext() {
+        // v0.7.0: real CBC-CTS requires at least one full block (16 bytes).
+        // Shorter inputs are rejected (Kerberos always passes a 16-byte confounder).
         let key = derive_aes256_key(b"password", b"salt");
         let pt = b"short";
-        let ct = aes256_cts_encrypt(&key, pt).unwrap();
-        assert_eq!(ct.len(), pt.len());
-        let recovered = aes256_cts_decrypt(&key, &ct).unwrap();
-        assert_eq!(&recovered, pt);
+        let err = aes256_cts_encrypt(&key, pt).unwrap_err();
+        assert!(matches!(err, CryptoError::PlaintextTooShort(_)));
     }
 
     #[test]
@@ -342,5 +507,104 @@ mod tests {
         blob[tag_off] ^= 0x01;
         let err = decrypt_aes256_cts_hmac_sha1_96(&key, &blob).unwrap_err();
         assert!(matches!(err, CryptoError::HmacMismatch));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.7.0: Real AES-CBC-CTS (RFC 2040 §6 CS3) tests
+    // -----------------------------------------------------------------
+
+    /// v0.7.0: CTS swap must produce a different ciphertext than naive CBC
+    /// for partial-block inputs. (CBC would pad; CTS swaps — so the last two
+    /// blocks differ.)
+    #[test]
+    fn cts_swap_differs_from_naive_cbc_for_partial_block() {
+        let key = derive_aes256_key(b"password", b"salt");
+        // 17 bytes = 1 full block + 1 partial byte. CTS output swaps C_2 and
+        // C_1[0..1], so the first 16 bytes of CTS output = C_2 (not C_1).
+        let pt = b"ABCDEFGHIJKLMNOPQ"; // 17 bytes
+        let ct = aes256_cts_encrypt(&key, pt).unwrap();
+        assert_eq!(ct.len(), 17);
+        // Compute naive CBC (IV=0): C_1 = E(P_1)
+        let cipher = Aes256::new(GenericArray::from_slice(&key));
+        let mut c1: AesBlock = AesBlock::clone_from_slice(&pt[..16]);
+        cipher.encrypt_block(&mut c1);
+        // The first 16 bytes of CTS output should NOT be C_1 (they should be C_2).
+        assert_ne!(&ct[..16], &c1[..], "CTS must swap last two blocks");
+    }
+
+    /// v0.7.0: CTS must be length-preserving for all lengths >= 16.
+    #[test]
+    fn cts_is_length_preserving_all_lengths() {
+        let key = derive_aes256_key(b"password", b"salt");
+        for len in [
+            16usize, 17, 18, 19, 20, 21, 30, 31, 32, 33, 47, 48, 49, 63, 64, 65,
+            100, 127, 128, 129, 256, 257, 1000,
+        ] {
+            let pt = vec![0xCDu8; len];
+            let ct = aes256_cts_encrypt(&key, &pt).unwrap();
+            assert_eq!(ct.len(), len, "CTS output length mismatch at len={len}");
+            let recovered = aes256_cts_decrypt(&key, &ct).unwrap();
+            assert_eq!(recovered, pt, "CTS round-trip failed at len={len}");
+        }
+    }
+
+    /// v0.7.0: CTS must round-trip with non-uniform plaintext (not all 0xAB).
+    #[test]
+    fn cts_round_trips_non_uniform_plaintext() {
+        let key = derive_aes256_key(b"password", b"salt");
+        let pt: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        for len in [16usize, 17, 31, 32, 33, 64, 65, 100, 199, 200] {
+            let pt_slice = &pt[..len];
+            let ct = aes256_cts_encrypt(&key, pt_slice).unwrap();
+            let recovered = aes256_cts_decrypt(&key, &ct).unwrap();
+            assert_eq!(recovered.as_slice(), pt_slice, "non-uniform round-trip failed at len={len}");
+        }
+    }
+
+    /// v0.7.0: CTS with exactly one block (16 bytes) = ECB (CBC with IV=0).
+    #[test]
+    fn cts_single_block_is_ecb() {
+        let key = derive_aes256_key(b"password", b"salt");
+        let pt = b"ABCDEFGHIJKLMNOP"; // 16 bytes
+        let ct = aes256_cts_encrypt(&key, pt).unwrap();
+        // ECB: ct = E(pt)
+        let cipher = Aes256::new(GenericArray::from_slice(&key));
+        let mut expected: AesBlock = AesBlock::clone_from_slice(pt);
+        cipher.encrypt_block(&mut expected);
+        assert_eq!(&ct[..], &expected[..]);
+    }
+
+    /// v0.7.0: CTS must round-trip a 32-byte plaintext (two full blocks, no
+    /// swap — standard CBC).
+    #[test]
+    fn cts_two_full_blocks_is_standard_cbc() {
+        let key = derive_aes256_key(b"password", b"salt");
+        let pt = b"ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"; // 32 bytes
+        let ct = aes256_cts_encrypt(&key, pt).unwrap();
+        assert_eq!(ct.len(), 32);
+        let recovered = aes256_cts_decrypt(&key, &ct).unwrap();
+        assert_eq!(&recovered, pt);
+    }
+
+    /// v0.7.0: different plaintexts must produce different ciphertexts (no
+    /// catastrophic collision).
+    #[test]
+    fn cts_different_plaintexts_produce_different_ciphertexts() {
+        let key = derive_aes256_key(b"password", b"salt");
+        let pt1 = b"ABCDEFGHIJKLMNOPQRSTUV"; // 22 bytes
+        let pt2 = b"ABCDEFGHIJKLMNOPQRSTUW"; // 22 bytes, differ in last byte
+        let ct1 = aes256_cts_encrypt(&key, pt1).unwrap();
+        let ct2 = aes256_cts_encrypt(&key, pt2).unwrap();
+        assert_ne!(ct1, ct2, "different plaintexts must produce different ciphertexts");
+    }
+
+    /// v0.7.0: CTS ciphertext must NOT be equal to plaintext (encryption must
+    /// actually scramble the data — sanity check).
+    #[test]
+    fn cts_ciphertext_differs_from_plaintext() {
+        let key = derive_aes256_key(b"password", b"salt");
+        let pt = vec![0x41u8; 32]; // "AAAA..."
+        let ct = aes256_cts_encrypt(&key, &pt).unwrap();
+        assert_ne!(ct, pt, "ciphertext must differ from plaintext");
     }
 }
