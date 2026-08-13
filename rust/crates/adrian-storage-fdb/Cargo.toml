@@ -8,6 +8,15 @@ description = "FoundationDB implementation of DirectoryStore for the Adrian fram
 
 [dependencies]
 adrian-storage-core = { workspace = true }
+# `adrian-storage-testkit` is a non-optional dependency because the fallback
+# code path (used when the `fdb` feature is disabled) wraps
+# `InMemoryDirectoryStore` to provide an in-process snapshot-isolated KV
+# store that exercises the real tuple-layer key-encoding logic without
+# requiring libclang at build time or a running FDB cluster at runtime.
+# (Layering note: this introduces a Layer 1 → Layer 2 dependency, but the
+# testkit is a workspace-internal crate and the dependency is on a thin
+# snapshot-isolated `BTreeMap` — no domain semantics leak across the seam.)
+adrian-storage-testkit = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -17,8 +26,8 @@ bytes.workspace = true
 tracing.workspace = true
 # `foundationdb` is declared as optional so that `cargo check` passes on
 # systems without libclang (foundationdb-sys requires it for bindgen). The
-# `fdb` feature flag enables the real backend; the stub `FdbDirectoryStore`
-# type below does not use the FDB client API. See ADR-073.
+# `fdb` feature flag enables the real backend; the in-memory fallback path
+# below does not use the FDB client API. See ADR-073.
 foundationdb = { workspace = true, optional = true }
 
 [features]
