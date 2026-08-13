@@ -52,7 +52,7 @@
 #![warn(missing_docs)]
 
 use adrian_storage_core::{
-    Attribute, DirectoryStore, DistinguishedName, Object, ReadTxn, StorageError, WriteTxn,
+    DirectoryStore, DistinguishedName, Object, ReadTxn, StorageError, WriteTxn,
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -280,6 +280,9 @@ mod tests {
     fn encode_link_forward_key_different_links() {
         let k1 = encode_link_forward_key(10, 5, 20);
         let k2 = encode_link_forward_key(10, 5, 21);
-        assert_ne!(k1, k2, "different backlink DNTs should produce different keys");
+        assert_ne!(
+            k1, k2,
+            "different backlink DNTs should produce different keys"
+        );
     }
 }

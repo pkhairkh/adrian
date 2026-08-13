@@ -211,7 +211,10 @@ mod tests {
     fn uuid_to_uid_different_uuids_different_uids() {
         let uid1 = uuid_to_uid(Uuid::from_u128(1));
         let uid2 = uuid_to_uid(Uuid::from_u128(2));
-        assert_ne!(uid1, uid2, "different UUIDs should produce different UIDs (with high probability)");
+        assert_ne!(
+            uid1, uid2,
+            "different UUIDs should produce different UIDs (with high probability)"
+        );
     }
 
     #[test]

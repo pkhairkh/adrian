@@ -367,7 +367,10 @@ mod tests {
     fn conflict_resolution_higher_version_wins() {
         let local = pmd(1, 100, 50, Uuid::nil());
         let incoming = pmd(2, 100, 50, Uuid::nil());
-        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+        assert_eq!(
+            resolve_conflict(&local, &incoming),
+            Resolution::IncomingWins
+        );
         assert_eq!(resolve_conflict(&incoming, &local), Resolution::LocalWins);
     }
 
@@ -375,21 +378,30 @@ mod tests {
     fn conflict_resolution_tiebreak_timestamp() {
         let local = pmd(1, 100, 50, Uuid::nil());
         let incoming = pmd(1, 200, 50, Uuid::nil());
-        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+        assert_eq!(
+            resolve_conflict(&local, &incoming),
+            Resolution::IncomingWins
+        );
     }
 
     #[test]
     fn conflict_resolution_tiebreak_usn() {
         let local = pmd(1, 100, 50, Uuid::nil());
         let incoming = pmd(1, 100, 60, Uuid::nil());
-        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+        assert_eq!(
+            resolve_conflict(&local, &incoming),
+            Resolution::IncomingWins
+        );
     }
 
     #[test]
     fn conflict_resolution_tiebreak_invocation_id() {
         let local = pmd(1, 100, 50, Uuid::nil());
         let incoming = pmd(1, 100, 50, Uuid::from_u128(1));
-        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+        assert_eq!(
+            resolve_conflict(&local, &incoming),
+            Resolution::IncomingWins
+        );
     }
 
     #[test]
