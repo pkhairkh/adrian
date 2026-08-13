@@ -86,7 +86,7 @@ pub use handler::{
     handle_add, handle_bind, handle_delete, handle_modify, handle_search, root_dse,
     DEFAULT_NAMING_CONTEXT,
 };
-pub use server::{serve_connection, LdapServer, DEFAULT_BIND_ADDR};
+pub use server::{serve_connection, serve_with_timeout, LdapServer, DEFAULT_BIND_ADDR};
 pub use types::{
     AddRequest, AddResponse, AuthenticationChoice, BindRequest, BindResponse, Change, Control,
     DelRequest, DelResponse, LdapMessage, LdapResult, MessageId, ModificationOp, ModifyRequest,
@@ -429,7 +429,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "TCP listener test — requires timeout handling fix (v0.8.0)"]
     async fn dsa_run_serves_real_connection() {
         // Spin up Dsa::run on an ephemeral port, connect as a client,
         // send a BindRequest, and verify the response. This verifies the
@@ -466,7 +465,11 @@ mod tests {
         client.write_all(&bytes).await.unwrap();
         client.flush().await.unwrap();
         let mut buf = vec![0u8; 4096];
-        let n = client.read(&mut buf).await.unwrap();
+        // Defensive timeout — Wave-1 DoD: no test hangs > 10s.
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("no response from server within 5s")
+            .unwrap();
         let resp = LdapMessage::decode(&buf[..n]).unwrap();
         assert_eq!(resp.message_id, 1);
         match resp.protocol_op {
@@ -475,6 +478,12 @@ mod tests {
             }
             other => panic!("expected BindResponse, got {:?}", other),
         }
-        serve_task.await.unwrap();
+        // Drop the client to trigger server-side EOF — without this the
+        // serve_task would block forever waiting for the next request.
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+            .await
+            .expect("serve task did not finish within 5s of client close")
+            .unwrap();
     }
 }
