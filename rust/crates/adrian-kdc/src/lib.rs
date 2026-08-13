@@ -24,6 +24,15 @@
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Convert an `HsmError` (from `adrian-hsm`) into a `KdcError::Storage`
+/// (the closest semantic match — HSM failures are backend failures from
+/// the KDC's perspective).
+impl From<adrian_hsm::HsmError> for KdcError {
+    fn from(e: adrian_hsm::HsmError) -> Self {
+        KdcError::Storage(format!("HSM: {e}"))
+    }
+}
+
 /// Kerberos encryption type (RFC 3961).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -121,6 +130,37 @@ impl Default for PacBuilder {
         Self::new()
     }
 }
+
+// MS-KILE PAC builder + signer (ADR-082). The full nine-buffer PAC
+// implementation is deferred — the `PacBuilder` struct above remains a
+// loud stub returning `KdcError::Pac("not yet implemented")` until the
+// dedicated Wave 3b PAC crate is wired in.
+
+/// Cryptographic primitives (AES-256-CTS-HMAC-SHA1-96, HMAC, key derivation)
+/// used by the KDC and PAC signer. Real, tested implementation by Wave 3c.
+pub mod crypto;
+
+/// HSM-bound krbtgt key manager with 30-day auto-rotation per ADR-015.
+/// Holds the current and previous krbtgt key handles; the previous is
+/// retained for the overlap window to accept TGTs issued under the old
+/// key during rotation.
+pub mod krbtgt;
+
+/// gMSA password derivation per ADR-020. Computes the per-cycle gMSA
+/// password from the KDS root key (HSM-bound) and the gMSA's DN per
+/// MS-ADTS §2.2.20.
+pub mod gmsa;
+
+/// kpasswd (RFC 3244) password-change protocol per ADR-019. Handles the
+/// APP-REQ-based password change request: verifies the TGT authenticity,
+/// looks up the principal, and writes the new (bcrypt-hashed) password
+/// to the directory store.
+pub mod kpasswd;
+
+/// Directory store access helpers for the KDC. Wraps the
+/// `adrian-storage-core` `DirectoryStore` trait with KDC-specific
+/// lookups (principal-by-name, keytab lookup, etc.).
+pub mod store;
 
 #[cfg(test)]
 mod tests {

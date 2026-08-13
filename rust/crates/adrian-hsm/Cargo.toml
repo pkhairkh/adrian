@@ -4,14 +4,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Uniform Signer trait over PKCS#11/CNG (Layer 3, enterprise-hsm)"
+description = "Uniform HSM/Signer trait over PKCS#11/CNG (Layer 3, enterprise-hsm)"
+
+[features]
+default = []
+# `hsm` enables the real PKCS#11 (cryptoki) backend. Without it, the
+# `SoftwareHsm` (in-memory, real-crypto) backend is the only implementation
+# — suitable for development, test, and small deployments per ADR-015 §Rationale
+# ("software-based HSM ... for development and testing").
+hsm = ["dep:cryptoki"]
 
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
-cryptoki.workspace = true
 ring.workspace = true
+sha1.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+# PKCS#11 binding (real HSM); gated by `hsm` feature so default builds do
+# not require the cryptoki crate's transitive deps (libpq? no — cryptoki is
+# pure-Rust but adds a C-bindgen surface for the PKCS#11 shared lib at runtime;
+# default builds ship software-only).
+cryptoki = { workspace = true, optional = true }
+# tokio for `tokio::sync::RwLock` (the HSM holds its key map behind an
+# async-aware lock so callers can `.await` while holding the guard if
+# needed — though current impl scopes all lock holds to sync code).
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tokio = { workspace = true, features = ["test-util"] }

@@ -9,7 +9,10 @@ description = "Fresh Rust Kerberos KDC for the Adrian framework"
 [features]
 default = []
 ad-interop = []
-enterprise-hsm = ["adrian-hsm"]
+# `enterprise-hsm` propagates to adrian-hsm's `hsm` feature (enables the real
+# PKCS#11 / `cryptoki` backend). Default builds use the software HSM (real
+# AES-256-GCM + HMAC-SHA1-96, keys in process memory). See adrian-hsm/Cargo.toml.
+enterprise-hsm = ["adrian-hsm/hsm"]
 pkinit-smartcard = []
 pkinit-fido2 = []
 
@@ -21,7 +24,10 @@ adrian-identity-fdb = { path = "../adrian-identity-fdb" }
 adrian-schema-traits = { path = "../adrian-schema-traits" }
 adrian-schema-compiler = { path = "../adrian-schema-compiler" }
 adrian-pac-validator = { path = "../adrian-pac-validator" }
-adrian-hsm = { path = "../adrian-hsm", optional = true }
+# adrian-hsm is now a hard dependency (Wave 3c — krbtgt rotation / kpasswd /
+# gMSA all need the HSM trait). The `enterprise-hsm` feature propagates to
+# adrian-hsm's `hsm` feature for PKCS#11 backend selection.
+adrian-hsm = { path = "../adrian-hsm" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,7 +42,6 @@ sha2.workspace = true
 hmac.workspace = true
 pbkdf2.workspace = true
 md4.workspace = true
-cryptoki.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 uuid.workspace = true
@@ -45,3 +50,6 @@ chrono.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+# adrian-storage-testkit provides InMemoryDirectoryStore for kpasswd /
+# krbtgt integration tests (real DirectoryStore impl, snapshot-isolated).
+adrian-storage-testkit = { path = "../adrian-storage-testkit" }

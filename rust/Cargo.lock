@@ -197,7 +197,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cryptoki",
+ "hmac",
  "ring",
+ "sha1",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
@@ -284,11 +286,11 @@ dependencies = [
  "adrian-schema-traits",
  "adrian-storage-core",
  "adrian-storage-fdb",
+ "adrian-storage-testkit",
  "aes",
  "async-trait",
  "bytes",
  "chrono",
- "cryptoki",
  "hmac",
  "md4",
  "pbkdf2",
@@ -359,14 +361,17 @@ version = "0.1.0"
 dependencies = [
  "adrian-auth-core",
  "adrian-sid",
+ "bitflags 2.13.1",
  "bytes",
  "hmac",
  "keyring",
+ "md-5",
  "md4",
  "rasn",
  "rasn-pkix",
  "sha2",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
@@ -401,6 +406,7 @@ dependencies = [
  "rasn-kerberos",
  "ring",
  "serde",
+ "sha1",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
@@ -2694,6 +2700,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
 
 [[package]]
 name = "md4"
@@ -5102,6 +5118,20 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"
