@@ -5,9 +5,9 @@
 //!
 //! Per ADR-029 §Decision and ADR-113 §Decision, the framework's policy model
 //! uses a canonical JSON representation that compiles to platform-native
-//! formats (PReg `Registry.pol` + GPP XML on Windows, MDM Configuration
-//! Profile payloads on macOS, `authselect` + `limits.conf.d` + `auditd`
-//! + `nftables` on Linux). This crate defines the canonical JSON schema
+//! formats: PReg `Registry.pol` + GPP XML on Windows, MDM Configuration
+//! Profile payloads on macOS, and `authselect`, `limits.conf.d`, `auditd`,
+//! and `nftables` on Linux. This crate defines the canonical JSON schema
 //! and the `PolicyArea` enum; the per-platform compilation lives in
 //! `adrian-policy-executor` (Layer 2).
 //!
@@ -235,3 +235,106 @@ pub fn from_json(json: &str) -> Result<PolicyDoc, PolicyError> {
 
 // TODO: implement PolicyDoc validation per ADR-029.
 // TODO: implement PolicyDoc diff (per ADR-025 — transactional rollback uses a diff to compute the inverse).
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `adrian-policy-core`. Per the task instructions these
+    //! cover type construction, enum variants, error types, configuration
+    //! parsing and the canonical JSON policy document structure — no network
+    //! or external-service integration.
+
+    use super::*;
+    use uuid::Uuid;
+
+    /// Build a small but representative `PolicyDoc` covering multiple
+    /// `PolicyArea` variants. Used by several of the tests below so the
+    /// construction logic is verified once and reused.
+    fn sample_doc() -> PolicyDoc {
+        let registry = RegistryPolicy {
+            values: vec![RegistryValue {
+                key: "Software\\Adrian\\Framework".into(),
+                value_name: "Enabled".into(),
+                value_type: 4, // REG_DWORD per MS-PREG §2.4
+                data: vec![0x01, 0x00, 0x00, 0x00],
+            }],
+        };
+        let audit = AuditPolicy {
+            subcategories: vec!["Logon".into(), "Logoff".into()],
+        };
+        PolicyDoc {
+            // `Uuid::nil()` is used in tests because the workspace `uuid`
+            // crate enables only the `v7` + `serde` features — `new_v4`
+            // would require the `v4` feature. The UUID value itself is
+            // irrelevant to the type-construction / round-trip coverage
+            // these tests provide.
+            uuid: Uuid::nil(),
+            name: "baseline".into(),
+            version: "0.1.0".into(),
+            areas: vec![PolicyArea::Registry(registry), PolicyArea::Audit(audit)],
+            security_descriptor: Some(vec![0x01, 0x00, 0x04, 0x80]),
+            scope: PolicyScope {
+                principals: vec!["S-1-5-32-544".into()],
+                ous: vec!["OU=Servers,DC=adrian,DC=dev".into()],
+                hosts: vec!["*.servers.adrian.dev".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn policy_doc_constructs_with_expected_fields() {
+        let doc = sample_doc();
+        assert_eq!(doc.name, "baseline");
+        assert_eq!(doc.version, "0.1.0");
+        assert_eq!(doc.areas.len(), 2);
+        assert!(doc.security_descriptor.is_some());
+        assert_eq!(doc.scope.principals.len(), 1);
+    }
+
+    #[test]
+    fn policy_area_enum_variants_match_inner_type() {
+        let doc = sample_doc();
+        assert!(matches!(
+            doc.areas[0],
+            PolicyArea::Registry(RegistryPolicy { .. })
+        ));
+        assert!(matches!(
+            doc.areas[1],
+            PolicyArea::Audit(AuditPolicy { .. })
+        ));
+    }
+
+    #[test]
+    fn json_round_trip_preserves_structure() {
+        let doc = sample_doc();
+        let json = to_json(&doc).expect("to_json");
+        let back = from_json(&json).expect("from_json");
+        assert_eq!(back.name, doc.name);
+        assert_eq!(back.version, doc.version);
+        assert_eq!(back.areas.len(), doc.areas.len());
+        assert_eq!(back.scope.principals, doc.scope.principals);
+        assert_eq!(back.scope.hosts, doc.scope.hosts);
+        assert_eq!(back.security_descriptor, doc.security_descriptor);
+    }
+
+    #[test]
+    fn from_json_rejects_malformed_input() {
+        let err = from_json("{not json").unwrap_err();
+        assert!(matches!(err, PolicyError::Malformed(_)));
+    }
+
+    #[test]
+    fn policy_error_variants_render_messages() {
+        // Construct each variant explicitly so the Display impl is exercised
+        // — this catches regressions in the `#[error("…")]` attributes that
+        // would otherwise only surface in production logs.
+        let malformed = PolicyError::Malformed("bad".into());
+        let unsupported = PolicyError::UnsupportedArea("X".into());
+        let empty = PolicyError::EmptyScope;
+        let sd = PolicyError::InvalidSd("no-owners".into());
+
+        assert_eq!(malformed.to_string(), "malformed policy document: bad");
+        assert_eq!(unsupported.to_string(), "unsupported policy area: X");
+        assert_eq!(empty.to_string(), "empty policy scope");
+        assert_eq!(sd.to_string(), "invalid security descriptor: no-owners");
+    }
+}

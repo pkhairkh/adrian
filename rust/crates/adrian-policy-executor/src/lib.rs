@@ -225,3 +225,121 @@ impl PolicyExecutor for LinuxPolicyExecutor {
 // TODO: implement authselect profile fragment writer per ADR-050.
 // TODO: implement nftables ruleset writer per ADR-113.
 // TODO: implement atomic rename(2) writer per ADR-113 §Decision.
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `adrian-policy-executor`. Per the task instructions
+    //! these cover type construction, the `PolicyExecutor` trait surface,
+    //! loud-stub behaviour, and `ApplyResult` / `VerifyResult` field
+    //! propagation — no real network or platform I/O.
+
+    use super::*;
+    use adrian_policy_core::{PolicyArea, PolicyDoc, PolicyScope, RegistryPolicy};
+    use uuid::Uuid;
+
+    /// Helper: build a minimal valid `PolicyDoc` for driving trait stubs.
+    fn sample_doc() -> PolicyDoc {
+        PolicyDoc {
+            // `Uuid::nil()` is used because the workspace `uuid` crate
+            // enables only `v7` + `serde` (no `v4`); the value is
+            // irrelevant to the trait-stub coverage here.
+            uuid: Uuid::nil(),
+            name: "test".into(),
+            version: "0.0.1".into(),
+            areas: vec![PolicyArea::Registry(RegistryPolicy { values: vec![] })],
+            security_descriptor: None,
+            scope: PolicyScope {
+                principals: vec!["S-1-5-32-544".into()],
+                ous: vec![],
+                hosts: vec!["host01".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn apply_result_carries_fields() {
+        let txn = Uuid::nil();
+        let r = ApplyResult {
+            transaction_id: txn,
+            areas_applied: 3,
+            areas_failed: 1,
+            errors: vec!["audit: boom".into()],
+        };
+        assert_eq!(r.transaction_id, txn);
+        assert_eq!(r.areas_applied, 3);
+        assert_eq!(r.areas_failed, 1);
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    #[test]
+    fn verify_result_failed_areas_default_empty() {
+        let r = VerifyResult {
+            verified: true,
+            failed_areas: vec![],
+        };
+        assert!(r.verified);
+        assert!(r.failed_areas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn windows_executor_stubs_return_unsupported_area() {
+        // Loud-stub contract: unimplemented trait methods must surface a
+        // typed `PolicyError::UnsupportedArea` rather than `panic!` or
+        // `todo!`. This guards the per-platform executors until
+        // ADR-024/ADR-092 land.
+        let exec = WindowsPolicyExecutor;
+        let doc = sample_doc();
+
+        let apply_err = exec.apply(&doc, "host01").await.unwrap_err();
+        assert!(matches!(
+            apply_err,
+            PolicyError::UnsupportedArea(ref m) if m.contains("WindowsPolicyExecutor::apply")
+        ));
+
+        let rollback_err = exec.rollback(Uuid::nil()).await.unwrap_err();
+        assert!(matches!(
+            rollback_err,
+            PolicyError::UnsupportedArea(ref m) if m.contains("rollback")
+        ));
+
+        let verify_err = exec.verify(&doc).await.unwrap_err();
+        assert!(matches!(
+            verify_err,
+            PolicyError::UnsupportedArea(ref m) if m.contains("verify")
+        ));
+    }
+
+    #[tokio::test]
+    async fn macos_and_linux_executors_surface_unsupported_area() {
+        let mac = MacOsPolicyExecutor;
+        let linux = LinuxPolicyExecutor;
+        let doc = sample_doc();
+
+        let mac_err = mac.apply(&doc, "host01").await.unwrap_err();
+        assert!(matches!(
+            mac_err,
+            PolicyError::UnsupportedArea(ref m) if m.contains("MacOsPolicyExecutor")
+        ));
+
+        let linux_err = linux.apply(&doc, "host01").await.unwrap_err();
+        assert!(matches!(
+            linux_err,
+            PolicyError::UnsupportedArea(ref m) if m.contains("LinuxPolicyExecutor")
+        ));
+    }
+
+    #[test]
+    fn cloneable_unit_executor_round_trips_debug() {
+        // `#[derive(Clone, Debug)]` on the executor structs must produce
+        // equal-by-construction values — this catches regressions if
+        // someone adds a field without updating `Clone`/`Debug`.
+        // Unit structs should be constructed directly per clippy's
+        // `default_constructed_unit_structs` lint.
+        let a = WindowsPolicyExecutor;
+        let b = a.clone();
+        // `WindowsPolicyExecutor` is a unit struct, so any two instances
+        // are equal-by-construction; we still assert via `Debug` format
+        // to guard the `Debug` derive and catch silent regressions.
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+}

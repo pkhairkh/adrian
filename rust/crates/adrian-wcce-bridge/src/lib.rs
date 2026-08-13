@@ -74,3 +74,92 @@ impl Default for WcceBridge {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `adrian-wcce-bridge`. Per the task instructions
+    //! these cover type construction, enum variants, error types and the
+    //! loud-stub behaviour of `WcceBridge::translate_request` — no real
+    //! DCOM transport or ACME upstream.
+
+    use super::*;
+
+    #[test]
+    fn wcce_request_type_variants_are_copy() {
+        // `WcceRequestType` is `Copy + Debug + Clone` — the bridge copies
+        // the request type into multiple translation paths, so removing
+        // `Copy` would break call sites silently.
+        let r = WcceRequestType::Ping;
+        let _r2 = r; // copy
+        let _r3 = r; // copy again — would fail without `Copy`
+                     // Verify all four MS-WCCE §3.x variants exist.
+        assert!(matches!(WcceRequestType::Ping, WcceRequestType::Ping));
+        assert!(matches!(WcceRequestType::Request, WcceRequestType::Request));
+        assert!(matches!(WcceRequestType::GetCert, WcceRequestType::GetCert));
+        assert!(matches!(
+            WcceRequestType::GetCaCert,
+            WcceRequestType::GetCaCert
+        ));
+    }
+
+    #[test]
+    fn wcce_error_variants_render_messages() {
+        // Each variant maps to a distinct HTTP/DCOM status once the
+        // bridge is wired — verify the `#[error("…")]` templates render
+        // so log lines stay parseable.
+        assert_eq!(
+            WcceError::Dcom("rpc timeout".into()).to_string(),
+            "dcom: rpc timeout"
+        );
+        assert_eq!(
+            WcceError::Acme("upstream 500".into()).to_string(),
+            "acme upstream: upstream 500"
+        );
+        assert_eq!(
+            WcceError::Translation("unknown template".into()).to_string(),
+            "translation: unknown template"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_default_equals_new() {
+        // Both constructors must yield a usable bridge. Catches the
+        // common regression of adding a field to `WcceBridge` and
+        // forgetting to update `Default`. No `Debug`/`PartialEq` on
+        // `WcceBridge` (TODO fields), so we exercise the seam via
+        // `translate_request` — if either constructor dropped an init
+        // step, this would surface a different error variant than
+        // `Translation`.
+        let a = WcceBridge::default();
+        let b = WcceBridge::new();
+        let ea = a
+            .translate_request(WcceRequestType::Request, &[])
+            .await
+            .unwrap_err();
+        let eb = b
+            .translate_request(WcceRequestType::Request, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(ea, WcceError::Translation(_)));
+        assert!(matches!(eb, WcceError::Translation(_)));
+    }
+
+    #[tokio::test]
+    async fn translate_request_stub_returns_translation_error() {
+        // Loud-stub contract: until MS-WCCE → ACME translation lands
+        // (ADR-095 TODO), `translate_request` must surface
+        // `WcceError::Translation` for every request type rather than
+        // panic — this guards the seam for the Wave 4c integration.
+        let bridge = WcceBridge::new();
+        for req in [
+            WcceRequestType::Ping,
+            WcceRequestType::Request,
+            WcceRequestType::GetCert,
+            WcceRequestType::GetCaCert,
+        ] {
+            let err = bridge.translate_request(req, &[]).await.unwrap_err();
+            assert!(matches!(err, WcceError::Translation(_)));
+            assert!(err.to_string().contains("not yet implemented"));
+        }
+    }
+}
