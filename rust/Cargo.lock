@@ -29,6 +29,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
@@ -343,7 +344,9 @@ version = "0.1.0"
 dependencies = [
  "adrian-repl-core",
  "adrian-storage-fdb",
+ "async-trait",
  "axum 0.8.9",
+ "chrono",
  "opentelemetry",
  "opentelemetry-otlp",
  "prometheus",
@@ -383,6 +386,7 @@ dependencies = [
  "adrian-storage-fdb",
  "anyhow",
  "async-trait",
+ "chrono",
  "k8s-openapi",
  "kube",
  "serde",
@@ -426,6 +430,7 @@ dependencies = [
 name = "adrian-policy-core"
 version = "0.1.0"
 dependencies = [
+ "adrian-policy-preg",
  "adrian-schema-traits",
  "async-trait",
  "proptest",
@@ -440,6 +445,7 @@ name = "adrian-policy-executor"
 version = "0.1.0"
 dependencies = [
  "adrian-policy-core",
+ "adrian-policy-preg",
  "adrian-schema-traits",
  "adrian-sid",
  "async-trait",
