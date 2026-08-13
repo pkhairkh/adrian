@@ -21,6 +21,11 @@ ring.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+# `Zeroizing<Vec<u8>>` wrapper for `KeyEntry.material` — secure-zeroes the heap
+# buffer when the entry is dropped (e.g. during `rotate_key` or HSM teardown).
+# Per P0 #7 of EVALUATION.md: key material must not persist in memory after
+# the owning handle is dropped.
+zeroize.workspace = true
 # PKCS#11 binding (real HSM); gated by `hsm` feature so default builds do
 # not require the cryptoki crate's transitive deps (libpq? no — cryptoki is
 # pure-Rust but adds a C-bindgen surface for the PKCS#11 shared lib at runtime;
