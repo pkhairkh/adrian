@@ -676,6 +676,7 @@ name = "adrian-storage-fdb"
 version = "0.1.0"
 dependencies = [
  "adrian-storage-core",
+ "adrian-storage-testkit",
  "async-trait",
  "bytes",
  "foundationdb",
