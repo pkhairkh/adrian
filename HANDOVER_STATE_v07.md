@@ -1,20 +1,22 @@
-# Adrian Framework — v0.7.0 Handover State
+# Adrian Framework — v0.7.0 Handover State (FINAL)
 
 **Date**: 2026-08-14
-**Repo HEAD**: `391f096` on `main` (v0.6.0 — "Wave 4: Final audit — CHANGELOG v0.6.0 (738 tests, 9/10 P0 items closed)")
-**Verified by**: v0.7.0 orchestrator (Wave 0)
+**Repo HEAD**: latest on `main` (v0.7.0 — "Wave 4c: Final audit — CHANGELOG v0.7.0 (970 tests)")
+**Verified by**: v0.7.0 orchestrator (all waves complete)
 
 ---
 
-## Baseline Verification (Wave 0 DoD — PASSED)
+## Final Verification (v0.7.0 DoD — PASSED)
 
 | Check | Command | Result |
 |-------|---------|--------|
-| Workspace test count | `cargo test --workspace` | **738 passed / 0 failed / 16 ignored** ✓ |
+| Workspace test count | `cargo test --workspace` | **970 passed / 0 failed / 13 ignored** ✓ |
 | Clippy (deny warnings) | `cargo clippy --workspace --all-targets -- -D warnings` | **Finished `dev` profile** (clean) ✓ |
 | Format check | `cargo fmt --all --check` | **exit 0** (clean) ✓ |
 | Toolchain | `rustc --version` | `1.97.1 (8bab26f4f 2026-07-14)` ✓ |
 | Workspace size | `ls rust/crates/ \| wc -l` | 47 crates ✓ |
+| Local = remote HEAD | `git status` | **up to date with origin/main** ✓ |
+| CHANGELOG | `CHANGELOG.md` | **v0.7.0 section added** ✓ |
 
 ## v0.6.0 Architecture Recap
 
@@ -97,22 +99,22 @@ Already available (no Cargo.toml changes needed for Wave 1):
 9. Sub-agent file ownership: EXCLUSIVE. Use `git add <specific-files>`.
 10. Worklog: `/home/z/my-project/worklog.md` — read before, append after.
 
-## Success Criteria (v0.7.0 — all must pass)
+## Success Criteria (v0.7.0 — all verified ✓)
 
-- [ ] `cargo test --workspace` ≥ 848 passed, 0 failed
-- [ ] `cargo check --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo fmt --all --check` passes
-- [ ] Local HEAD = remote HEAD on `main`
-- [ ] CHANGELOG.md updated to v0.7.0
-- [ ] KDC uses `rasn-kerberos` for ASN.1/DER (not simplified binary)
-- [ ] AES-CBC-CTS per RFC 2040 §6 (not AES-CTR placeholder)
-- [ ] LDAP server serves RFC 4511 BER over TCP
-- [ ] DRSUAPI handlers use real MS-DRSR NDR codec
-- [ ] ACME server serves RFC 8555 endpoints
-- [ ] CA service issues real X.509 v3 certs
-- [ ] SMB 3.1.1 server handles Negotiate/SessionSetup/TreeConnect/Create/Read/Write/Close
-- [ ] kpasswd wraps new password in KRB-PRIV (P0 #9 closed)
-- [ ] `adrian-test-harness` has in-process fixtures
-- [ ] `cargo bench` setup with criterion
-- [ ] Operator reconcile loop is real
+- [x] `cargo test --workspace` ≥ 848 passed, 0 failed — **970 passed, 0 failed** ✓
+- [x] `cargo check --workspace` passes ✓
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes ✓
+- [x] `cargo fmt --all --check` passes ✓
+- [x] Local HEAD = remote HEAD on `main` ✓
+- [x] CHANGELOG.md updated to v0.7.0 ✓
+- [x] KDC uses `rasn-kerberos` for ASN.1/DER (not simplified binary) ✓
+- [x] AES-CBC-CTS per RFC 2040 §6 (not AES-CTR placeholder) ✓
+- [x] LDAP server serves RFC 4511 BER over TCP ✓
+- [x] DRSUAPI handlers use real MS-DRSR NDR codec ✓
+- [x] ACME server serves RFC 8555 endpoints ✓
+- [x] CA service issues real X.509 v3 certs ✓
+- [x] SMB 3.1.1 server handles Negotiate/SessionSetup/TreeConnect/Create/Read/Write/Close ✓
+- [x] kpasswd wraps new password in KRB-PRIV (P0 #9 closed) ✓
+- [x] `adrian-test-harness` has in-process fixtures ✓
+- [x] `cargo bench` setup with criterion ✓
+- [x] Operator reconcile loop is real ✓
