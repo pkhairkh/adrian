@@ -1,0 +1,43 @@
+# Build artifacts and target dirs — never copy into the build context.
+rust/target/
+target/
+**/target/
+
+# VCS.
+.git/
+.gitignore
+
+# Editor / IDE cruft.
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local docs / planning artifacts not needed for the image.
+draft/
+catalog/
+specs/
+docs/
+workshop/
+adr/
+eval/
+finaldraft/
+scripts/
+
+# CI / release artifacts.
+.github/
+*.md
+LICENSE
+CHANGELOG.md
+CONTRIBUTING.md
+HANDOVER_STATE.md
+HANDOVER_PROMPT.md
+TASKS.md
+EVALUATION.md
+
+# Misc.
+*.log
+*.tmp
+.env
+.env.*
