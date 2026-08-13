@@ -8,12 +8,22 @@ version = "0.1.0"
 dependencies = [
  "adrian-ca",
  "axum 0.8.9",
+ "base64",
+ "bitvec",
+ "bytes",
  "chrono",
+ "http-body-util",
+ "hyper",
+ "rasn",
+ "rasn-pkix",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "uuid",
 ]
@@ -55,6 +65,8 @@ dependencies = [
  "adrian-storage-core",
  "adrian-storage-fdb",
  "async-trait",
+ "bitvec",
+ "bytes",
  "chrono",
  "rasn",
  "rasn-pkix",
@@ -634,13 +646,13 @@ dependencies = [
 name = "adrian-smb-client"
 version = "0.1.0"
 dependencies = [
- "adrian-auth-core",
  "adrian-smb-core",
+ "adrian-smb-server",
  "bytes",
- "rustls",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -648,31 +660,25 @@ name = "adrian-smb-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "rasn",
- "rasn-kerberos",
+ "hmac",
+ "sha2",
  "thiserror 2.0.20",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "adrian-smb-server"
 version = "0.1.0"
 dependencies = [
- "adrian-identity-fdb",
- "adrian-pac-validator",
  "adrian-smb-core",
- "adrian-storage-core",
- "adrian-storage-fdb",
- "aes",
  "async-trait",
  "bytes",
- "hmac",
- "rasn",
- "rasn-kerberos",
- "rustls",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

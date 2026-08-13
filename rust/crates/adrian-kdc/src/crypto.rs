@@ -536,8 +536,8 @@ mod tests {
     fn cts_is_length_preserving_all_lengths() {
         let key = derive_aes256_key(b"password", b"salt");
         for len in [
-            16usize, 17, 18, 19, 20, 21, 30, 31, 32, 33, 47, 48, 49, 63, 64, 65,
-            100, 127, 128, 129, 256, 257, 1000,
+            16usize, 17, 18, 19, 20, 21, 30, 31, 32, 33, 47, 48, 49, 63, 64, 65, 100, 127, 128,
+            129, 256, 257, 1000,
         ] {
             let pt = vec![0xCDu8; len];
             let ct = aes256_cts_encrypt(&key, &pt).unwrap();
@@ -556,7 +556,11 @@ mod tests {
             let pt_slice = &pt[..len];
             let ct = aes256_cts_encrypt(&key, pt_slice).unwrap();
             let recovered = aes256_cts_decrypt(&key, &ct).unwrap();
-            assert_eq!(recovered.as_slice(), pt_slice, "non-uniform round-trip failed at len={len}");
+            assert_eq!(
+                recovered.as_slice(),
+                pt_slice,
+                "non-uniform round-trip failed at len={len}"
+            );
         }
     }
 
@@ -594,7 +598,10 @@ mod tests {
         let pt2 = b"ABCDEFGHIJKLMNOPQRSTUW"; // 22 bytes, differ in last byte
         let ct1 = aes256_cts_encrypt(&key, pt1).unwrap();
         let ct2 = aes256_cts_encrypt(&key, pt2).unwrap();
-        assert_ne!(ct1, ct2, "different plaintexts must produce different ciphertexts");
+        assert_ne!(
+            ct1, ct2,
+            "different plaintexts must produce different ciphertexts"
+        );
     }
 
     /// v0.7.0: CTS ciphertext must NOT be equal to plaintext (encryption must

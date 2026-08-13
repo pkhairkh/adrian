@@ -587,10 +587,7 @@ pub mod sdk {
             krbtgt_key: adrian_kdc::crypto::Aes256Key,
         ) -> Self {
             Self {
-                kdc: Some(KdcBackend {
-                    store,
-                    krbtgt_key,
-                }),
+                kdc: Some(KdcBackend { store, krbtgt_key }),
             }
         }
 
@@ -1211,7 +1208,12 @@ mod api_tests {
         let store = std::sync::Arc::new(adrian_kdc::store::InMemoryPrincipalStore::new());
         let m = sdk::KerberosAuthModule::with_kdc(store, [0u8; 32]);
 
-        for bad in ["alice", "alice@", "@ADRIAN.EXAMPLE", "host/foo.adrian.example@ADRIAN"] {
+        for bad in [
+            "alice",
+            "alice@",
+            "@ADRIAN.EXAMPLE",
+            "host/foo.adrian.example@ADRIAN",
+        ] {
             let err = m
                 .authenticate_kerberos(bad, "pw")
                 .await

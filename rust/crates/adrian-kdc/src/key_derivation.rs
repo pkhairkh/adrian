@@ -434,13 +434,19 @@ mod tests {
     #[test]
     fn rfc3961_nfold_password_to_168() {
         let out = nfold(b"password", 168);
-        assert_eq!(bytes_to_hex(&out), "00003ffffffffff9ffffc00001000007fffffffffb");
+        assert_eq!(
+            bytes_to_hex(&out),
+            "00003ffffffffff9ffffc00001000007fffffffffb"
+        );
     }
 
     #[test]
     fn rfc3961_nfold_massachusetts_to_192() {
         let out = nfold(b"massachusetts", 192);
-        assert_eq!(bytes_to_hex(&out), "00000cfffffffffff9fffffb000003000000000004fffff6");
+        assert_eq!(
+            bytes_to_hex(&out),
+            "00000cfffffffffff9fffffb000003000000000004fffff6"
+        );
     }
 
     #[test]

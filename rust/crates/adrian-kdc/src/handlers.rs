@@ -343,13 +343,10 @@ impl EType {
 
 pub use crate::wire::{
     decode_as_rep, decode_as_req, decode_authenticator, decode_enc_kdc_rep_part,
-    decode_enc_ticket_part, decode_pa_enc_ts_enc, decode_ticket, decode_tgs_rep,
-    decode_tgs_req, encode_as_rep, encode_as_req, encode_authenticator,
-    encode_enc_kdc_rep_part, encode_enc_ticket_part, encode_pa_enc_ts_enc,
-    encode_ticket, encode_tgs_rep, encode_tgs_req,
+    decode_enc_ticket_part, decode_pa_enc_ts_enc, decode_tgs_rep, decode_tgs_req, decode_ticket,
+    encode_as_rep, encode_as_req, encode_authenticator, encode_enc_kdc_rep_part,
+    encode_enc_ticket_part, encode_pa_enc_ts_enc, encode_tgs_rep, encode_tgs_req, encode_ticket,
 };
-
-
 
 // ---------------------------------------------------------------------------
 // Per-usage encryption (RFC 3961 §5.1)
@@ -589,8 +586,7 @@ async fn handle_as_req_with_metrics_inner(
         client_uuid: client.uuid,
     };
     let enc_ticket_part_bytes = encode_enc_ticket_part(&enc_ticket_part);
-    let ticket_enc =
-        encrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &enc_ticket_part_bytes)?;
+    let ticket_enc = encrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &enc_ticket_part_bytes)?;
 
     let tgt = Ticket {
         tkt_vno: PVNO,
@@ -614,8 +610,7 @@ async fn handle_as_req_with_metrics_inner(
         cname: client.components.clone(),
     };
     let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
-    let enc_part =
-        encrypt_for_usage(&client.key, KEY_USAGE_AS_REP_ENC_PART, &enc_rep_part_bytes)?;
+    let enc_part = encrypt_for_usage(&client.key, KEY_USAGE_AS_REP_ENC_PART, &enc_rep_part_bytes)?;
 
     let rep = AsRep {
         pvno: PVNO,
@@ -683,9 +678,8 @@ pub fn find_pa_enc_timestamp(padata: &[PaData]) -> Result<Option<Vec<u8>>, KdcEr
 /// Verify a PA-ENC-TIMESTAMP blob: decrypt with the client's key (key usage
 /// 1), parse `PaEncTsEnc`, check timestamp within ±5 minutes of KDC time.
 pub fn verify_pa_enc_timestamp(client: &PrincipalRecord, blob: &[u8]) -> Result<(), KdcError> {
-    let plaintext =
-        decrypt_for_usage(&client.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, blob)
-            .map_err(|_| KdcError::PreauthFailed("decrypt failed".into()))?;
+    let plaintext = decrypt_for_usage(&client.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, blob)
+        .map_err(|_| KdcError::PreauthFailed("decrypt failed".into()))?;
     let ts = decode_pa_enc_ts_enc(&plaintext)?;
     let now = now_secs();
     let skew = now - ts.patimestamp;
@@ -825,8 +819,11 @@ async fn handle_tgs_req_with_metrics_inner(
         client_uuid: enc_ticket_part.client_uuid,
     };
     let svc_enc_ticket_part_bytes = encode_enc_ticket_part(&svc_enc_ticket_part);
-    let svc_ticket_enc =
-        encrypt_for_usage(&svc.key, KEY_USAGE_TGS_REP_TICKET, &svc_enc_ticket_part_bytes)?;
+    let svc_ticket_enc = encrypt_for_usage(
+        &svc.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &svc_enc_ticket_part_bytes,
+    )?;
 
     let svc_ticket = Ticket {
         tkt_vno: PVNO,
@@ -940,9 +937,8 @@ mod tests {
             pausec: 0,
         };
         let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
-        let blob =
-            encrypt_for_usage(&client.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
-                .expect("encrypt pa-enc-timestamp");
+        let blob = encrypt_for_usage(&client.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+            .expect("encrypt pa-enc-timestamp");
 
         AsReq {
             pvno: PVNO,
@@ -1157,8 +1153,8 @@ mod tests {
         let plaintext = b"some-secret-payload-32-bytes-ok!";
         let blob = encrypt_for_usage(&base, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, plaintext)
             .expect("encrypt");
-        let recovered = decrypt_for_usage(&base, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &blob)
-            .expect("decrypt");
+        let recovered =
+            decrypt_for_usage(&base, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &blob).expect("decrypt");
         assert_eq!(&recovered, plaintext);
     }
 
@@ -1207,11 +1203,8 @@ mod tests {
 
     #[test]
     fn negotiate_etype_prefers_aes256_over_aes128() {
-        let chosen = negotiate_etype(&[
-            EType::Aes128CtsHmacSha1_96,
-            EType::Aes256CtsHmacSha1_96,
-        ])
-        .expect("must pick aes256");
+        let chosen = negotiate_etype(&[EType::Aes128CtsHmacSha1_96, EType::Aes256CtsHmacSha1_96])
+            .expect("must pick aes256");
         assert_eq!(chosen, EType::Aes256CtsHmacSha1_96);
     }
 
@@ -1267,9 +1260,8 @@ mod tests {
 
         // Decrypt the TGT enc-part with the krbtgt key (key usage 2) — must
         // yield a valid EncTicketPart with the client's identity.
-        let tgt_pt =
-            decrypt_for_usage(&krbtgt_key, KEY_USAGE_AS_REP_TGT, &rep.ticket.enc_part)
-                .expect("decrypt TGT");
+        let tgt_pt = decrypt_for_usage(&krbtgt_key, KEY_USAGE_AS_REP_TGT, &rep.ticket.enc_part)
+            .expect("decrypt TGT");
         let etp = decode_enc_ticket_part(&tgt_pt).expect("decode EncTicketPart");
         assert_eq!(etp.crealm, "EXAMPLE.COM");
         assert_eq!(etp.cname, alice.components);
@@ -1279,9 +1271,8 @@ mod tests {
 
         // Decrypt the AS-REP enc-part with the client's key (key usage 3) —
         // must yield a valid EncKdcRepPart echoing the session key.
-        let rep_pt =
-            decrypt_for_usage(&alice.key, KEY_USAGE_AS_REP_ENC_PART, &rep.enc_part)
-                .expect("decrypt AS-REP enc-part");
+        let rep_pt = decrypt_for_usage(&alice.key, KEY_USAGE_AS_REP_ENC_PART, &rep.enc_part)
+            .expect("decrypt AS-REP enc-part");
         let erp = decode_enc_kdc_rep_part(&rep_pt).expect("decode EncKdcRepPart");
         assert_eq!(erp.session_key, etp.session_key);
         assert_eq!(erp.nonce, req.nonce);
@@ -1346,9 +1337,8 @@ mod tests {
             pausec: 0,
         };
         let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
-        let blob =
-            encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
-                .expect("encrypt");
+        let blob = encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+            .expect("encrypt");
 
         let req = AsReq {
             pvno: PVNO,
@@ -1470,9 +1460,8 @@ mod tests {
             client_uuid: client.uuid,
         };
         let etp_bytes = encode_enc_ticket_part(&etp);
-        let ticket_enc =
-            encrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &etp_bytes)
-                .expect("encrypt TGT enc-part");
+        let ticket_enc = encrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &etp_bytes)
+            .expect("encrypt TGT enc-part");
         let tgt = Ticket {
             tkt_vno: PVNO,
             realm: client.realm.clone(),
@@ -1540,9 +1529,8 @@ mod tests {
 
         // The service ticket must be decryptable with the service's key
         // (key usage 2).
-        let svc_pt =
-            decrypt_for_usage(&web.key, KEY_USAGE_TGS_REP_TICKET, &rep.ticket.enc_part)
-                .expect("decrypt service ticket");
+        let svc_pt = decrypt_for_usage(&web.key, KEY_USAGE_TGS_REP_TICKET, &rep.ticket.enc_part)
+            .expect("decrypt service ticket");
         let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode EncTicketPart");
         assert_eq!(svc_etp.cname, alice.components);
         assert_eq!(svc_etp.crealm, alice.realm);
@@ -1550,9 +1538,8 @@ mod tests {
 
         // The TGS-REP enc-part must be decryptable with the TGT session key
         // (key usage 8).
-        let rep_pt =
-            decrypt_for_usage(&session_key, KEY_USAGE_TGS_REP_ENC_PART, &rep.enc_part)
-                .expect("decrypt TGS-REP enc-part");
+        let rep_pt = decrypt_for_usage(&session_key, KEY_USAGE_TGS_REP_ENC_PART, &rep.enc_part)
+            .expect("decrypt TGS-REP enc-part");
         let erp = decode_enc_kdc_rep_part(&rep_pt).expect("decode EncKdcRepPart");
         assert_eq!(erp.session_key, session_key);
         assert_eq!(erp.nonce, 1234);
@@ -1734,9 +1721,8 @@ mod tests {
         let as_rep = decode_as_rep(&as_rep_bytes).expect("decode AS-REP");
 
         // Recover the session key from the AS-REP enc-part.
-        let rep_pt =
-            decrypt_for_usage(&alice.key, KEY_USAGE_AS_REP_ENC_PART, &as_rep.enc_part)
-                .expect("decrypt AS-REP enc-part");
+        let rep_pt = decrypt_for_usage(&alice.key, KEY_USAGE_AS_REP_ENC_PART, &as_rep.enc_part)
+            .expect("decrypt AS-REP enc-part");
         let erp = decode_enc_kdc_rep_part(&rep_pt).expect("decode EncKdcRepPart");
         let session_key = erp.session_key;
 

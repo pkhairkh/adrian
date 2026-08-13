@@ -7,19 +7,11 @@ authors.workspace = true
 description = "Fresh Rust SMB 3.1.1 server"
 
 [dependencies]
-adrian-storage-fdb = { path = "../adrian-storage-fdb" }
-adrian-storage-core = { path = "../adrian-storage-core" }
-adrian-identity-fdb = { path = "../adrian-identity-fdb" }
-adrian-pac-validator = { path = "../adrian-pac-validator" }
 adrian-smb-core = { path = "../adrian-smb-core" }
 tokio.workspace = true
-rustls.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
-rasn.workspace = true
-rasn-kerberos.workspace = true
-aes.workspace = true
-sha2.workspace = true
-hmac.workspace = true
 bytes.workspace = true
+uuid.workspace = true
+sha2.workspace = true

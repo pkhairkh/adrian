@@ -281,9 +281,7 @@ async fn dispatch(command: Command) -> Result<(), CliError> {
             // platform ticket cache; `klist` would then surface it.
             Ok(())
         }
-        Command::Migrate { subcommand } => {
-            dispatch_migrate(subcommand).await
-        }
+        Command::Migrate { subcommand } => dispatch_migrate(subcommand).await,
         Command::GpoTranslate { source, out } => {
             tracing::info!(%source, %out, "adrian gpo-translate: delegating to adrian-gpo-translate");
             // Real dispatch: call into the `adrian-gpo-translate` crate.
@@ -338,13 +336,10 @@ async fn dispatch(command: Command) -> Result<(), CliError> {
                 tracing::info!(%file, "adrian policy apply: reading declarative JSON");
                 // Read the JSON file and surface parse errors; full policy
                 // application lives in `adrian-policy-executor` (Wave 4a).
-                let text = std::fs::read_to_string(&file).map_err(|e| {
-                    CliError::NotImplemented(format!("policy file `{file}`: {e}"))
-                })?;
+                let text = std::fs::read_to_string(&file)
+                    .map_err(|e| CliError::NotImplemented(format!("policy file `{file}`: {e}")))?;
                 let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-                    CliError::NotImplemented(format!(
-                        "policy file `{file}` is not valid JSON: {e}"
-                    ))
+                    CliError::NotImplemented(format!("policy file `{file}` is not valid JSON: {e}"))
                 })?;
                 tracing::info!(%file, "policy file parsed; delegating to SDK policy module");
                 // Build a minimal DeclarativePolicy from the parsed JSON
@@ -401,7 +396,9 @@ async fn dispatch(command: Command) -> Result<(), CliError> {
         },
         Command::Kdc { subcommand } => match subcommand {
             KdcSub::RotateKrbtgt => {
-                tracing::info!("adrian kdc rotate-krbtgt: would delegate to KrbtgtManager (ADR-065)");
+                tracing::info!(
+                    "adrian kdc rotate-krbtgt: would delegate to KrbtgtManager (ADR-065)"
+                );
                 // `KrbtgtManager::rotate()` requires an `Arc<dyn Hsm>`
                 // instance the CLI doesn't construct (the operator
                 // runtime owns it). Surface this as a loud NotImplemented.
@@ -437,9 +434,9 @@ async fn dispatch_migrate(sub: MigrateSub) -> Result<(), CliError> {
         }
         MigrateSub::PlanNtlm => {
             tracing::info!("adrian migrate plan-ntlm: delegating to adrian-migrate");
-            adrian_migrate::plan_ntlm(&config)
-                .await
-                .map_err(|e| CliError::NotImplemented(format!("migrate plan-ntlm: {e} (ADR-086/011)")))
+            adrian_migrate::plan_ntlm(&config).await.map_err(|e| {
+                CliError::NotImplemented(format!("migrate plan-ntlm: {e} (ADR-086/011)"))
+            })
         }
         MigrateSub::Sidhistory => {
             tracing::info!("adrian migrate sidhistory: delegating to adrian-migrate");
@@ -822,7 +819,10 @@ mod tests {
             msg.contains("not implemented") && msg.contains("leave"),
             "expected 'not implemented' + 'leave' in error, got: {msg}"
         );
-        assert!(msg.contains("ADR-107"), "expected ADR ref in error; got: {msg}");
+        assert!(
+            msg.contains("ADR-107"),
+            "expected ADR ref in error; got: {msg}"
+        );
     }
 
     #[tokio::test]

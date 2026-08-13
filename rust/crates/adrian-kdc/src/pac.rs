@@ -365,7 +365,9 @@ impl LogonInfo {
         let dom_len = read_u16_le(buf, pos)? as usize;
         pos += 2;
         if pos + dom_len > buf.len() {
-            return Err(KdcError::Pac("LogonInfo: truncated logon_domain_name".into()));
+            return Err(KdcError::Pac(
+                "LogonInfo: truncated logon_domain_name".into(),
+            ));
         }
         let logon_domain_name = utf16le_to_string(&buf[pos..pos + dom_len]);
         pos += dom_len;
@@ -408,7 +410,9 @@ impl LogonInfo {
 
         // Remaining bytes are the SID.
         if pos >= buf.len() {
-            return Err(KdcError::Pac("LogonInfo: missing logon_domain_id SID".into()));
+            return Err(KdcError::Pac(
+                "LogonInfo: missing logon_domain_id SID".into(),
+            ));
         }
         let logon_domain_id = Sid::from_bytes(&buf[pos..])
             .map_err(|e| KdcError::Pac(format!("LogonInfo: bad SID: {e}")))?;
@@ -874,11 +878,10 @@ impl Pac {
             .find_buffer(buffer_type::FULL_CHECKSUM)
             .ok_or_else(|| KdcError::Pac("PAC: missing FULL_CHECKSUM".into()))?;
         let full_sig = SignatureData::decode(&full.data)?;
-        let (full_data_off, full_data_len) = self.buffer_data_range(raw, buffer_type::FULL_CHECKSUM)?;
+        let (full_data_off, full_data_len) =
+            self.buffer_data_range(raw, buffer_type::FULL_CHECKSUM)?;
         if full_data_len < 4 + HMAC_SHA1_96_LEN {
-            return Err(KdcError::Pac(
-                "PAC: FULL_CHECKSUM buffer too short".into(),
-            ));
+            return Err(KdcError::Pac("PAC: FULL_CHECKSUM buffer too short".into()));
         }
         let full_sig_off = full_data_off + 4;
         let mut tmp = raw.to_vec();
@@ -973,7 +976,9 @@ impl PacBuilder {
     pub fn new(client_uuid: Uuid, client_sid: &Sid, realm: &str) -> Self {
         // Derive the user RID and domain SID from `client_sid`.
         let user_id = client_sid.rid().unwrap_or(0);
-        let domain_sid = client_sid.domain_sid().unwrap_or_else(|| client_sid.clone());
+        let domain_sid = client_sid
+            .domain_sid()
+            .unwrap_or_else(|| client_sid.clone());
 
         let logon_info = LogonInfo {
             logon_time: 0,
@@ -1045,8 +1050,10 @@ impl PacBuilder {
         bytes[srv_sig_off..srv_sig_off + HMAC_SHA1_96_LEN].copy_from_slice(&srv_sig);
 
         // 3. Compute PRIVSVR_CHECKSUM over SERVER_CHECKSUM.SignatureValue.
-        let privsvr_sig =
-            crypto::hmac_sha1_96(krbtgt_key, &bytes[srv_sig_off..srv_sig_off + HMAC_SHA1_96_LEN]);
+        let privsvr_sig = crypto::hmac_sha1_96(
+            krbtgt_key,
+            &bytes[srv_sig_off..srv_sig_off + HMAC_SHA1_96_LEN],
+        );
         let (priv_data_off, _priv_data_len) =
             pac.buffer_data_range(&bytes, buffer_type::PRIVSVR_CHECKSUM)?;
         let priv_sig_off = priv_data_off + 4;
@@ -1154,11 +1161,7 @@ mod tests {
 
     /// Test fixture: a domain SID `S-1-5-21-100-200-300`.
     fn test_domain_sid() -> Sid {
-        Sid::new(
-            adrian_sid::SECURITY_NT_AUTHORITY,
-            vec![21, 100, 200, 300],
-        )
-        .expect("domain SID")
+        Sid::new(adrian_sid::SECURITY_NT_AUTHORITY, vec![21, 100, 200, 300]).expect("domain SID")
     }
 
     /// Test fixture: a user SID `S-1-5-21-100-200-300-1101` (RID 1101).
@@ -1415,7 +1418,8 @@ mod tests {
         let bytes = builder.build(&key).expect("build");
         let pac = Pac::parse(&bytes).expect("parse");
         pac.verify_server_checksum(&bytes, &key).expect("server ok");
-        pac.verify_privsvr_checksum(&bytes, &key).expect("privsvr ok");
+        pac.verify_privsvr_checksum(&bytes, &key)
+            .expect("privsvr ok");
         pac.verify_full_checksum(&bytes, &key).expect("full ok");
     }
 
@@ -1564,7 +1568,9 @@ mod tests {
         assert_eq!(client.client_id, 0x1234_5678_90AB_CDEF);
         assert_eq!(client.name, "asmith");
 
-        let upn_buf = pac.find_buffer(buffer_type::UPN_DNS_INFO).expect("UPN_DNS_INFO");
+        let upn_buf = pac
+            .find_buffer(buffer_type::UPN_DNS_INFO)
+            .expect("UPN_DNS_INFO");
         let upn = UpnDnsInfo::decode(&upn_buf.data).expect("decode UPN_DNS_INFO");
         assert_eq!(upn.upn, "asmith@corp.example.com");
         assert_eq!(upn.dns_domain_name, "corp.example.com");
@@ -1605,7 +1611,9 @@ mod tests {
     #[test]
     fn requestor_info_encode_decode_with_sid() {
         let sid = test_user_sid();
-        let original = RequestorInfo { sid: Some(sid.clone()) };
+        let original = RequestorInfo {
+            sid: Some(sid.clone()),
+        };
         let encoded = original.encode();
         assert!(!encoded.is_empty());
         let decoded = RequestorInfo::decode(&encoded).expect("decode");
@@ -1630,11 +1638,7 @@ mod tests {
     /// Truncated PAC input must surface a typed `KdcError::Pac`, not panic.
     #[test]
     fn pac_parse_truncated_returns_error() {
-        let cases: &[&[u8]] = &[
-            &[],
-            &[0u8; 8],
-            &[0u8; 15],
-        ];
+        let cases: &[&[u8]] = &[&[], &[0u8; 8], &[0u8; 15]];
         for case in cases {
             let err = Pac::parse(case).expect_err("truncated PAC must error");
             assert!(matches!(err, KdcError::Pac(_)));

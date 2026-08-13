@@ -159,7 +159,8 @@ impl Pac {
             }
             if b_offset + b_size > bytes.len() {
                 return Err(PacValidationError::Malformed(format!(
-                    "buffer {i} data out of bounds (offset={b_offset}, size={b_size}, pac_len={})", bytes.len()
+                    "buffer {i} data out of bounds (offset={b_offset}, size={b_size}, pac_len={})",
+                    bytes.len()
                 )));
             }
 
@@ -186,32 +187,38 @@ impl Pac {
 
     /// Get the LOGON_INFO buffer data.
     pub fn logon_info(&self) -> Option<&[u8]> {
-        self.get_buffer(buffer_type::LOGON_INFO).map(|b| b.data.as_slice())
+        self.get_buffer(buffer_type::LOGON_INFO)
+            .map(|b| b.data.as_slice())
     }
 
     /// Get the SERVER_CHECKSUM buffer data.
     pub fn server_checksum(&self) -> Option<&[u8]> {
-        self.get_buffer(buffer_type::SERVER_CHECKSUM).map(|b| b.data.as_slice())
+        self.get_buffer(buffer_type::SERVER_CHECKSUM)
+            .map(|b| b.data.as_slice())
     }
 
     /// Get the PRIVSVR_CHECKSUM buffer data.
     pub fn privsvr_checksum(&self) -> Option<&[u8]> {
-        self.get_buffer(buffer_type::PRIVSVR_CHECKSUM).map(|b| b.data.as_slice())
+        self.get_buffer(buffer_type::PRIVSVR_CHECKSUM)
+            .map(|b| b.data.as_slice())
     }
 
     /// Get the CLIENT_INFO buffer data.
     pub fn client_info(&self) -> Option<&[u8]> {
-        self.get_buffer(buffer_type::CLIENT_INFO).map(|b| b.data.as_slice())
+        self.get_buffer(buffer_type::CLIENT_INFO)
+            .map(|b| b.data.as_slice())
     }
 
     /// Get the UPN_DNS_INFO buffer data.
     pub fn upn_dns_info(&self) -> Option<&[u8]> {
-        self.get_buffer(buffer_type::UPN_DNS_INFO).map(|b| b.data.as_slice())
+        self.get_buffer(buffer_type::UPN_DNS_INFO)
+            .map(|b| b.data.as_slice())
     }
 
     /// Get the TICKET_CHECKSUM buffer data (ADR-123 silver ticket mitigation).
     pub fn ticket_checksum(&self) -> Option<&[u8]> {
-        self.get_buffer(buffer_type::TICKET_CHECKSUM).map(|b| b.data.as_slice())
+        self.get_buffer(buffer_type::TICKET_CHECKSUM)
+            .map(|b| b.data.as_slice())
     }
 
     /// Validate the KDC (privsvr) checksum — Layer 1 of ADR-083.
@@ -223,12 +230,16 @@ impl Pac {
     /// # Arguments
     /// * `krbtgt_key` — The krbtgt long-term key (32 bytes for AES-256).
     pub fn validate_kdc_checksum(&self, krbtgt_key: &[u8]) -> Result<(), PacValidationError> {
-        let server_buf = self.server_checksum().ok_or(PacValidationError::MissingBuffer(
-            buffer_type::SERVER_CHECKSUM,
-        ))?;
-        let privsvr_buf = self.privsvr_checksum().ok_or(PacValidationError::MissingBuffer(
-            buffer_type::PRIVSVR_CHECKSUM,
-        ))?;
+        let server_buf = self
+            .server_checksum()
+            .ok_or(PacValidationError::MissingBuffer(
+                buffer_type::SERVER_CHECKSUM,
+            ))?;
+        let privsvr_buf = self
+            .privsvr_checksum()
+            .ok_or(PacValidationError::MissingBuffer(
+                buffer_type::PRIVSVR_CHECKSUM,
+            ))?;
 
         // The SERVER_CHECKSUM buffer contains: signature_type (4 bytes) + signature (12 bytes)
         if server_buf.len() < 4 + 12 {
@@ -274,9 +285,11 @@ impl Pac {
         service_key: &[u8],
         pac_bytes: &[u8],
     ) -> Result<(), PacValidationError> {
-        let server_buf = self.server_checksum().ok_or(PacValidationError::MissingBuffer(
-            buffer_type::SERVER_CHECKSUM,
-        ))?;
+        let server_buf = self
+            .server_checksum()
+            .ok_or(PacValidationError::MissingBuffer(
+                buffer_type::SERVER_CHECKSUM,
+            ))?;
 
         if server_buf.len() < 4 + 12 {
             return Err(PacValidationError::Malformed(format!(
@@ -299,7 +312,8 @@ impl Pac {
         // Constant-time comparison.
         if expected_sig.ct_eq(stored_sig).unwrap_u8() == 0 {
             return Err(PacValidationError::SignatureMismatch(
-                "SERVER_CHECKSUM does not match (service signature verification failed)".to_string(),
+                "SERVER_CHECKSUM does not match (service signature verification failed)"
+                    .to_string(),
             ));
         }
 
@@ -330,7 +344,8 @@ impl Pac {
                 // ticket bytes, which the caller must provide separately.
                 if ticket_sig.iter().all(|&b| b == 0) {
                     return Err(PacValidationError::SignatureMismatch(
-                        "TICKET_CHECKSUM is all zeros (silver ticket mitigation not enforced)".to_string(),
+                        "TICKET_CHECKSUM is all zeros (silver ticket mitigation not enforced)"
+                            .to_string(),
                     ));
                 }
             }
@@ -431,10 +446,7 @@ fn read_u64_le(buf: &[u8], off: usize) -> Result<u64, PacValidationError> {
 
 /// Build a minimal PAC for testing (compatible with the Wave 2b builder format).
 #[cfg(test)]
-fn build_test_pac(
-    server_key: &[u8],
-    krbtgt_key: &[u8],
-) -> Vec<u8> {
+fn build_test_pac(server_key: &[u8], krbtgt_key: &[u8]) -> Vec<u8> {
     let num_buffers: u32 = 2;
     let header_len = PAC_HEADER_LEN;
     let entry_header_len = PAC_BUFFER_HEADER_LEN;
@@ -594,7 +606,8 @@ mod tests {
         // signed with zeroed sig fields, then sigs computed. Our test PAC
         // computes the server sig over the all-zero-body (which IS the
         // zeroed-sig state), so this should pass.
-        pac.validate_service_checksum(&server_key, &pac_bytes).unwrap();
+        pac.validate_service_checksum(&server_key, &pac_bytes)
+            .unwrap();
     }
 
     #[test]
@@ -604,7 +617,9 @@ mod tests {
         let wrong_key = [0xEFu8; 32];
         let pac_bytes = build_test_pac(&server_key, &krbtgt_key);
         let pac = Pac::parse(&pac_bytes).unwrap();
-        let err = pac.validate_service_checksum(&wrong_key, &pac_bytes).unwrap_err();
+        let err = pac
+            .validate_service_checksum(&wrong_key, &pac_bytes)
+            .unwrap_err();
         assert!(matches!(err, PacValidationError::SignatureMismatch(_)));
     }
 
@@ -686,7 +701,9 @@ mod tests {
         let wrong_service_key = [0xFFu8; 32];
         let pac_bytes = build_test_pac(&server_key, &krbtgt_key);
         let pac = Pac::parse(&pac_bytes).unwrap();
-        let err = pac.validate(&pac_bytes, &wrong_service_key, &krbtgt_key).unwrap_err();
+        let err = pac
+            .validate(&pac_bytes, &wrong_service_key, &krbtgt_key)
+            .unwrap_err();
         assert!(matches!(err, PacValidationError::SignatureMismatch(_)));
     }
 
@@ -697,7 +714,9 @@ mod tests {
         let wrong_krbtgt_key = [0xFFu8; 32];
         let pac_bytes = build_test_pac(&server_key, &krbtgt_key);
         let pac = Pac::parse(&pac_bytes).unwrap();
-        let err = pac.validate(&pac_bytes, &server_key, &wrong_krbtgt_key).unwrap_err();
+        let err = pac
+            .validate(&pac_bytes, &server_key, &wrong_krbtgt_key)
+            .unwrap_err();
         assert!(matches!(err, PacValidationError::SignatureMismatch(_)));
     }
 }

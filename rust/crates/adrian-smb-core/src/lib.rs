@@ -1,7 +1,27 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 //! # adrian-smb-core
 //!
 //! SMB 3.1.1 protocol primitives shared by `adrian-smb-server` and
-//! `adrian-smb-client`. Wire codecs via `rasn`; no I/O.
+//! `adrian-smb-client`. Wire codecs are hand-written against [MS-SMB2]
+//! (no `rasn` / `pavao` dependency — SMB2 is plain little-endian
+//! integers and length-prefixed byte arrays, not ASN.1).
+//!
+//! ## Coverage
+//!
+//! - [`Smb2Header`] — the 64-byte fixed SMB2 packet header (§2.2.1.1)
+//! - [`NegotiateRequest`] / [`NegotiateResponse`] — command 0x0000 (§2.2.3)
+//! - [`SessionSetupRequest`] / [`SessionSetupResponse`] — command 0x0001 (§2.2.5)
+//! - [`TreeConnectRequest`] / [`TreeConnectResponse`] — command 0x0003 (§2.2.8/9)
+//! - [`CreateRequest`] / [`CreateResponse`] — command 0x0005 (§2.2.13/14)
+//! - [`ReadRequest`] / [`ReadResponse`] — command 0x0008 (§2.2.19/20)
+//! - [`WriteRequest`] / [`WriteResponse`] — command 0x0009 (§2.2.21/22)
+//! - [`CloseRequest`] / [`CloseResponse`] — command 0x0006 (§2.2.14/15)
+//! - [`LogoffRequest`] / [`LogoffResponse`] — command 0x0002 (§2.2.2/3)
+//! - [`EchoRequest`] / [`EchoResponse`] — command 0x000d (§2.2.28/29)
+//! - [`PreauthHash`] — SHA-512 pre-auth integrity hash (§3.2.5.1)
+//! - [`TransformHeader`] — SMB 3.1.1 transform header for encrypted PDUs (§2.2.41)
 //!
 //! ## ADRs
 //!
@@ -11,65 +31,3016 @@
 
 use thiserror::Error;
 
-/// SMB dialect revision.
+// ============================================================================
+// Errors
+// ============================================================================
+
+/// SMB protocol error (codec / transport level).
+#[derive(Debug, Error)]
+pub enum SmbError {
+    /// PDU is malformed (wrong magic, truncated, etc).
+    #[error("malformed: {0}")]
+    Malformed(String),
+    /// NT status code returned by the peer.
+    #[error("status: {0:#x}")]
+    Status(u32),
+    /// Dialect unsupported (e.g. SMB1 refused per ADR-043).
+    #[error("dialect unsupported")]
+    DialectUnsupported,
+    /// SMB1 refused per ADR-043.
+    #[error("smb1 refused (per ADR-043)")]
+    Smb1Refused,
+    /// Encryption failure (cipher not negotiated, AEAD tag mismatch, etc).
+    #[error("encryption: {0}")]
+    Encryption(String),
+    /// Pre-auth integrity hash mismatch (downgrade / MITM detection).
+    #[error("integrity: {0}")]
+    Integrity(String),
+    /// Underlying I/O error.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// ============================================================================
+// NT status codes (subset used by this crate). MS-ERREF.
+// ============================================================================
+
+/// NT status codes (subset). All `STATUS_*` constants per MS-ERREF.
+pub mod ntstatus {
+    /// `0x00000000` — success.
+    pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+    /// `0xC000000D` — invalid SMB2 parameter.
+    pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    /// `0xC0000010` — invalid device request (e.g. wrong command for session).
+    pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+    /// `0xC000000F` — `STATUS_NO_SUCH_FILE` (create with `FILE_OPEN` on missing).
+    pub const STATUS_NO_SUCH_FILE: u32 = 0xC000_000F;
+    /// `0xC0000011` — read past end of file (with `SL_READ_AT_OFFSET`).
+    pub const STATUS_END_OF_FILE: u32 = 0xC000_0011;
+    /// `0xC0000016` — `STATUS_MORE_PROCESSING_REQUIRED` (mid session-setup).
+    pub const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
+    /// `0xC0000022` — `STATUS_ACCESS_DENIED`.
+    pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+    /// `0xC0000034` — `STATUS_OBJECT_NAME_NOT_FOUND` (tree connect unknown share).
+    pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+    /// `0xC0000035` — `STATUS_OBJECT_NAME_COLLISION` (create with `FILE_CREATE`
+    /// on existing).
+    pub const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+    /// `0xC000006D` — `STATUS_LOGON_FAILURE` (Kerberos / NTLM auth refused).
+    pub const STATUS_LOGON_FAILURE: u32 = 0xC000_006D;
+    /// `0xC00000CC` — `STATUS_BAD_NETWORK_NAME` (share not on this server).
+    pub const STATUS_BAD_NETWORK_NAME: u32 = 0xC000_00CC;
+    /// `0xC0000128` — `STATUS_FILE_CLOSED` (file handle unknown).
+    pub const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
+}
+
+// ============================================================================
+// Wire constants — magic bytes, header sizes, command codes, flags, dialects
+// ============================================================================
+
+/// SMB2 magic: `0xFE 'S' 'M' 'B'` (the first 4 bytes of every SMB2 packet).
+pub const SMB2_MAGIC: [u8; 4] = [0xFE, b'S', b'M', b'B'];
+
+/// SMB1 magic: `0xFF 'S' 'M' 'B'` — refused per ADR-043.
+pub const SMB1_MAGIC: [u8; 4] = [0xFF, b'S', b'M', b'B'];
+
+/// SMB2 Transform-header magic: `0xFD 'S' 'M' 'B'` (encrypted PDU prefix).
+pub const SMB2_TRANSFORM_MAGIC: [u8; 4] = [0xFD, b'S', b'M', b'B'];
+
+/// SMB2 fixed header size (bytes).
+pub const SMB2_HEADER_SIZE: usize = 64;
+
+/// SMB2 Transform-header fixed size (bytes).
+pub const SMB2_TRANSFORM_HEADER_SIZE: usize = 52;
+
+/// Maximum SMB2 PDU size (1 MiB; matches Windows Server default).
+pub const MAX_SMB2_MESSAGE_SIZE: u32 = 1 << 20;
+
+/// SMB2 command codes per MS-SMB2 §2.2.1.1.
+pub mod command {
+    /// `0x0000` — NEGOTIATE.
+    pub const NEGOTIATE: u16 = 0x0000;
+    /// `0x0001` — SESSION_SETUP.
+    pub const SESSION_SETUP: u16 = 0x0001;
+    /// `0x0002` — LOGOFF.
+    pub const LOGOFF: u16 = 0x0002;
+    /// `0x0003` — TREE_CONNECT.
+    pub const TREE_CONNECT: u16 = 0x0003;
+    /// `0x0004` — TREE_DISCONNECT.
+    pub const TREE_DISCONNECT: u16 = 0x0004;
+    /// `0x0005` — CREATE.
+    pub const CREATE: u16 = 0x0005;
+    /// `0x0006` — CLOSE.
+    pub const CLOSE: u16 = 0x0006;
+    /// `0x0008` — READ.
+    pub const READ: u16 = 0x0008;
+    /// `0x0009` — WRITE.
+    pub const WRITE: u16 = 0x0009;
+    /// `0x000D` — ECHO.
+    pub const ECHO: u16 = 0x000D;
+    /// `0x00F2` — TRANSFORM (encrypted PDU).
+    pub const TRANSFORM: u16 = 0x00F2;
+}
+
+/// SMB2 header Flags bits per MS-SMB2 §2.2.1.2.
+pub mod flags {
+    /// `0x00000001` — RESPONSE (server→client).
+    pub const SMB2_FLAGS_RESPONSE: u32 = 0x0000_0001;
+    /// `0x00000002` — ASYNC (async-id variant).
+    pub const SMB2_FLAGS_ASYNC: u32 = 0x0000_0002;
+    /// `0x00000004` — RELATED_OPERATIONS (chained request).
+    pub const SMB2_FLAGS_RELATED_OPERATIONS: u32 = 0x0000_0004;
+    /// `0x00000008` — SIGNED (signature valid).
+    pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
+    /// `0x20000000` — REPLAY_OPERATION (3.1.1+).
+    pub const SMB2_FLAGS_REPLAY_OPERATION: u32 = 0x2000_0000;
+}
+
+/// SMB2 dialect wire codes (u16 LE per MS-SMB2 §2.2.3.1.1 / §2.2.4.1.2).
+pub mod dialect_code {
+    /// `0x0202` — SMB 2.0.2 (minimum supported per ADR-043).
+    pub const SMB202: u16 = 0x0202;
+    /// `0x0210` — SMB 2.1.
+    pub const SMB210: u16 = 0x0210;
+    /// `0x0300` — SMB 3.0.
+    pub const SMB300: u16 = 0x0300;
+    /// `0x0302` — SMB 3.0.2.
+    pub const SMB302: u16 = 0x0302;
+    /// `0x0311` — SMB 3.1.1 (default per ADR-043 / ADR-105).
+    pub const SMB311: u16 = 0x0311;
+}
+
+/// SMB2 negotiate SecurityMode bits per MS-SMB2 §2.2.3.1.3 / §2.2.4.1.3.
+pub mod security_mode {
+    /// `0x0001` — SMB2_NEGOTIATE_SIGNING_ENABLED.
+    pub const SIGNING_ENABLED: u16 = 0x0001;
+    /// `0x0002` — SMB2_NEGOTIATE_SIGNING_REQUIRED.
+    pub const SIGNING_REQUIRED: u16 = 0x0002;
+}
+
+/// SMB2 negotiate Capabilities bits per MS-SMB2 §2.2.3.1.4 / §2.2.4.1.5.
+pub mod capabilities {
+    /// `0x00000001` — SMB2_GLOBAL_CAP_DFS.
+    pub const DFS: u32 = 0x0000_0001;
+    /// `0x00000002` — SMB2_GLOBAL_CAP_LEASING.
+    pub const LEASING: u32 = 0x0000_0002;
+    /// `0x00000004` — SMB2_GLOBAL_CAP_LARGE_MTU.
+    pub const LARGE_MTU: u32 = 0x0000_0004;
+    /// `0x00000008` — SMB2_GLOBAL_CAP_MULTI_CHANNEL.
+    pub const MULTI_CHANNEL: u32 = 0x0000_0008;
+    /// `0x00000010` — SMB2_GLOBAL_CAP_PERSISTENT_HANDLES.
+    pub const PERSISTENT_HANDLES: u32 = 0x0000_0010;
+    /// `0x00000020` — SMB2_GLOBAL_CAP_DIRECTORY_LEASING.
+    pub const DIRECTORY_LEASING: u32 = 0x0000_0020;
+    /// `0x00000040` — SMB2_GLOBAL_CAP_ENCRYPTION (3.0/3.0.2).
+    pub const ENCRYPTION: u32 = 0x0000_0040;
+}
+
+/// Negotiate context types per MS-SMB2 §2.2.3.1.6 / §2.2.4.1.6.
+pub mod negotiate_context_type {
+    /// `0x0001` — `SMB2_PREAUTH_INTEGRITY_CAPABILITIES`.
+    pub const PREAUTH_INTEGRITY: u16 = 0x0001;
+    /// `0x0002` — `SMB2_ENCRYPTION_CAPABILITIES`.
+    pub const ENCRYPTION: u16 = 0x0002;
+    /// `0x0007` — `SMB2_SIGNING_CAPABILITIES`.
+    pub const SIGNING: u16 = 0x0007;
+}
+
+/// Preauth integrity hash algorithm IDs per MS-SMB2 §2.2.3.1.6.1.
+pub mod preauth_hash_algo {
+    /// `0x0001` — SHA-512 (the only algorithm defined by MS-SMB2 §3.2.5.1.1).
+    pub const SHA512: u16 = 0x0001;
+}
+
+/// Encryption cipher IDs per MS-SMB2 §2.2.3.1.6.2.
+pub mod cipher {
+    /// `0x0001` — AES-128-CCM.
+    pub const AES_128_CCM: u16 = 0x0001;
+    /// `0x0002` — AES-128-GCM.
+    pub const AES_128_GCM: u16 = 0x0002;
+    /// `0x0003` — AES-256-CCM.
+    pub const AES_256_CCM: u16 = 0x0003;
+    /// `0x0004` — AES-256-GCM (the framework default per ADR-105 §4).
+    pub const AES_256_GCM: u16 = 0x0004;
+}
+
+/// Signing algorithm IDs per MS-SMB2 §2.2.3.1.6.4 (3.1.1+).
+pub mod signing_algo {
+    /// `0x0000` — HMAC-SHA256 (2.x+ default).
+    pub const HMAC_SHA256: u16 = 0x0000;
+    /// `0x0001` — AES-CMAC (3.0+).
+    pub const AES_CMAC: u16 = 0x0001;
+    /// `0x0002` — AES-GMAC (3.1.1+ default per ADR-105 §5).
+    pub const AES_GMAC: u16 = 0x0002;
+}
+
+/// TreeConnect ShareType values per MS-SMB2 §2.2.9.2.
+pub mod share_type {
+    /// `0x01` — disk share.
+    pub const DISK: u8 = 0x01;
+    /// `0x02` — named-pipe share.
+    pub const PIPE: u8 = 0x02;
+    /// `0x03` — print share.
+    pub const PRINT: u8 = 0x03;
+}
+
+/// SMB2 dialect revision (typed wrapper).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
+    /// SMB 2.0.2 (minimum supported per ADR-043).
     Smb202,
+    /// SMB 2.1.
     Smb210,
+    /// SMB 3.0.
     Smb300,
+    /// SMB 3.0.2.
     Smb302,
+    /// SMB 3.1.1 (default per ADR-043 / ADR-105).
     Smb311,
 }
 
-/// SMB command code (subset).
-#[derive(Clone, Copy, Debug)]
+impl Dialect {
+    /// Encode to the wire u16.
+    #[must_use]
+    pub fn to_wire(self) -> u16 {
+        match self {
+            Dialect::Smb202 => dialect_code::SMB202,
+            Dialect::Smb210 => dialect_code::SMB210,
+            Dialect::Smb300 => dialect_code::SMB300,
+            Dialect::Smb302 => dialect_code::SMB302,
+            Dialect::Smb311 => dialect_code::SMB311,
+        }
+    }
+
+    /// Decode from the wire u16. Returns `None` for unknown dialect codes.
+    #[must_use]
+    pub fn from_wire(v: u16) -> Option<Self> {
+        match v {
+            dialect_code::SMB202 => Some(Dialect::Smb202),
+            dialect_code::SMB210 => Some(Dialect::Smb210),
+            dialect_code::SMB300 => Some(Dialect::Smb300),
+            dialect_code::SMB302 => Some(Dialect::Smb302),
+            dialect_code::SMB311 => Some(Dialect::Smb311),
+            _ => None,
+        }
+    }
+
+    /// True for SMB 3.1.1 (the framework default per ADR-043).
+    #[must_use]
+    pub fn is_311(self) -> bool {
+        matches!(self, Dialect::Smb311)
+    }
+}
+
+/// SMB2 command code (typed wrapper around the wire code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Command {
+    /// `0x0000` — NEGOTIATE.
     Negotiate = 0x0000,
+    /// `0x0001` — SESSION_SETUP.
     SessionSetup = 0x0001,
+    /// `0x0002` — LOGOFF.
+    Logoff = 0x0002,
+    /// `0x0003` — TREE_CONNECT.
     TreeConnect = 0x0003,
+    /// `0x0004` — TREE_DISCONNECT.
     TreeDisconnect = 0x0004,
+    /// `0x0005` — CREATE.
     Create = 0x0005,
+    /// `0x0006` — CLOSE.
     Close = 0x0006,
+    /// `0x0008` — READ.
     Read = 0x0008,
+    /// `0x0009` — WRITE.
     Write = 0x0009,
+    /// `0x000D` — ECHO.
+    Echo = 0x000d,
+    /// `0x00F2` — TRANSFORM (encrypted PDU).
     Transform = 0x00F2,
 }
 
-#[derive(Debug, Error)]
-pub enum SmbError {
-    #[error("malformed: {0}")]
-    Malformed(String),
-    #[error("status: {0:#x}")]
-    Status(u32),
-    #[error("dialect unsupported")]
-    DialectUnsupported,
+impl Command {
+    /// Encode to the wire u16.
+    #[must_use]
+    pub fn to_wire(self) -> u16 {
+        self as u16
+    }
+
+    /// Decode from the wire u16.
+    #[must_use]
+    pub fn from_wire(v: u16) -> Option<Self> {
+        match v {
+            0x0000 => Some(Command::Negotiate),
+            0x0001 => Some(Command::SessionSetup),
+            0x0002 => Some(Command::Logoff),
+            0x0003 => Some(Command::TreeConnect),
+            0x0004 => Some(Command::TreeDisconnect),
+            0x0005 => Some(Command::Create),
+            0x0006 => Some(Command::Close),
+            0x0008 => Some(Command::Read),
+            0x0009 => Some(Command::Write),
+            0x000D => Some(Command::Echo),
+            0x00F2 => Some(Command::Transform),
+            _ => None,
+        }
+    }
 }
 
-/// SMB2 NEGOTIATE request (decoded).
-#[derive(Debug)]
+// ============================================================================
+// Reader/Writer helpers (no unsafe — plain slice indexing).
+// ============================================================================
+
+/// Cursor-style reader over a borrowed byte slice. Used by every `decode`
+/// function. Tracks an absolute position from the start of the SMB2 message
+/// (header + body) so SMB2's absolute-offset fields work directly.
+pub struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// Construct a reader at position 0 over `buf`.
+    #[must_use]
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// Construct a reader at absolute position `pos`.
+    pub fn at(buf: &'a [u8], pos: usize) -> Result<Self, SmbError> {
+        if pos > buf.len() {
+            return Err(SmbError::Malformed(format!(
+                "seek past end: {pos} > {}",
+                buf.len()
+            )));
+        }
+        Ok(Self { buf, pos })
+    }
+
+    /// Remaining unread bytes.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    /// Current absolute position.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Seek to an absolute position.
+    pub fn seek(&mut self, pos: usize) -> Result<(), SmbError> {
+        if pos > self.buf.len() {
+            return Err(SmbError::Malformed(format!(
+                "seek past end: {pos} > {}",
+                self.buf.len()
+            )));
+        }
+        self.pos = pos;
+        Ok(())
+    }
+
+    /// Read a single byte.
+    pub fn read_u8(&mut self) -> Result<u8, SmbError> {
+        if self.pos + 1 > self.buf.len() {
+            return Err(SmbError::Malformed("eof reading u8".into()));
+        }
+        let v = self.buf[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+
+    /// Read a u16 little-endian.
+    pub fn read_u16(&mut self) -> Result<u16, SmbError> {
+        if self.pos + 2 > self.buf.len() {
+            return Err(SmbError::Malformed("eof reading u16".into()));
+        }
+        let v = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
+        self.pos += 2;
+        Ok(v)
+    }
+
+    /// Read a u32 little-endian.
+    pub fn read_u32(&mut self) -> Result<u32, SmbError> {
+        if self.pos + 4 > self.buf.len() {
+            return Err(SmbError::Malformed("eof reading u32".into()));
+        }
+        let v = u32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(v)
+    }
+
+    /// Read a u64 little-endian.
+    pub fn read_u64(&mut self) -> Result<u64, SmbError> {
+        if self.pos + 8 > self.buf.len() {
+            return Err(SmbError::Malformed("eof reading u64".into()));
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
+        self.pos += 8;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Read `n` raw bytes.
+    pub fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], SmbError> {
+        if self.pos + n > self.buf.len() {
+            return Err(SmbError::Malformed(format!(
+                "eof reading {n} bytes at pos {}",
+                self.pos
+            )));
+        }
+        let v = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(v)
+    }
+
+    /// Read a 16-byte UUID (server/client GUID; 128-bit).
+    pub fn read_uuid(&mut self) -> Result<uuid::Uuid, SmbError> {
+        let b = self.read_bytes(16)?;
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(b);
+        Ok(uuid::Uuid::from_bytes(arr))
+    }
+
+    /// Read a 16-byte file-id (PersistentFileId || VolatileFileId).
+    pub fn read_file_id(&mut self) -> Result<FileId, SmbError> {
+        let persistent = self.read_u64()?;
+        let volatile_ = self.read_u64()?;
+        Ok(FileId {
+            persistent,
+            volatile_,
+        })
+    }
+
+    /// Read a 16-byte raw signature.
+    pub fn read_signature(&mut self) -> Result<[u8; 16], SmbError> {
+        let b = self.read_bytes(16)?;
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(b);
+        Ok(arr)
+    }
+}
+
+/// Append-only byte writer. Used by every `encode` function. Plain
+/// `Vec<u8>` wrapper so we get amortised O(1) `push` and zero-copy
+/// `extend_from_slice`.
+#[derive(Debug, Default, Clone)]
+pub struct Writer {
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    /// Construct an empty writer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct an empty writer with pre-allocated `capacity`.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Finalise: return the underlying byte vector.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+
+    /// Borrow the bytes written so far.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Current write position (= length).
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Write a single byte.
+    pub fn write_u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    /// Write a u16 little-endian.
+    pub fn write_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write a u32 little-endian.
+    pub fn write_u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write a u64 little-endian.
+    pub fn write_u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write raw bytes.
+    pub fn write_bytes(&mut self, v: &[u8]) {
+        self.buf.extend_from_slice(v);
+    }
+
+    /// Write a 16-byte UUID.
+    pub fn write_uuid(&mut self, v: uuid::Uuid) {
+        self.buf.extend_from_slice(v.as_bytes());
+    }
+
+    /// Write a 16-byte file-id.
+    pub fn write_file_id(&mut self, v: &FileId) {
+        self.write_u64(v.persistent);
+        self.write_u64(v.volatile_);
+    }
+
+    /// Pad with `n` zero bytes (used for SMB2 8-byte alignment).
+    pub fn pad(&mut self, n: usize) {
+        self.buf.extend(std::iter::repeat_n(0u8, n));
+    }
+
+    /// Align to `alignment` (must be a power of two or 1).
+    pub fn align(&mut self, alignment: usize) {
+        debug_assert!(
+            alignment == 1 || alignment.is_power_of_two(),
+            "alignment must be power-of-two or 1, got {alignment}"
+        );
+        if alignment <= 1 {
+            return;
+        }
+        let mask = alignment - 1;
+        let rem = self.buf.len() & mask;
+        if rem != 0 {
+            let pad = alignment - rem;
+            self.buf.extend(std::iter::repeat_n(0u8, pad));
+        }
+    }
+}
+
+/// Encode a Rust string as UTF-16LE bytes (no length prefix).
+///
+/// SMB2 paths are passed as UTF-16LE per MS-SMB2 §2.2.9. This helper
+/// replaces the `wchar_t[]` encoding that Windows performs natively.
+#[must_use]
+pub fn encode_utf16le(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 2);
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out
+}
+
+/// Decode UTF-16LE bytes back to a Rust `String`. Replaces invalid
+/// surrogates with U+FFFD per RFC 3629.
+#[must_use]
+pub fn decode_utf16le(bytes: &[u8]) -> String {
+    if !bytes.len().is_multiple_of(2) {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+// ============================================================================
+// SMB2 fixed header (64 bytes) — MS-SMB2 §2.2.1.1 / §2.2.1.2
+// ============================================================================
+
+/// SMB2 packet header (64-byte fixed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Smb2Header {
+    /// CreditCharge (number of credits this request consumes).
+    pub credit_charge: u16,
+    /// Status (responses) / ChannelSequence (requests, low 16 bits).
+    pub status: u32,
+    /// Command code (see [`command`] / [`Command`]).
+    pub command: u16,
+    /// CreditRequest (requests) / CreditResponse (responses).
+    pub credits: u16,
+    /// Flags (see [`flags`]).
+    pub flags: u32,
+    /// NextCommand offset (for chained messages; 0 = no chain).
+    pub next_command: u32,
+    /// MessageId (sequence number).
+    pub message_id: u64,
+    /// ProcessId (low 16 bits meaningful; high 16 reserved).
+    pub process_id: u32,
+    /// TreeId (tree-connection scope; 0 for Negotiate / SessionSetup / Echo).
+    pub tree_id: u32,
+    /// SessionId (session scope; 0 for Negotiate).
+    pub session_id: u64,
+    /// Signature (16 bytes; zero if not signed).
+    pub signature: [u8; 16],
+}
+
+impl Smb2Header {
+    /// Build a fresh request header.
+    #[must_use]
+    pub fn new_request(command: u16, message_id: u64) -> Self {
+        Self {
+            credit_charge: 1,
+            status: 0,
+            command,
+            credits: 1,
+            flags: 0,
+            next_command: 0,
+            message_id,
+            process_id: 0,
+            tree_id: 0,
+            session_id: 0,
+            signature: [0; 16],
+        }
+    }
+
+    /// Build a response header mirroring the request's routing fields.
+    #[must_use]
+    pub fn new_response(req: &Smb2Header) -> Self {
+        Self {
+            credit_charge: 1,
+            status: 0,
+            command: req.command,
+            credits: 1,
+            flags: flags::SMB2_FLAGS_RESPONSE,
+            next_command: 0,
+            message_id: req.message_id,
+            process_id: req.process_id,
+            tree_id: req.tree_id,
+            session_id: req.session_id,
+            signature: [0; 16],
+        }
+    }
+
+    /// True if this header marks a response (server→client).
+    #[must_use]
+    pub fn is_response(&self) -> bool {
+        self.flags & flags::SMB2_FLAGS_RESPONSE != 0
+    }
+
+    /// True if this header is signed.
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        self.flags & flags::SMB2_FLAGS_SIGNED != 0
+    }
+
+    /// Encode to a 64-byte buffer.
+    pub fn encode(&self, out: &mut Writer) {
+        out.write_bytes(&SMB2_MAGIC);
+        out.write_u16(SMB2_HEADER_SIZE as u16); // StructureSize = 64
+        out.write_u16(self.credit_charge);
+        out.write_u32(self.status);
+        out.write_u16(self.command);
+        out.write_u16(self.credits);
+        out.write_u32(self.flags);
+        out.write_u32(self.next_command);
+        out.write_u64(self.message_id);
+        out.write_u32(self.process_id);
+        out.write_u32(self.tree_id);
+        out.write_u64(self.session_id);
+        out.write_bytes(&self.signature);
+    }
+
+    /// Decode from a 64+ byte buffer.
+    pub fn decode(buf: &[u8]) -> Result<Self, SmbError> {
+        if buf.len() < SMB2_HEADER_SIZE {
+            return Err(SmbError::Malformed(format!(
+                "header too short: {} < {SMB2_HEADER_SIZE}",
+                buf.len()
+            )));
+        }
+        if buf[0..4] != SMB2_MAGIC {
+            if buf[0..4] == SMB1_MAGIC {
+                return Err(SmbError::Smb1Refused);
+            }
+            return Err(SmbError::Malformed(format!(
+                "bad magic: {:02x?} (expected {:02x?})",
+                &buf[0..4],
+                SMB2_MAGIC
+            )));
+        }
+        let mut r = Reader::new(buf);
+        r.seek(4)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != SMB2_HEADER_SIZE as u16 {
+            return Err(SmbError::Malformed(format!(
+                "bad header StructureSize: {structure_size} (expected {SMB2_HEADER_SIZE})"
+            )));
+        }
+        let credit_charge = r.read_u16()?;
+        let status = r.read_u32()?;
+        let command = r.read_u16()?;
+        let credits = r.read_u16()?;
+        let flags_v = r.read_u32()?;
+        let next_command = r.read_u32()?;
+        let message_id = r.read_u64()?;
+        let process_id = r.read_u32()?;
+        let tree_id = r.read_u32()?;
+        let session_id = r.read_u64()?;
+        let signature = r.read_signature()?;
+        Ok(Self {
+            credit_charge,
+            status,
+            command,
+            credits,
+            flags: flags_v,
+            next_command,
+            message_id,
+            process_id,
+            tree_id,
+            session_id,
+            signature,
+        })
+    }
+}
+
+// ============================================================================
+// FileId (16 bytes: PersistentFileId || VolatileFileId) — MS-SMB2 §2.2.14.6
+// ============================================================================
+
+/// SMB2 FileId (16 bytes: PersistentFileId || VolatileFileId).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileId {
+    /// PersistentFileId (8 bytes) — stable across reconnects for durable handles.
+    pub persistent: u64,
+    /// VolatileFileId (8 bytes) — may change on reconnect.
+    pub volatile_: u64,
+}
+
+impl FileId {
+    /// Build a FileId from two u64s.
+    #[must_use]
+    pub const fn new(persistent: u64, volatile_: u64) -> Self {
+        Self {
+            persistent,
+            volatile_,
+        }
+    }
+
+    /// Zero FileId (used as a sentinel).
+    pub const ZERO: FileId = FileId::new(0, 0);
+
+    /// True if both halves are zero.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.persistent == 0 && self.volatile_ == 0
+    }
+}
+
+// ============================================================================
+// NegotiateContext (8-byte aligned, type+len+reserved+data) — §2.2.3.1.6
+// ============================================================================
+
+/// A single NegotiateContext entry (type + data).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NegotiateContext {
+    /// ContextType (e.g. 0x0001 = preauth integrity).
+    pub context_type: u16,
+    /// Raw context Data (callers interpret per ContextType).
+    pub data: Vec<u8>,
+}
+
+impl NegotiateContext {
+    /// Build a PREAUTH_INTEGRITY_CAPABILITIES context (SHA-512 + salt).
+    #[must_use]
+    pub fn preauth_integrity(hash_algos: &[u16], salt: &[u8]) -> Self {
+        let mut data = Vec::with_capacity(4 + hash_algos.len() * 2 + salt.len());
+        data.extend_from_slice(&(hash_algos.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(salt.len() as u16).to_le_bytes());
+        for &h in hash_algos {
+            data.extend_from_slice(&h.to_le_bytes());
+        }
+        data.extend_from_slice(salt);
+        Self {
+            context_type: negotiate_context_type::PREAUTH_INTEGRITY,
+            data,
+        }
+    }
+
+    /// Build an ENCRYPTION_CAPABILITIES context (list of cipher IDs).
+    #[must_use]
+    pub fn encryption(ciphers: &[u16]) -> Self {
+        let mut data = Vec::with_capacity(2 + ciphers.len() * 2);
+        data.extend_from_slice(&(ciphers.len() as u16).to_le_bytes());
+        for &c in ciphers {
+            data.extend_from_slice(&c.to_le_bytes());
+        }
+        Self {
+            context_type: negotiate_context_type::ENCRYPTION,
+            data,
+        }
+    }
+
+    /// Build a SIGNING_CAPABILITIES context (list of signing algos).
+    #[must_use]
+    pub fn signing(algos: &[u16]) -> Self {
+        let mut data = Vec::with_capacity(2 + algos.len() * 2);
+        data.extend_from_slice(&(algos.len() as u16).to_le_bytes());
+        for &a in algos {
+            data.extend_from_slice(&a.to_le_bytes());
+        }
+        Self {
+            context_type: negotiate_context_type::SIGNING,
+            data,
+        }
+    }
+
+    /// Parse a PREAUTH_INTEGRITY context's data into (hash_algos, salt).
+    ///
+    /// Returns `None` if the data is malformed.
+    #[must_use]
+    pub fn parse_preauth(&self) -> Option<(Vec<u16>, Vec<u8>)> {
+        if self.context_type != negotiate_context_type::PREAUTH_INTEGRITY {
+            return None;
+        }
+        if self.data.len() < 4 {
+            return None;
+        }
+        let hash_count = u16::from_le_bytes([self.data[0], self.data[1]]) as usize;
+        let salt_len = u16::from_le_bytes([self.data[2], self.data[3]]) as usize;
+        let need = 4 + hash_count * 2 + salt_len;
+        if self.data.len() < need {
+            return None;
+        }
+        let mut algos = Vec::with_capacity(hash_count);
+        for i in 0..hash_count {
+            let off = 4 + i * 2;
+            algos.push(u16::from_le_bytes([self.data[off], self.data[off + 1]]));
+        }
+        let salt = self.data[4 + hash_count * 2..need].to_vec();
+        Some((algos, salt))
+    }
+
+    /// Parse an ENCRYPTION context's data into cipher IDs.
+    #[must_use]
+    pub fn parse_encryption(&self) -> Option<Vec<u16>> {
+        if self.context_type != negotiate_context_type::ENCRYPTION {
+            return None;
+        }
+        if self.data.len() < 2 {
+            return None;
+        }
+        let n = u16::from_le_bytes([self.data[0], self.data[1]]) as usize;
+        if self.data.len() < 2 + n * 2 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = 2 + i * 2;
+            out.push(u16::from_le_bytes([self.data[off], self.data[off + 1]]));
+        }
+        Some(out)
+    }
+
+    /// Encode a sequence of contexts into `out`, with 8-byte alignment
+    /// between consecutive entries (per MS-SMB2 §2.2.3.1.6).
+    pub fn encode_all(ctxs: &[NegotiateContext], out: &mut Writer) {
+        for (i, ctx) in ctxs.iter().enumerate() {
+            if i > 0 {
+                out.align(8);
+            }
+            out.write_u16(ctx.context_type);
+            out.write_u16(ctx.data.len() as u16);
+            out.write_u32(0); // Reserved
+            out.write_bytes(&ctx.data);
+        }
+    }
+
+    /// Decode a sequence of contexts from `buf` (length-bounded by `len`).
+    pub fn decode_all(buf: &[u8]) -> Result<Vec<NegotiateContext>, SmbError> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= buf.len() {
+            let context_type = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            let data_len = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+            let data_start = pos + 8;
+            if data_start + data_len > buf.len() {
+                return Err(SmbError::Malformed(
+                    "negotiate context data truncated".into(),
+                ));
+            }
+            let data = buf[data_start..data_start + data_len].to_vec();
+            out.push(NegotiateContext { context_type, data });
+            // Advance and align to 8.
+            let next = data_start + data_len;
+            let rem = next % 8;
+            pos = if rem == 0 { next } else { next + (8 - rem) };
+        }
+        Ok(out)
+    }
+}
+
+// ============================================================================
+// Negotiate request/response — §2.2.3 / §2.2.4
+// ============================================================================
+
+/// SMB2 NEGOTIATE request (command 0x0000). MS-SMB2 §2.2.3.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NegotiateRequest {
+    /// Dialects the client offers (in order of preference).
     pub dialects: Vec<Dialect>,
+    /// Security mode (signing enabled / required).
+    pub security_mode: u16,
+    /// Client capabilities bitmask.
+    pub capabilities: u32,
+    /// ClientGuid (16 bytes).
+    pub client_guid: uuid::Uuid,
+    /// Negotiate contexts (only meaningful when SMB 3.1.1 is offered).
+    pub negotiate_contexts: Vec<NegotiateContext>,
 }
 
-/// Encode/decode helpers. TODO: full rasn-backed wire codecs.
-pub fn encode_negotiate(_req: &NegotiateRequest) -> Result<Vec<u8>, SmbError> {
-    Err(SmbError::Malformed("not yet implemented".into()))
+impl NegotiateRequest {
+    /// Build a default SMB 3.1.1 negotiate request with SHA-512 preauth
+    /// integrity and AES-256-GCM encryption (the framework default per
+    /// ADR-105 §3-4).
+    #[must_use]
+    pub fn new_311(client_guid: uuid::Uuid, client_salt: &[u8]) -> Self {
+        Self {
+            dialects: vec![Dialect::Smb311],
+            security_mode: security_mode::SIGNING_ENABLED,
+            capabilities: capabilities::LARGE_MTU | capabilities::ENCRYPTION,
+            client_guid,
+            negotiate_contexts: vec![
+                NegotiateContext::preauth_integrity(&[preauth_hash_algo::SHA512], client_salt),
+                NegotiateContext::encryption(&[cipher::AES_256_GCM, cipher::AES_128_GCM]),
+                NegotiateContext::signing(&[signing_algo::AES_GMAC, signing_algo::HMAC_SHA256]),
+            ],
+        }
+    }
+
+    /// Encode just the negotiate body (NOT including the SMB2 header) into
+    /// `out`. Returns the offsets needed for the SMB2 header (the absolute
+    /// offset of the negotiate-context list, and its byte length).
+    ///
+    /// `header_size` is the SMB2 header size in front of this body — used
+    /// to convert relative offsets to absolute (header-relative) offsets.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> (u32, u32) {
+        let dialect_count = self.dialects.len() as u16;
+        out.write_u16(36); // StructureSize
+        out.write_u16(dialect_count);
+        out.write_u16(self.security_mode);
+        out.write_u16(0); // Reserved
+        out.write_u32(self.capabilities);
+        out.write_uuid(self.client_guid);
+        // Compute the absolute offset of the NegotiateContextList.
+        // header_size + 36 (fixed body) + dialect_count*2 + padding to 8.
+        let dialects_len = dialect_count as usize * 2;
+        let pre_pad = header_size + 36 + dialects_len;
+        let pad = (8 - (pre_pad % 8)) % 8;
+        let ctx_offset = if self.negotiate_contexts.is_empty() {
+            0
+        } else {
+            (pre_pad + pad) as u32
+        };
+        out.write_u32(ctx_offset);
+        out.write_u16(self.negotiate_contexts.len() as u16);
+        out.write_u16(0); // Reserved2
+        for d in &self.dialects {
+            out.write_u16(d.to_wire());
+        }
+        if !self.negotiate_contexts.is_empty() {
+            out.align(8);
+            let ctx_start = out.position();
+            NegotiateContext::encode_all(&self.negotiate_contexts, out);
+            let ctx_end = out.position();
+            debug_assert_eq!(ctx_start, ctx_offset as usize);
+            let _ = ctx_start; // suppress unused warning in release
+            return (ctx_offset, (ctx_end - ctx_start) as u32);
+        }
+        (ctx_offset, 0)
+    }
+
+    /// Encode the full SMB2 NEGOTIATE request (header + body).
+    pub fn encode(&self, message_id: u64) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 64);
+        let hdr = Smb2Header::new_request(command::NEGOTIATE, message_id);
+        hdr.encode(&mut out);
+        let (ctx_offset, _ctx_len) = self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        let _ = ctx_offset;
+        out.into_bytes()
+    }
+
+    /// Decode the body (header already consumed). `buf` is the entire SMB2
+    /// message (header + body); `header_size` is the SMB2 header size (64).
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 36 {
+            return Err(SmbError::Malformed("negotiate request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 36 {
+            return Err(SmbError::Malformed(format!(
+                "negotiate request StructureSize {structure_size} != 36"
+            )));
+        }
+        let dialect_count = r.read_u16()? as usize;
+        let security_mode = r.read_u16()?;
+        let _reserved = r.read_u16()?;
+        let capabilities = r.read_u32()?;
+        let client_guid = r.read_uuid()?;
+        let negotiate_context_offset = r.read_u32()? as usize;
+        let negotiate_context_count = r.read_u16()? as usize;
+        let _reserved2 = r.read_u16()?;
+        // Read dialects.
+        let mut dialects = Vec::with_capacity(dialect_count);
+        for _ in 0..dialect_count {
+            let code = r.read_u16()?;
+            dialects.push(Dialect::from_wire(code).ok_or_else(|| {
+                SmbError::Malformed(format!("unknown dialect code: 0x{code:04x}"))
+            })?);
+        }
+        // Read negotiate contexts (absolute offset from start of message).
+        let mut negotiate_contexts = Vec::new();
+        if negotiate_context_count > 0 {
+            if negotiate_context_offset == 0 || negotiate_context_offset >= buf.len() {
+                return Err(SmbError::Malformed(format!(
+                    "bad negotiate context offset: {negotiate_context_offset}"
+                )));
+            }
+            // Align offset up to 8 if needed (defensive).
+            let aligned = (negotiate_context_offset + 7) & !7;
+            let ctx_buf = &buf[aligned.min(buf.len())..];
+            negotiate_contexts = NegotiateContext::decode_all(ctx_buf)?;
+            // Truncate to expected count (decoder may over-read trailing bytes).
+            negotiate_contexts.truncate(negotiate_context_count);
+        }
+        Ok(Self {
+            dialects,
+            security_mode,
+            capabilities,
+            client_guid,
+            negotiate_contexts,
+        })
+    }
 }
 
-pub fn decode_negotiate(_bytes: &[u8]) -> Result<NegotiateRequest, SmbError> {
-    Err(SmbError::Malformed("not yet implemented".into()))
+/// SMB2 NEGOTIATE response (command 0x0000). MS-SMB2 §2.2.4.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NegotiateResponse {
+    /// Server-selected security mode (signing enabled / required).
+    pub security_mode: u16,
+    /// Server-selected dialect revision (e.g. 0x0311).
+    pub dialect_revision: u16,
+    /// Server capabilities bitmask.
+    pub capabilities: u32,
+    /// ServerGuid (16 bytes).
+    pub server_guid: uuid::Uuid,
+    /// MaxTransactSize (bytes the server will accept in a single transact).
+    pub max_transact_size: u32,
+    /// MaxReadSize (bytes the server will return in a single READ).
+    pub max_read_size: u32,
+    /// MaxWriteSize (bytes the server will accept in a single WRITE).
+    pub max_write_size: u32,
+    /// SystemTime (NT time — 100-ns intervals since 1601-01-01).
+    pub system_time: u64,
+    /// BootTime (NT time).
+    pub boot_time: u64,
+    /// SecurityBuffer (GSS-API / SPNEGO blob; may be empty for our stub auth).
+    pub security_buffer: Vec<u8>,
+    /// Negotiate contexts (only present when dialect is 3.1.1).
+    pub negotiate_contexts: Vec<NegotiateContext>,
 }
+
+impl NegotiateResponse {
+    /// Build a default SMB 3.1.1 negotiate response with SHA-512 preauth
+    /// integrity and AES-256-GCM encryption (the framework default per
+    /// ADR-105 §3-4). Plaintext sessions are still allowed — the server
+    /// does not set `SMB2_GLOBAL_CAP_ENCRYPTION` (encryption is opt-in
+    /// per-session, not mandated).
+    #[must_use]
+    pub fn new_311(server_guid: uuid::Uuid, server_salt: &[u8]) -> Self {
+        Self {
+            security_mode: security_mode::SIGNING_ENABLED,
+            dialect_revision: dialect_code::SMB311,
+            capabilities: capabilities::LARGE_MTU,
+            server_guid,
+            max_transact_size: MAX_SMB2_MESSAGE_SIZE,
+            max_read_size: MAX_SMB2_MESSAGE_SIZE,
+            max_write_size: MAX_SMB2_MESSAGE_SIZE,
+            system_time: 0,
+            boot_time: 0,
+            security_buffer: Vec::new(),
+            negotiate_contexts: vec![
+                NegotiateContext::preauth_integrity(&[preauth_hash_algo::SHA512], server_salt),
+                NegotiateContext::encryption(&[cipher::AES_256_GCM, cipher::AES_128_GCM]),
+                NegotiateContext::signing(&[signing_algo::AES_GMAC, signing_algo::HMAC_SHA256]),
+            ],
+        }
+    }
+
+    /// Encode just the response body (NOT including the SMB2 header) into
+    /// `out`. Returns the absolute offset of the negotiate-context list.
+    ///
+    /// # Pre-conditions
+    ///
+    /// `out.position()` MUST equal `header_size` (the SMB2 header has
+    /// already been written into `out`).
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        debug_assert_eq!(out.position(), header_size);
+        let has_ctx = !self.negotiate_contexts.is_empty();
+        // Pre-encode the NegotiateContextList into a temp buffer so we know
+        // its length before writing the fixed SecurityBufferOffset field.
+        let mut ctx_buf = Writer::new();
+        if has_ctx {
+            NegotiateContext::encode_all(&self.negotiate_contexts, &mut ctx_buf);
+        }
+        let ctx_len = ctx_buf.as_bytes().len();
+        out.write_u16(65); // StructureSize
+        out.write_u16(self.security_mode);
+        out.write_u16(self.dialect_revision);
+        out.write_u16(self.negotiate_contexts.len() as u16);
+        // NegotiateContextOffset: the fixed structure is 64 bytes; the
+        // NegotiateContextList starts immediately after (header_size + 64
+        // is already a multiple of 8, so no padding needed).
+        let ctx_offset = if has_ctx {
+            (header_size + 64) as u32
+        } else {
+            0
+        };
+        out.write_u32(ctx_offset);
+        out.write_uuid(self.server_guid);
+        out.write_u32(self.capabilities);
+        out.write_u32(self.max_transact_size);
+        out.write_u32(self.max_read_size);
+        out.write_u32(self.max_write_size);
+        out.write_u64(self.system_time);
+        out.write_u64(self.boot_time);
+        // SecurityBufferOffset — comes after the NegotiateContextList
+        // (and is 8-byte aligned).
+        let after_ctx = header_size + 64 + ctx_len;
+        let sb_align_pad = (8 - (after_ctx % 8)) % 8;
+        let sb_offset = if self.security_buffer.is_empty() {
+            0
+        } else {
+            (after_ctx + sb_align_pad) as u32
+        };
+        out.write_u16(sb_offset as u16);
+        out.write_u16(self.security_buffer.len() as u16);
+        // Verify we wrote exactly 64 bytes of fixed structure.
+        debug_assert_eq!(out.position(), header_size + 64);
+        // Write NegotiateContextList (if any).
+        if has_ctx {
+            out.write_bytes(ctx_buf.as_bytes());
+        }
+        // Pad and write SecurityBuffer (if any).
+        if !self.security_buffer.is_empty() {
+            out.align(8);
+            out.write_bytes(&self.security_buffer);
+        }
+        ctx_offset
+    }
+
+    /// Encode the full SMB2 NEGOTIATE response (header + body).
+    pub fn encode(&self, request_header: &Smb2Header) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 128);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = ntstatus::STATUS_SUCCESS;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body (header already consumed). `buf` is the entire SMB2
+    /// message (header + body); `header_size` is the SMB2 header size (64).
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 64 {
+            return Err(SmbError::Malformed("negotiate response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 65 {
+            return Err(SmbError::Malformed(format!(
+                "negotiate response StructureSize {structure_size} != 65"
+            )));
+        }
+        let security_mode = r.read_u16()?;
+        let dialect_revision = r.read_u16()?;
+        let negotiate_context_count = r.read_u16()? as usize;
+        let negotiate_context_offset = r.read_u32()? as usize;
+        let server_guid = r.read_uuid()?;
+        let capabilities = r.read_u32()?;
+        let max_transact_size = r.read_u32()?;
+        let max_read_size = r.read_u32()?;
+        let max_write_size = r.read_u32()?;
+        let system_time = r.read_u64()?;
+        let boot_time = r.read_u64()?;
+        let security_buffer_offset = r.read_u16()? as usize;
+        let security_buffer_length = r.read_u16()? as usize;
+        // Read security buffer (absolute offset from start of message).
+        let security_buffer = if security_buffer_length == 0 {
+            Vec::new()
+        } else {
+            if security_buffer_offset + security_buffer_length > buf.len() {
+                return Err(SmbError::Malformed(
+                    "negotiate response security buffer truncated".into(),
+                ));
+            }
+            buf[security_buffer_offset..security_buffer_offset + security_buffer_length].to_vec()
+        };
+        // Read negotiate contexts (only if 3.1.1).
+        let mut negotiate_contexts = Vec::new();
+        if negotiate_context_count > 0 {
+            if negotiate_context_offset == 0 || negotiate_context_offset >= buf.len() {
+                return Err(SmbError::Malformed(format!(
+                    "bad negotiate context offset: {negotiate_context_offset}"
+                )));
+            }
+            let aligned = (negotiate_context_offset + 7) & !7;
+            let ctx_buf = &buf[aligned.min(buf.len())..];
+            negotiate_contexts = NegotiateContext::decode_all(ctx_buf)?;
+            negotiate_contexts.truncate(negotiate_context_count);
+        }
+        Ok(Self {
+            security_mode,
+            dialect_revision,
+            capabilities,
+            server_guid,
+            max_transact_size,
+            max_read_size,
+            max_write_size,
+            system_time,
+            boot_time,
+            security_buffer,
+            negotiate_contexts,
+        })
+    }
+}
+
+// ============================================================================
+// SessionSetup request/response — §2.2.5
+// ============================================================================
+
+/// SMB2 SESSION_SETUP request (command 0x0001). MS-SMB2 §2.2.5.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSetupRequest {
+    /// Flags (0x00 = normal, 0x01 = binding).
+    pub flags: u8,
+    /// SecurityMode (signing enabled / required).
+    pub security_mode: u16,
+    /// Capabilities (always 0 for SMB 3.x — channel-binding only).
+    pub capabilities: u32,
+    /// Channel (0 = None, 1 = RDMA V1).
+    pub channel: u32,
+    /// SecurityBuffer (GSS-API / SPNEGO blob).
+    pub security_buffer: Vec<u8>,
+    /// PreviousSessionId (for reconnect-after-disconnect).
+    pub previous_session_id: u64,
+}
+
+impl SessionSetupRequest {
+    /// Build a minimal session-setup request with the given SPNEGO blob.
+    #[must_use]
+    pub fn new(security_buffer: Vec<u8>) -> Self {
+        Self {
+            flags: 0,
+            security_mode: security_mode::SIGNING_ENABLED,
+            capabilities: 0,
+            channel: 0,
+            security_buffer,
+            previous_session_id: 0,
+        }
+    }
+
+    /// Encode the body (NOT including the SMB2 header). Returns the
+    /// security-buffer's absolute offset (from start of SMB2 message).
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(25); // StructureSize
+        out.write_u8(self.flags);
+        out.write_u8((self.security_mode & 0xFF) as u8);
+        // security_mode is u16 — but the wire format has it as a single
+        // byte here. Encode the low byte (high byte is reserved/0).
+        out.write_u32(self.capabilities);
+        out.write_u32(self.channel);
+        let sb_off = (header_size + 24) as u32;
+        out.write_u16(sb_off as u16);
+        out.write_u16(self.security_buffer.len() as u16);
+        out.write_u64(self.previous_session_id);
+        // Buffer (security_buffer).
+        out.write_bytes(&self.security_buffer);
+        sb_off
+    }
+
+    /// Encode the full SMB2 SESSION_SETUP request.
+    pub fn encode(&self, message_id: u64, session_id: u64) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 64);
+        let mut hdr = Smb2Header::new_request(command::SESSION_SETUP, message_id);
+        hdr.session_id = session_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 24 {
+            return Err(SmbError::Malformed(
+                "session setup request too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 25 {
+            return Err(SmbError::Malformed(format!(
+                "session setup request StructureSize {structure_size} != 25"
+            )));
+        }
+        let flags = r.read_u8()?;
+        let security_mode_low = r.read_u8()? as u16;
+        let capabilities = r.read_u32()?;
+        let channel = r.read_u32()?;
+        let sb_off = r.read_u16()? as usize;
+        let sb_len = r.read_u16()? as usize;
+        let previous_session_id = r.read_u64()?;
+        let security_buffer = if sb_len == 0 {
+            Vec::new()
+        } else {
+            if sb_off + sb_len > buf.len() {
+                return Err(SmbError::Malformed(
+                    "session setup security buffer truncated".into(),
+                ));
+            }
+            buf[sb_off..sb_off + sb_len].to_vec()
+        };
+        Ok(Self {
+            flags,
+            security_mode: security_mode_low,
+            capabilities,
+            channel,
+            security_buffer,
+            previous_session_id,
+        })
+    }
+}
+
+/// SMB2 SESSION_SETUP response (command 0x0001). MS-SMB2 §2.2.6.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSetupResponse {
+    /// SessionFlags (0x01=IsGuest, 0x02=IsNull, 0x04=EncryptData).
+    pub session_flags: u16,
+    /// SecurityBuffer (SPNEGO continuation token; may be empty on success).
+    pub security_buffer: Vec<u8>,
+}
+
+impl SessionSetupResponse {
+    /// Build a minimal session-setup response (success, no flags).
+    #[must_use]
+    pub fn new_success() -> Self {
+        Self {
+            session_flags: 0,
+            security_buffer: Vec::new(),
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(9); // StructureSize
+        out.write_u16(self.session_flags);
+        let sb_off = (header_size + 8) as u32;
+        out.write_u16(sb_off as u16);
+        out.write_u16(self.security_buffer.len() as u16);
+        out.write_bytes(&self.security_buffer);
+        sb_off
+    }
+
+    /// Encode the full SMB2 SESSION_SETUP response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 32);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 8 {
+            return Err(SmbError::Malformed(
+                "session setup response too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 9 {
+            return Err(SmbError::Malformed(format!(
+                "session setup response StructureSize {structure_size} != 9"
+            )));
+        }
+        let session_flags = r.read_u16()?;
+        let sb_off = r.read_u16()? as usize;
+        let sb_len = r.read_u16()? as usize;
+        let security_buffer = if sb_len == 0 {
+            Vec::new()
+        } else {
+            if sb_off + sb_len > buf.len() {
+                return Err(SmbError::Malformed(
+                    "session setup response security buffer truncated".into(),
+                ));
+            }
+            buf[sb_off..sb_off + sb_len].to_vec()
+        };
+        Ok(Self {
+            session_flags,
+            security_buffer,
+        })
+    }
+}
+
+// ============================================================================
+// TreeConnect request/response — §2.2.8 / §2.2.9
+// ============================================================================
+
+/// SMB2 TREE_CONNECT request (command 0x0003). MS-SMB2 §2.2.8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeConnectRequest {
+    /// UNC path (`\\server\share`, UTF-16LE on the wire).
+    pub path: String,
+}
+
+impl TreeConnectRequest {
+    /// Build a new TreeConnect request for `\\server\share`.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(9); // StructureSize
+        out.write_u16(0); // Reserved
+        let path_offset = (header_size + 8) as u32;
+        out.write_u16(path_offset as u16);
+        let path_utf16 = encode_utf16le(&self.path);
+        out.write_u16(path_utf16.len() as u16);
+        out.write_bytes(&path_utf16);
+        path_offset
+    }
+
+    /// Encode the full SMB2 TREE_CONNECT request.
+    pub fn encode(&self, message_id: u64, session_id: u64) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 64);
+        let mut hdr = Smb2Header::new_request(command::TREE_CONNECT, message_id);
+        hdr.session_id = session_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 8 {
+            return Err(SmbError::Malformed("tree connect request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 9 {
+            return Err(SmbError::Malformed(format!(
+                "tree connect request StructureSize {structure_size} != 9"
+            )));
+        }
+        let _reserved = r.read_u16()?;
+        let path_offset = r.read_u16()? as usize;
+        let path_length = r.read_u16()? as usize;
+        if path_length == 0 {
+            return Ok(Self {
+                path: String::new(),
+            });
+        }
+        if path_offset + path_length > buf.len() {
+            return Err(SmbError::Malformed("tree connect path truncated".into()));
+        }
+        let path = decode_utf16le(&buf[path_offset..path_offset + path_length]);
+        Ok(Self { path })
+    }
+}
+
+/// SMB2 TREE_CONNECT response (command 0x0003). MS-SMB2 §2.2.9.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeConnectResponse {
+    /// ShareType (0x01=Disk, 0x02=Pipe, 0x03=Print).
+    pub share_type: u8,
+    /// ShareFlags (per MS-SMB2 §2.2.9.2).
+    pub share_flags: u32,
+    /// Capabilities (per MS-SMB2 §2.2.9.3).
+    pub capabilities: u32,
+    /// MaximalAccess (mask of granted access rights).
+    pub maximal_access: u32,
+}
+
+impl TreeConnectResponse {
+    /// Build a default disk-share TreeConnect response.
+    #[must_use]
+    pub fn new_disk() -> Self {
+        Self {
+            share_type: share_type::DISK,
+            share_flags: 0,
+            capabilities: 0,
+            maximal_access: 0x001F_01FF, // FILE_ALL_ACCESS generic
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(16); // StructureSize
+        out.write_u8(self.share_type);
+        out.write_u8(0); // Reserved
+        out.write_u32(self.share_flags);
+        out.write_u32(self.capabilities);
+        out.write_u32(self.maximal_access);
+    }
+
+    /// Encode the full SMB2 TREE_CONNECT response.
+    pub fn encode(&self, request_header: &Smb2Header, tree_id: u32, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 16);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed(
+                "tree connect response too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 16 {
+            return Err(SmbError::Malformed(format!(
+                "tree connect response StructureSize {structure_size} != 16"
+            )));
+        }
+        let share_type = r.read_u8()?;
+        let _reserved = r.read_u8()?;
+        let share_flags = r.read_u32()?;
+        let capabilities = r.read_u32()?;
+        let maximal_access = r.read_u32()?;
+        Ok(Self {
+            share_type,
+            share_flags,
+            capabilities,
+            maximal_access,
+        })
+    }
+}
+
+// ============================================================================
+// Create request/response — §2.2.13 / §2.2.14
+// ============================================================================
+
+/// SMB2 CREATE request (command 0x0005). MS-SMB2 §2.2.13.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateRequest {
+    /// OplockLevel (0x00=None, 0x01=II, 0x02=Level2 (deprecated), 0x08=Batch).
+    pub oplock_level: u8,
+    /// ImpersonationLevel (3=Identification, 4=Impersonation).
+    pub impersonation_level: u32,
+    /// SmbCreateFlags (always 0 for SMB 3.x).
+    pub smb_create_flags: u64,
+    /// DesiredAccess (FILE_GENERIC_READ/WRITE/EXECUTE, etc).
+    pub desired_access: u32,
+    /// FileAttributes (FILE_ATTRIBUTE_NORMAL = 0x80).
+    pub file_attributes: u32,
+    /// ShareAccess (FILE_SHARE_READ/WRITE/DELETE).
+    pub share_access: u32,
+    /// CreateDisposition (FILE_SUPERSEDE/OPEN/CREATE/OPEN_IF/OVERWRITE/OVERWRITE_IF).
+    pub create_disposition: u32,
+    /// CreateOptions (FILE_DIRECTORY_FILE, etc).
+    pub create_options: u32,
+    /// Name (UTF-16LE; relative to tree root).
+    pub name: String,
+}
+
+impl CreateRequest {
+    /// Build a CREATE request for the given file path (UTF-8 → UTF-16LE on wire).
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            oplock_level: 0,
+            impersonation_level: 2, // Impersonation
+            smb_create_flags: 0,
+            desired_access: 0x0017_0089, // FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE
+            file_attributes: 0x80,       // FILE_ATTRIBUTE_NORMAL
+            share_access: 0x07,          // READ | WRITE | DELETE
+            create_disposition: 0x03,    // FILE_OPEN_IF (open or create; do not truncate)
+            create_options: 0,
+            name: name.into(),
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(57); // StructureSize
+        out.write_u8(self.oplock_level);
+        out.write_u8(0); // Reserved
+        out.write_u32(self.impersonation_level);
+        out.write_u64(self.smb_create_flags);
+        out.write_u64(0); // Reserved2
+        out.write_u32(self.desired_access);
+        out.write_u32(self.file_attributes);
+        out.write_u32(self.share_access);
+        out.write_u32(self.create_disposition);
+        out.write_u32(self.create_options);
+        let name_offset = (header_size + 56) as u32;
+        out.write_u16(name_offset as u16);
+        let name_utf16 = encode_utf16le(&self.name);
+        out.write_u16(name_utf16.len() as u16);
+        // CreateContextsOffset/Length (we don't support create contexts).
+        out.write_u32(0);
+        out.write_u32(0);
+        // Buffer (name).
+        out.write_bytes(&name_utf16);
+        name_offset
+    }
+
+    /// Encode the full SMB2 CREATE request.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 64);
+        let mut hdr = Smb2Header::new_request(command::CREATE, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 56 {
+            return Err(SmbError::Malformed("create request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 57 {
+            return Err(SmbError::Malformed(format!(
+                "create request StructureSize {structure_size} != 57"
+            )));
+        }
+        let oplock_level = r.read_u8()?;
+        let _reserved = r.read_u8()?;
+        let impersonation_level = r.read_u32()?;
+        let smb_create_flags = r.read_u64()?;
+        let _reserved2 = r.read_u64()?;
+        let desired_access = r.read_u32()?;
+        let file_attributes = r.read_u32()?;
+        let share_access = r.read_u32()?;
+        let create_disposition = r.read_u32()?;
+        let create_options = r.read_u32()?;
+        let name_offset = r.read_u16()? as usize;
+        let name_length = r.read_u16()? as usize;
+        let _ctx_offset = r.read_u32()?;
+        let _ctx_length = r.read_u32()?;
+        let name = if name_length == 0 {
+            String::new()
+        } else {
+            if name_offset + name_length > buf.len() {
+                return Err(SmbError::Malformed("create name truncated".into()));
+            }
+            decode_utf16le(&buf[name_offset..name_offset + name_length])
+        };
+        Ok(Self {
+            oplock_level,
+            impersonation_level,
+            smb_create_flags,
+            desired_access,
+            file_attributes,
+            share_access,
+            create_disposition,
+            create_options,
+            name,
+        })
+    }
+}
+
+/// SMB2 CREATE response (command 0x0005). MS-SMB2 §2.2.14.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateResponse {
+    /// OplockLevel granted.
+    pub oplock_level: u8,
+    /// Flags (0x01=ReplayOperation, 0x02=PersistentHandle).
+    pub flags: u8,
+    /// CreateAction (FILE_SUPERSEDED/OPENED/CREATED/OVERWRITTEN = 0/1/2/3).
+    pub create_action: u32,
+    /// CreationTime (NT time).
+    pub creation_time: u64,
+    /// LastAccessTime (NT time).
+    pub last_access_time: u64,
+    /// LastWriteTime (NT time).
+    pub last_write_time: u64,
+    /// ChangeTime (NT time).
+    pub change_time: u64,
+    /// AllocationSize (rounded up to FS block size).
+    pub allocation_size: u64,
+    /// EndofFile (logical size).
+    pub end_of_file: u64,
+    /// FileAttributes.
+    pub file_attributes: u32,
+    /// Granted FileId.
+    pub file_id: FileId,
+}
+
+impl CreateResponse {
+    /// Build a CREATE response for a newly-opened file with the given FileId
+    /// and size.
+    #[must_use]
+    pub fn new(file_id: FileId, size: u64) -> Self {
+        Self {
+            oplock_level: 0,
+            flags: 0,
+            create_action: 1, // FILE_OPENED
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            allocation_size: size,
+            end_of_file: size,
+            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            file_id,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(89); // StructureSize
+        out.write_u8(self.oplock_level);
+        out.write_u8(self.flags);
+        out.write_u32(self.create_action);
+        out.write_u64(self.creation_time);
+        out.write_u64(self.last_access_time);
+        out.write_u64(self.last_write_time);
+        out.write_u64(self.change_time);
+        out.write_u64(self.allocation_size);
+        out.write_u64(self.end_of_file);
+        out.write_u32(self.file_attributes);
+        out.write_u32(0); // Reserved2
+        out.write_file_id(&self.file_id);
+        out.write_u32(0); // CreateContextsOffset
+        out.write_u32(0); // CreateContextsLength
+    }
+
+    /// Encode the full SMB2 CREATE response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 88);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 88 {
+            return Err(SmbError::Malformed("create response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 89 {
+            return Err(SmbError::Malformed(format!(
+                "create response StructureSize {structure_size} != 89"
+            )));
+        }
+        let oplock_level = r.read_u8()?;
+        let flags = r.read_u8()?;
+        let create_action = r.read_u32()?;
+        let creation_time = r.read_u64()?;
+        let last_access_time = r.read_u64()?;
+        let last_write_time = r.read_u64()?;
+        let change_time = r.read_u64()?;
+        let allocation_size = r.read_u64()?;
+        let end_of_file = r.read_u64()?;
+        let file_attributes = r.read_u32()?;
+        let _reserved2 = r.read_u32()?;
+        let file_id = r.read_file_id()?;
+        // Create contexts (we don't support them).
+        let _ctx_offset = r.read_u32()?;
+        let _ctx_length = r.read_u32()?;
+        Ok(Self {
+            oplock_level,
+            flags,
+            create_action,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            allocation_size,
+            end_of_file,
+            file_attributes,
+            file_id,
+        })
+    }
+}
+
+// ============================================================================
+// Read request/response — §2.2.19 / §2.2.20
+// ============================================================================
+
+/// SMB2 READ request (command 0x0008). MS-SMB2 §2.2.19.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadRequest {
+    /// Length (bytes to read).
+    pub length: u32,
+    /// Offset (byte offset within the file).
+    pub offset: u64,
+    /// FileId.
+    pub file_id: FileId,
+    /// MinimumCount (server MUST read at least this many bytes or return EOF).
+    pub minimum_count: u32,
+}
+
+impl ReadRequest {
+    /// Build a READ request for `length` bytes starting at `offset` on
+    /// `file_id`.
+    #[must_use]
+    pub fn new(file_id: FileId, offset: u64, length: u32) -> Self {
+        Self {
+            length,
+            offset,
+            file_id,
+            minimum_count: 1,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(49); // StructureSize
+        out.write_u8(0); // Padding
+        out.write_u8(0); // Flags
+        out.write_u32(self.length);
+        out.write_u64(self.offset);
+        out.write_file_id(&self.file_id);
+        out.write_u32(self.minimum_count);
+        out.write_u32(0); // Channel
+        out.write_u32(0); // RemainingBytes
+        out.write_u16(0); // ReadChannelInfoOffset
+        out.write_u16(0); // ReadChannelInfoLength
+                          // (Buffer is empty — channel info not supported.)
+    }
+
+    /// Encode the full SMB2 READ request.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 48);
+        let mut hdr = Smb2Header::new_request(command::READ, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 48 {
+            return Err(SmbError::Malformed("read request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 49 {
+            return Err(SmbError::Malformed(format!(
+                "read request StructureSize {structure_size} != 49"
+            )));
+        }
+        let _padding = r.read_u8()?;
+        let _flags = r.read_u8()?;
+        let length = r.read_u32()?;
+        let offset = r.read_u64()?;
+        let file_id = r.read_file_id()?;
+        let minimum_count = r.read_u32()?;
+        Ok(Self {
+            length,
+            offset,
+            file_id,
+            minimum_count,
+        })
+    }
+}
+
+/// SMB2 READ response (command 0x0008). MS-SMB2 §2.2.20.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadResponse {
+    /// Data read (the actual file bytes).
+    pub data: Vec<u8>,
+}
+
+impl ReadResponse {
+    /// Build a READ response carrying `data`.
+    #[must_use]
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(17); // StructureSize
+        let data_offset = (header_size + 16) as u32;
+        out.write_u8(data_offset as u8);
+        out.write_u8(0); // Reserved
+        out.write_u32(self.data.len() as u32);
+        out.write_u32(0); // DataRemaining
+        out.write_u32(0); // Flags
+                          // Pad to 8-byte alignment before data (per MS-SMB2 §2.2.20 the data
+                          // follows immediately after the fixed portion, but Windows aligns
+                          // it to 8 for performance).
+        out.align(8);
+        out.write_bytes(&self.data);
+        data_offset
+    }
+
+    /// Encode the full SMB2 READ response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 16 + self.data.len());
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.credit_charge = self.data.len().div_ceil(65536).max(1) as u16;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed("read response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 17 {
+            return Err(SmbError::Malformed(format!(
+                "read response StructureSize {structure_size} != 17"
+            )));
+        }
+        let data_offset = r.read_u8()? as usize;
+        let _reserved = r.read_u8()?;
+        let data_length = r.read_u32()? as usize;
+        let _data_remaining = r.read_u32()?;
+        let _flags = r.read_u32()?;
+        if data_length == 0 {
+            return Ok(Self { data: Vec::new() });
+        }
+        if data_offset + data_length > buf.len() {
+            return Err(SmbError::Malformed("read response data truncated".into()));
+        }
+        Ok(Self {
+            data: buf[data_offset..data_offset + data_length].to_vec(),
+        })
+    }
+}
+
+// ============================================================================
+// Write request/response — §2.2.21 / §2.2.22
+// ============================================================================
+
+/// SMB2 WRITE request (command 0x0009). MS-SMB2 §2.2.21.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteRequest {
+    /// Length (bytes to write).
+    pub length: u32,
+    /// Offset (byte offset within the file).
+    pub offset: u64,
+    /// FileId.
+    pub file_id: FileId,
+    /// Data (the bytes to write).
+    pub data: Vec<u8>,
+}
+
+impl WriteRequest {
+    /// Build a WRITE request carrying `data` to be written at `offset` on
+    /// `file_id`.
+    #[must_use]
+    pub fn new(file_id: FileId, offset: u64, data: Vec<u8>) -> Self {
+        let length = data.len() as u32;
+        Self {
+            length,
+            offset,
+            file_id,
+            data,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(49); // StructureSize
+        let data_offset = (header_size + 48) as u32;
+        out.write_u8(data_offset as u8);
+        out.write_u8(0); // Reserved
+        out.write_u32(self.length);
+        out.write_u64(self.offset);
+        out.write_file_id(&self.file_id);
+        out.write_u32(0); // Channel
+        out.write_u32(0); // RemainingBytes
+        out.write_u16(0); // WriteChannelInfoOffset
+        out.write_u16(0); // WriteChannelInfoLength
+        out.write_u32(0); // Flags
+        out.write_bytes(&self.data);
+        data_offset
+    }
+
+    /// Encode the full SMB2 WRITE request.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 48 + self.data.len());
+        let mut hdr = Smb2Header::new_request(command::WRITE, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.credit_charge = self.data.len().div_ceil(65536).max(1) as u16;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 48 {
+            return Err(SmbError::Malformed("write request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 49 {
+            return Err(SmbError::Malformed(format!(
+                "write request StructureSize {structure_size} != 49"
+            )));
+        }
+        let data_offset = r.read_u8()? as usize;
+        let _reserved = r.read_u8()?;
+        let length = r.read_u32()?;
+        let offset = r.read_u64()?;
+        let file_id = r.read_file_id()?;
+        let _channel = r.read_u32()?;
+        let _remaining = r.read_u32()?;
+        let _ch_info_off = r.read_u16()?;
+        let _ch_info_len = r.read_u16()?;
+        let _flags = r.read_u32()?;
+        let data = if length == 0 {
+            Vec::new()
+        } else {
+            if data_offset + length as usize > buf.len() {
+                return Err(SmbError::Malformed("write data truncated".into()));
+            }
+            buf[data_offset..data_offset + length as usize].to_vec()
+        };
+        Ok(Self {
+            length,
+            offset,
+            file_id,
+            data,
+        })
+    }
+}
+
+/// SMB2 WRITE response (command 0x0009). MS-SMB2 §2.2.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteResponse {
+    /// Count (bytes actually written).
+    pub count: u32,
+}
+
+impl WriteResponse {
+    /// Build a WRITE response reporting `count` bytes written.
+    #[must_use]
+    pub fn new(count: u32) -> Self {
+        Self { count }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(17); // StructureSize
+        out.write_u16(0); // Reserved
+        out.write_u32(self.count);
+        out.write_u32(0); // Remaining
+        out.write_u16(0); // WriteChannelInfoOffset
+        out.write_u16(0); // WriteChannelInfoLength
+    }
+
+    /// Encode the full SMB2 WRITE response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 16);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed("write response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 17 {
+            return Err(SmbError::Malformed(format!(
+                "write response StructureSize {structure_size} != 17"
+            )));
+        }
+        let _reserved = r.read_u16()?;
+        let count = r.read_u32()?;
+        Ok(Self { count })
+    }
+}
+
+// ============================================================================
+// Close request/response — §2.2.14 / §2.2.15
+// ============================================================================
+
+/// SMB2 CLOSE request (command 0x0006). MS-SMB2 §2.2.14.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseRequest {
+    /// Flags (0x01 = PostQueryAttrib — response includes file metadata).
+    pub flags: u16,
+    /// FileId.
+    pub file_id: FileId,
+}
+
+impl CloseRequest {
+    /// Build a CLOSE request for `file_id` (no post-query-attrib).
+    #[must_use]
+    pub fn new(file_id: FileId) -> Self {
+        Self { flags: 0, file_id }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(24); // StructureSize
+        out.write_u16(self.flags);
+        out.write_u32(0); // Reserved
+        out.write_file_id(&self.file_id);
+    }
+
+    /// Encode the full SMB2 CLOSE request.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 24);
+        let mut hdr = Smb2Header::new_request(command::CLOSE, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 24 {
+            return Err(SmbError::Malformed("close request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 24 {
+            return Err(SmbError::Malformed(format!(
+                "close request StructureSize {structure_size} != 24"
+            )));
+        }
+        let flags = r.read_u16()?;
+        let _reserved = r.read_u32()?;
+        let file_id = r.read_file_id()?;
+        Ok(Self { flags, file_id })
+    }
+}
+
+/// SMB2 CLOSE response (command 0x0006). MS-SMB2 §2.2.15.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct CloseResponse {
+    /// Flags (echo of request flags).
+    pub flags: u16,
+    /// CreationTime (NT time).
+    pub creation_time: u64,
+    /// LastAccessTime (NT time).
+    pub last_access_time: u64,
+    /// LastWriteTime (NT time).
+    pub last_write_time: u64,
+    /// ChangeTime (NT time).
+    pub change_time: u64,
+    /// AllocationSize.
+    pub allocation_size: u64,
+    /// EndofFile (logical size).
+    pub end_of_file: u64,
+    /// FileAttributes.
+    pub file_attributes: u32,
+}
+
+impl CloseResponse {
+    /// Build an empty (no post-query-attrib) CLOSE response.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(60); // StructureSize
+        out.write_u16(self.flags);
+        out.write_u32(0); // Reserved
+        out.write_u64(self.creation_time);
+        out.write_u64(self.last_access_time);
+        out.write_u64(self.last_write_time);
+        out.write_u64(self.change_time);
+        out.write_u64(self.allocation_size);
+        out.write_u64(self.end_of_file);
+        out.write_u32(self.file_attributes);
+    }
+
+    /// Encode the full SMB2 CLOSE response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 60);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 60 {
+            return Err(SmbError::Malformed("close response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 60 {
+            return Err(SmbError::Malformed(format!(
+                "close response StructureSize {structure_size} != 60"
+            )));
+        }
+        let flags = r.read_u16()?;
+        let _reserved = r.read_u32()?;
+        let creation_time = r.read_u64()?;
+        let last_access_time = r.read_u64()?;
+        let last_write_time = r.read_u64()?;
+        let change_time = r.read_u64()?;
+        let allocation_size = r.read_u64()?;
+        let end_of_file = r.read_u64()?;
+        let file_attributes = r.read_u32()?;
+        Ok(Self {
+            flags,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            allocation_size,
+            end_of_file,
+            file_attributes,
+        })
+    }
+}
+
+// ============================================================================
+// Logoff / Echo — §2.2.2 / §2.2.3 and §2.2.28 / §2.2.29
+// ============================================================================
+
+/// SMB2 LOGOFF request (command 0x0002). MS-SMB2 §2.2.2.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LogoffRequest;
+
+impl LogoffRequest {
+    /// Encode the full SMB2 LOGOFF request.
+    pub fn encode(&self, message_id: u64, session_id: u64) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 4);
+        let mut hdr = Smb2Header::new_request(command::LOGOFF, message_id);
+        hdr.session_id = session_id;
+        hdr.encode(&mut out);
+        out.write_u16(4); // StructureSize
+        out.write_u16(0); // Reserved
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 4 {
+            return Err(SmbError::Malformed("logoff request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 4 {
+            return Err(SmbError::Malformed(format!(
+                "logoff request StructureSize {structure_size} != 4"
+            )));
+        }
+        Ok(Self)
+    }
+}
+
+/// SMB2 LOGOFF response (command 0x0002). MS-SMB2 §2.2.3.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LogoffResponse;
+
+impl LogoffResponse {
+    /// Encode the full SMB2 LOGOFF response.
+    pub fn encode(&self, request_header: &Smb2Header) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 4);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = ntstatus::STATUS_SUCCESS;
+        hdr.encode(&mut out);
+        out.write_u16(4);
+        out.write_u16(0);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 4 {
+            return Err(SmbError::Malformed("logoff response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 4 {
+            return Err(SmbError::Malformed(format!(
+                "logoff response StructureSize {structure_size} != 4"
+            )));
+        }
+        Ok(Self)
+    }
+}
+
+/// SMB2 ECHO request (command 0x000D). MS-SMB2 §2.2.28.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct EchoRequest;
+
+impl EchoRequest {
+    /// Encode the full SMB2 ECHO request.
+    pub fn encode(&self, message_id: u64) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 4);
+        let hdr = Smb2Header::new_request(command::ECHO, message_id);
+        hdr.encode(&mut out);
+        out.write_u16(4);
+        out.write_u16(0);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 4 {
+            return Err(SmbError::Malformed("echo request too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 4 {
+            return Err(SmbError::Malformed(format!(
+                "echo request StructureSize {structure_size} != 4"
+            )));
+        }
+        Ok(Self)
+    }
+}
+
+/// SMB2 ECHO response (command 0x000D). MS-SMB2 §2.2.29.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct EchoResponse;
+
+impl EchoResponse {
+    /// Encode the full SMB2 ECHO response.
+    pub fn encode(&self, request_header: &Smb2Header) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 4);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = ntstatus::STATUS_SUCCESS;
+        hdr.encode(&mut out);
+        out.write_u16(4);
+        out.write_u16(0);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 4 {
+            return Err(SmbError::Malformed("echo response too short".into()));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 4 {
+            return Err(SmbError::Malformed(format!(
+                "echo response StructureSize {structure_size} != 4"
+            )));
+        }
+        Ok(Self)
+    }
+}
+
+// ============================================================================
+// TransformHeader (encrypted PDU prefix) — §2.2.41
+// ============================================================================
+
+/// SMB2 Transform header (52-byte fixed prefix on encrypted PDUs). §2.2.41.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransformHeader {
+    /// Signature (16 bytes — top 16 bytes of the AEAD tag).
+    pub signature: [u8; 16],
+    /// Nonce (16 bytes — for AES-256-GCM the low 12 bytes are the nonce
+    /// and the high 4 bytes are reserved).
+    pub nonce: [u8; 16],
+    /// OriginalMessageSize (unencrypted PDU size, in bytes).
+    pub original_message_size: u32,
+    /// Flags (0x0001 = Encrypted).
+    pub flags: u16,
+    /// SessionId this encrypted PDU belongs to.
+    pub session_id: u64,
+}
+
+impl TransformHeader {
+    /// Build a fresh transform header with zeroed signature/nonce.
+    #[must_use]
+    pub fn new(original_message_size: u32, session_id: u64) -> Self {
+        Self {
+            signature: [0; 16],
+            nonce: [0; 16],
+            original_message_size,
+            flags: 0x0001,
+            session_id,
+        }
+    }
+
+    /// Encode to a 52-byte buffer.
+    pub fn encode(&self, out: &mut Writer) {
+        out.write_bytes(&SMB2_TRANSFORM_MAGIC);
+        out.write_bytes(&self.signature);
+        out.write_bytes(&self.nonce);
+        out.write_u32(self.original_message_size);
+        out.write_u16(0); // Reserved
+        out.write_u16(self.flags);
+        out.write_u64(self.session_id);
+    }
+
+    /// Decode from a 52+ byte buffer.
+    pub fn decode(buf: &[u8]) -> Result<Self, SmbError> {
+        if buf.len() < SMB2_TRANSFORM_HEADER_SIZE {
+            return Err(SmbError::Malformed(format!(
+                "transform header too short: {} < {SMB2_TRANSFORM_HEADER_SIZE}",
+                buf.len()
+            )));
+        }
+        if buf[0..4] != SMB2_TRANSFORM_MAGIC {
+            return Err(SmbError::Malformed(format!(
+                "bad transform magic: {:02x?}",
+                &buf[0..4]
+            )));
+        }
+        let mut r = Reader::at(buf, 4)?;
+        let signature = r.read_signature()?;
+        let nonce_bytes = r.read_bytes(16)?;
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(nonce_bytes);
+        let original_message_size = r.read_u32()?;
+        let _reserved = r.read_u16()?;
+        let flags = r.read_u16()?;
+        let session_id = r.read_u64()?;
+        Ok(Self {
+            signature,
+            nonce,
+            original_message_size,
+            flags,
+            session_id,
+        })
+    }
+}
+
+// ============================================================================
+// PreauthHash — SHA-512 chained pre-auth integrity hash per MS-SMB2 §3.2.5.1
+// ============================================================================
+
+/// SHA-512 pre-auth integrity hash, chained over Negotiate + SessionSetup
+/// messages per MS-SMB2 §3.2.5.1.
+///
+/// The initial hash value is 512 bits of zeros. For each message, the
+/// hash is updated as `SHA-512(prev_hash || message)`. The final hash
+/// value is mixed into the session-key derivation (HKDF-SHA-512 labeled
+/// `"SMBSigningKey"` / `"ServerIn"` / `"ServerOut"` per §3.2.5.2).
+#[derive(Debug, Clone)]
+pub struct PreauthHash {
+    state: [u8; 64],
+}
+
+impl Default for PreauthHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PreauthHash {
+    /// Construct a fresh preauth hash (initial value = 64 bytes of zeros).
+    #[must_use]
+    pub fn new() -> Self {
+        Self { state: [0u8; 64] }
+    }
+
+    /// Feed `data` into the hash chain. The new state is
+    /// `SHA-512(prev_state || data)`.
+    pub fn update(&mut self, data: &[u8]) {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update(self.state);
+        h.update(data);
+        let out = h.finalize();
+        self.state.copy_from_slice(&out);
+    }
+
+    /// Feed multiple byte slices in order (convenience for header+body).
+    pub fn update_all(&mut self, parts: &[&[u8]]) {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update(self.state);
+        for p in parts {
+            h.update(*p);
+        }
+        let out = h.finalize();
+        self.state.copy_from_slice(&out);
+    }
+
+    /// Snapshot the current hash value (does not consume self).
+    #[must_use]
+    pub fn current(&self) -> [u8; 64] {
+        self.state
+    }
+
+    /// Finalize: consume self and return the hash value.
+    #[must_use]
+    pub fn finalize(self) -> [u8; 64] {
+        self.state
+    }
+
+    /// One-shot: compute the preauth hash over the given messages
+    /// (typically `[negotiate_request, negotiate_response]`).
+    #[must_use]
+    pub fn compute(messages: &[&[u8]]) -> [u8; 64] {
+        let mut h = Self::new();
+        for m in messages {
+            h.update(m);
+        }
+        h.finalize()
+    }
+}
+
+// ============================================================================
+// NetBIOS Session Service framing — used by the transport
+// ============================================================================
+
+/// NetBIOS Session Service header: 1 byte type (0x00 = session message) +
+/// 3 bytes big-endian length. Used on TCP/445 for SMB2 message framing.
+pub mod netbios {
+    use super::SmbError;
+
+    /// Encode a NetBIOS Session Service frame: type=0x00, 3-byte big-endian
+    /// length, then `payload`.
+    pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        debug_assert!(len < 0x0100_0000, "netbios frame too large");
+        let mut out = Vec::with_capacity(4 + len);
+        out.push(0x00); // type = session message
+        out.push(((len >> 16) & 0xFF) as u8);
+        out.push(((len >> 8) & 0xFF) as u8);
+        out.push((len & 0xFF) as u8);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Decode the 4-byte NetBIOS header from `buf` and return
+    /// `(frame_type, payload_length)`. Returns `Ok(None)` if `buf` has
+    /// fewer than 4 bytes available (caller should read more).
+    pub fn peek_header(buf: &[u8]) -> Result<Option<(u8, usize)>, SmbError> {
+        if buf.len() < 4 {
+            return Ok(None);
+        }
+        let frame_type = buf[0];
+        let length = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
+        Ok(Some((frame_type, length)))
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ---- SMB2 header round-trip ----
+
+    #[test]
+    fn smb2_header_request_round_trips() {
+        let hdr = Smb2Header {
+            credit_charge: 1,
+            status: 0,
+            command: command::NEGOTIATE,
+            credits: 31,
+            flags: 0,
+            next_command: 0,
+            message_id: 42,
+            process_id: 0xDEAD_BEEF,
+            tree_id: 0,
+            session_id: 0,
+            signature: [0; 16],
+        };
+        let mut out = Writer::new();
+        hdr.encode(&mut out);
+        assert_eq!(out.position(), 64);
+        let decoded = Smb2Header::decode(out.as_bytes()).expect("decode header");
+        assert_eq!(decoded, hdr);
+    }
+
+    #[test]
+    fn smb2_header_response_round_trips_with_status_and_signature() {
+        let mut sig = [0u8; 16];
+        for (i, b) in sig.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7);
+        }
+        let hdr = Smb2Header {
+            credit_charge: 2,
+            status: ntstatus::STATUS_ACCESS_DENIED,
+            command: command::READ,
+            credits: 1,
+            flags: flags::SMB2_FLAGS_RESPONSE | flags::SMB2_FLAGS_SIGNED,
+            next_command: 0,
+            message_id: 0xCAFE_BABE,
+            process_id: 1,
+            tree_id: 7,
+            session_id: 0x1234_5678_9ABC_DEF0,
+            signature: sig,
+        };
+        let mut out = Writer::new();
+        hdr.encode(&mut out);
+        assert_eq!(out.position(), 64);
+        let decoded = Smb2Header::decode(out.as_bytes()).expect("decode header");
+        assert_eq!(decoded, hdr);
+        assert!(decoded.is_response());
+        assert!(decoded.is_signed());
+    }
+
+    #[test]
+    fn smb2_header_decode_rejects_short_buffer() {
+        let buf = [0u8; 32];
+        let err = Smb2Header::decode(&buf).expect_err("should reject short");
+        assert!(matches!(err, SmbError::Malformed(_)));
+    }
+
+    #[test]
+    fn smb2_header_decode_rejects_bad_magic() {
+        let mut out = Writer::new();
+        out.write_bytes(&[0xAA, 0xBB, 0xCC, 0xDD]); // bad magic
+        out.write_u16(64);
+        out.write_bytes(&[0u8; 58]);
+        let err = Smb2Header::decode(out.as_bytes()).expect_err("should reject bad magic");
+        assert!(matches!(err, SmbError::Malformed(_)));
+    }
+
+    #[test]
+    fn smb2_header_decode_refuses_smb1_magic() {
+        // Per ADR-043 — SMB1 magic must surface Smb1Refused so the server
+        // can reply with STATUS_INVALID_PARAMETER and close the connection.
+        let mut out = Writer::new();
+        out.write_bytes(&SMB1_MAGIC);
+        out.write_u16(64);
+        out.write_bytes(&[0u8; 58]);
+        let err = Smb2Header::decode(out.as_bytes()).expect_err("should refuse SMB1");
+        assert!(matches!(err, SmbError::Smb1Refused), "got {err:?}");
+    }
+
+    // ---- Negotiate round-trip ----
+
+    #[test]
+    fn negotiate_request_round_trips_with_311_contexts() {
+        let client_guid = uuid::Uuid::from_u128(0xABCD_1234_5678_0000_0000_0000_0000_0001);
+        let salt = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
+        let req = NegotiateRequest::new_311(client_guid, &salt);
+        let bytes = req.encode(1);
+        // Header magic + StructureSize.
+        assert_eq!(&bytes[0..4], &SMB2_MAGIC);
+        let decoded = NegotiateRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+        // 3 contexts: preauth integrity, encryption, signing.
+        assert_eq!(decoded.negotiate_contexts.len(), 3);
+    }
+
+    #[test]
+    fn negotiate_response_round_trips_with_311_contexts() {
+        let server_guid = uuid::Uuid::from_u128(0x9999_9999_9999_9999_9999_9999_9999_9999);
+        let salt = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        let resp = NegotiateResponse::new_311(server_guid, &salt);
+        let req_hdr = Smb2Header::new_request(command::NEGOTIATE, 1);
+        let bytes = resp.encode(&req_hdr);
+        assert_eq!(&bytes[0..4], &SMB2_MAGIC);
+        let decoded = NegotiateResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+        assert_eq!(decoded.dialect_revision, dialect_code::SMB311);
+    }
+
+    #[test]
+    fn negotiate_context_preauth_integrity_round_trips() {
+        let salt = [0x11u8; 32];
+        let ctx = NegotiateContext::preauth_integrity(&[preauth_hash_algo::SHA512], &salt);
+        let (algos, decoded_salt) = ctx.parse_preauth().expect("parse preauth");
+        assert_eq!(algos, vec![preauth_hash_algo::SHA512]);
+        assert_eq!(decoded_salt, salt.to_vec());
+    }
+
+    #[test]
+    fn negotiate_context_encryption_round_trips() {
+        let ctx = NegotiateContext::encryption(&[cipher::AES_256_GCM, cipher::AES_128_GCM]);
+        let ciphers = ctx.parse_encryption().expect("parse encryption");
+        assert_eq!(ciphers, vec![cipher::AES_256_GCM, cipher::AES_128_GCM]);
+    }
+
+    // ---- SessionSetup round-trip ----
+
+    #[test]
+    fn session_setup_round_trips_with_spnego_blob() {
+        let blob = vec![0x60, 0x06, 0x06, 0x02, 0x2A, 0x03, 0x01, 0x00]; // dummy SPNEGO
+        let req = SessionSetupRequest::new(blob.clone());
+        let bytes = req.encode(1, 0xABCD_1234);
+        let decoded = SessionSetupRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode");
+        assert_eq!(decoded, req);
+        assert_eq!(decoded.security_buffer, blob);
+    }
+
+    #[test]
+    fn session_setup_response_round_trips() {
+        let resp = SessionSetupResponse::new_success();
+        let req_hdr = Smb2Header::new_request(command::SESSION_SETUP, 1);
+        let bytes = resp.encode(&req_hdr, ntstatus::STATUS_SUCCESS);
+        let decoded = SessionSetupResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode");
+        assert_eq!(decoded, resp);
+    }
+
+    // ---- TreeConnect round-trip ----
+
+    #[test]
+    fn tree_connect_round_trips_with_unc_path() {
+        let path = r"\dc01\sysvol".to_string();
+        let req = TreeConnectRequest::new(path.clone());
+        let bytes = req.encode(2, 0xCAFE);
+        let decoded = TreeConnectRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode");
+        assert_eq!(decoded, req);
+        assert_eq!(decoded.path, path);
+    }
+
+    #[test]
+    fn tree_connect_response_round_trips_disk_share() {
+        let resp = TreeConnectResponse::new_disk();
+        let req_hdr = Smb2Header::new_request(command::TREE_CONNECT, 2);
+        let bytes = resp.encode(&req_hdr, 7, ntstatus::STATUS_SUCCESS);
+        let decoded = TreeConnectResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode");
+        assert_eq!(decoded, resp);
+        assert_eq!(decoded.share_type, share_type::DISK);
+    }
+
+    // ---- Create / Read / Write / Close round-trip ----
+
+    #[test]
+    fn create_request_response_round_trips() {
+        let req = CreateRequest::new(r"\share\file.txt");
+        let bytes = req.encode(3, 0x100, 7);
+        let decoded = CreateRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+
+        let file_id = FileId::new(0xAAAA_BBBB_CCCC_DDDD, 0x1111_2222_3333_4444);
+        let resp = CreateResponse::new(file_id, 4096);
+        let req_hdr = Smb2Header::new_request(command::CREATE, 3);
+        let bytes = resp.encode(&req_hdr, ntstatus::STATUS_SUCCESS);
+        let decoded = CreateResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+        assert_eq!(decoded.file_id, file_id);
+    }
+
+    #[test]
+    fn read_request_response_round_trips() {
+        let file_id = FileId::new(1, 2);
+        let req = ReadRequest::new(file_id, 1024, 4096);
+        let bytes = req.encode(4, 0x100, 7);
+        let decoded = ReadRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+
+        let data = vec![0xABu8; 4096];
+        let resp = ReadResponse::new(data.clone());
+        let req_hdr = Smb2Header::new_request(command::READ, 4);
+        let bytes = resp.encode(&req_hdr, ntstatus::STATUS_SUCCESS);
+        let decoded = ReadResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+        assert_eq!(decoded.data, data);
+    }
+
+    #[test]
+    fn write_request_response_round_trips() {
+        let file_id = FileId::new(3, 4);
+        let data = vec![0xCDu8; 1234];
+        let req = WriteRequest::new(file_id, 0, data.clone());
+        let bytes = req.encode(5, 0x100, 7);
+        let decoded = WriteRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+        assert_eq!(decoded.data, data);
+
+        let resp = WriteResponse::new(1234);
+        let req_hdr = Smb2Header::new_request(command::WRITE, 5);
+        let bytes = resp.encode(&req_hdr, ntstatus::STATUS_SUCCESS);
+        let decoded = WriteResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn close_request_response_round_trips() {
+        let file_id = FileId::new(5, 6);
+        let req = CloseRequest::new(file_id);
+        let bytes = req.encode(6, 0x100, 7);
+        let decoded = CloseRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+
+        let resp = CloseResponse::new();
+        let req_hdr = Smb2Header::new_request(command::CLOSE, 6);
+        let bytes = resp.encode(&req_hdr, ntstatus::STATUS_SUCCESS);
+        let decoded = CloseResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+    }
+
+    // ---- Logoff / Echo round-trip ----
+
+    #[test]
+    fn logoff_round_trips() {
+        let req = LogoffRequest;
+        let bytes = req.encode(7, 0xDEAD_BEEF);
+        let decoded = LogoffRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+
+        let req_hdr = Smb2Header::new_request(command::LOGOFF, 7);
+        let resp = LogoffResponse;
+        let bytes = resp.encode(&req_hdr);
+        let decoded = LogoffResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn echo_round_trips() {
+        let req = EchoRequest;
+        let bytes = req.encode(8);
+        let decoded = EchoRequest::decode(&bytes, SMB2_HEADER_SIZE).expect("decode req");
+        assert_eq!(decoded, req);
+
+        let req_hdr = Smb2Header::new_request(command::ECHO, 8);
+        let resp = EchoResponse;
+        let bytes = resp.encode(&req_hdr);
+        let decoded = EchoResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode resp");
+        assert_eq!(decoded, resp);
+    }
+
+    // ---- Preauth integrity SHA-512 ----
+
+    #[test]
+    fn preauth_hash_chains_sha512_correctly() {
+        // MS-SMB2 §3.2.5.1: H_0 = 0^512 ; H_{i+1} = SHA-512(H_i || msg_i)
+        // Verify against the canonical first step:
+        //   H_1 = SHA-512(0^512 || b"hello")
+        use sha2::{Digest, Sha512};
+        let mut h1 = Sha512::new();
+        h1.update([0u8; 64]);
+        h1.update(b"hello");
+        let expected = h1.finalize();
+
+        let mut p = PreauthHash::new();
+        p.update(b"hello");
+        assert_eq!(p.current(), expected.as_slice());
+    }
+
+    #[test]
+    fn preauth_hash_two_step_chain_matches_one_shot() {
+        let mut p = PreauthHash::new();
+        p.update(b"negotiate-request-bytes");
+        p.update(b"negotiate-response-bytes");
+        let chained = p.finalize();
+
+        let one_shot = PreauthHash::compute(&[
+            b"negotiate-request-bytes" as &[u8],
+            b"negotiate-response-bytes" as &[u8],
+        ]);
+        assert_eq!(chained.as_slice(), one_shot.as_slice());
+    }
+
+    // ---- Transform header round-trip ----
+
+    #[test]
+    fn transform_header_round_trips() {
+        let mut sig = [0u8; 16];
+        for (i, b) in sig.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut nonce = [0u8; 16];
+        for (i, b) in nonce.iter_mut().enumerate() {
+            *b = 0xF0u8.wrapping_add(i as u8);
+        }
+        let hdr = TransformHeader {
+            signature: sig,
+            nonce,
+            original_message_size: 1234,
+            flags: 0x0001,
+            session_id: 0xABCD_1234,
+        };
+        let mut out = Writer::new();
+        hdr.encode(&mut out);
+        assert_eq!(out.position(), 52);
+        let decoded = TransformHeader::decode(out.as_bytes()).expect("decode");
+        assert_eq!(decoded, hdr);
+    }
+
+    // ---- SMB1 refused ----
+
+    #[test]
+    fn smb1_magic_is_detected_and_refused_at_header_decode() {
+        let mut out = Writer::new();
+        out.write_bytes(&SMB1_MAGIC);
+        out.write_u16(64);
+        out.write_bytes(&[0u8; 58]);
+        let err = Smb2Header::decode(out.as_bytes()).expect_err("must refuse");
+        assert!(matches!(err, SmbError::Smb1Refused), "got {err:?}");
+    }
+
+    // ---- NetBIOS framing ----
+
+    #[test]
+    fn netbios_frame_round_trips() {
+        let payload = vec![0xABu8; 100];
+        let frame = netbios::encode_frame(&payload);
+        assert_eq!(frame.len(), 4 + 100);
+        assert_eq!(frame[0], 0x00);
+        assert_eq!(&frame[4..], &payload);
+        let (frame_type, length) = netbios::peek_header(&frame)
+            .expect("peek")
+            .expect("some header");
+        assert_eq!(frame_type, 0x00);
+        assert_eq!(length, 100);
+    }
+
+    #[test]
+    fn netbios_peek_header_returns_none_for_short_buffer() {
+        let buf = [0u8; 2];
+        let result = netbios::peek_header(&buf).expect("ok");
+        assert!(result.is_none());
+    }
+
+    // ---- UTF-16LE helpers ----
+
+    #[test]
+    fn utf16le_round_trips_ascii() {
+        let s = r"\server\share\file.txt";
+        let bytes = encode_utf16le(s);
+        let decoded = decode_utf16le(&bytes);
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn utf16le_round_trips_non_ascii() {
+        let s = "héllo wörld 中文";
+        let bytes = encode_utf16le(s);
+        let decoded = decode_utf16le(&bytes);
+        assert_eq!(decoded, s);
+    }
+
+    // ---- Dialect / Command ----
+
+    #[test]
+    fn dialect_round_trips_through_wire_code() {
+        for d in [
+            Dialect::Smb202,
+            Dialect::Smb210,
+            Dialect::Smb300,
+            Dialect::Smb302,
+            Dialect::Smb311,
+        ] {
+            assert_eq!(Dialect::from_wire(d.to_wire()), Some(d));
+        }
+        assert_eq!(Dialect::from_wire(0xFFFF), None);
+    }
+
+    #[test]
+    fn command_round_trips_through_wire_code() {
+        for c in [
+            Command::Negotiate,
+            Command::SessionSetup,
+            Command::Logoff,
+            Command::TreeConnect,
+            Command::TreeDisconnect,
+            Command::Create,
+            Command::Close,
+            Command::Read,
+            Command::Write,
+            Command::Echo,
+            Command::Transform,
+        ] {
+            assert_eq!(Command::from_wire(c.to_wire()), Some(c));
+        }
+        assert_eq!(Command::from_wire(0xFFFF), None);
+    }
+
+    // ---- Existing public API contracts ----
+
     #[test]
     fn dialect_equality_and_distinctness() {
-        // Per ADR-043: SMB 3.1.1 is the default dialect. Dialects must be
-        // PartialEq/Eq so negotiate responses can match the highest common
-        // dialect.
         assert_eq!(Dialect::Smb311, Dialect::Smb311);
         assert_ne!(Dialect::Smb311, Dialect::Smb302);
         assert_ne!(Dialect::Smb202, Dialect::Smb311);
@@ -77,7 +3048,6 @@ mod tests {
 
     #[test]
     fn dialect_variants_cover_minimum_and_default() {
-        // Per ADR-043: SMB 2.0.2 minimum (Smb202), 3.1.1 default (Smb311).
         let all = [
             Dialect::Smb202,
             Dialect::Smb210,
@@ -85,18 +3055,15 @@ mod tests {
             Dialect::Smb302,
             Dialect::Smb311,
         ];
-        // Distinct pairwise — no two variants compare equal.
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
-                assert_ne!(all[i], all[j], "variants {} and {} collide", i, j);
+                assert_ne!(all[i], all[j], "variants {i} and {j} collide");
             }
         }
     }
 
     #[test]
     fn command_values_match_ms_smb2() {
-        // Per MS-SMB2 §2.2.1.1 (Command field). Sanity-check the
-        // repr(u16) values so wire codecs stay stable across releases.
         assert_eq!(Command::Negotiate as u16, 0x0000);
         assert_eq!(Command::SessionSetup as u16, 0x0001);
         assert_eq!(Command::TreeConnect as u16, 0x0003);
@@ -112,76 +3079,35 @@ mod tests {
     fn smb_error_malformed_display() {
         let err = SmbError::Malformed("short header".into());
         let msg = format!("{}", err);
-        assert!(msg.contains("malformed"), "msg={}", msg);
-        assert!(msg.contains("short header"), "msg={}", msg);
+        assert!(msg.contains("malformed"));
+        assert!(msg.contains("short header"));
     }
 
     #[test]
     fn smb_error_status_display_hex() {
-        // Per MS-SMB2 §2.2.1.4 — NT status codes are printed in hex.
-        let err = SmbError::Status(0xC000_0022); // STATUS_ACCESS_DENIED
+        let err = SmbError::Status(0xC000_0022);
         let msg = format!("{}", err);
-        assert!(msg.contains("status:"), "msg={}", msg);
-        assert!(msg.contains("0xc0000022"), "msg={}", msg);
+        assert!(msg.contains("status:"));
+        assert!(msg.contains("0xc0000022"));
     }
 
     #[test]
     fn smb_error_dialect_unsupported_display() {
         let err = SmbError::DialectUnsupported;
+        assert_eq!(format!("{}", err), "dialect unsupported");
+    }
+
+    #[test]
+    fn smb_error_smb1_refused_display() {
+        let err = SmbError::Smb1Refused;
         let msg = format!("{}", err);
-        assert_eq!(msg, "dialect unsupported");
+        assert!(msg.contains("smb1 refused"));
     }
 
     #[test]
-    fn negotiate_request_construction() {
-        // A typical client offers SMB 3.0.2 and 3.1.1; the server picks the
-        // highest dialect both support (per MS-SMB2 §3.3.5.4 / ADR-043).
-        let req = NegotiateRequest {
-            dialects: vec![Dialect::Smb302, Dialect::Smb311],
-        };
-        assert_eq!(req.dialects.len(), 2);
-        assert_eq!(req.dialects[1], Dialect::Smb311);
-    }
-
-    #[test]
-    fn negotiate_request_supports_legacy_only_offers() {
-        // Per ADR-043, SMB1 is dropped — but a client may still offer only
-        // SMB 2.0.2 (Smb202) and the server-side negotiate handler will
-        // accept it as the minimum supported dialect.
-        let req = NegotiateRequest {
-            dialects: vec![Dialect::Smb202],
-        };
-        assert_eq!(req.dialects, vec![Dialect::Smb202]);
-    }
-
-    #[test]
-    fn encode_negotiate_returns_malformed() {
-        // Wire codec is not yet implemented (TODO rasn-backed). Until then
-        // encode_negotiate MUST surface Malformed rather than Ok with empty
-        // bytes — clients must not mistake an empty payload for a valid
-        // NEGOTIATE message.
-        let req = NegotiateRequest {
-            dialects: vec![Dialect::Smb311],
-        };
-        let result = encode_negotiate(&req);
-        let err = result.expect_err("encode_negotiate should return Malformed");
-        assert!(matches!(err, SmbError::Malformed(_)), "{:?}", err);
-    }
-
-    #[test]
-    fn decode_negotiate_returns_malformed_for_empty_input() {
-        let result = decode_negotiate(&[]);
-        let err = result.expect_err("decode_negotiate should return Malformed");
-        assert!(matches!(err, SmbError::Malformed(_)), "{:?}", err);
-    }
-
-    #[test]
-    fn decode_negotiate_returns_malformed_for_arbitrary_bytes() {
-        // Even non-empty garbage bytes can't be decoded yet — the stub
-        // rejects all input with Malformed.
-        let bytes = [0xFE, 0x53, 0x4D, 0x42, 0x00, 0x00, 0x00, 0x00];
-        let result = decode_negotiate(&bytes);
-        let err = result.expect_err("decode_negotiate should return Malformed");
-        assert!(matches!(err, SmbError::Malformed(_)), "{:?}", err);
+    fn file_id_zero_predicate_works() {
+        assert!(FileId::ZERO.is_zero());
+        assert!(!FileId::new(1, 0).is_zero());
+        assert!(!FileId::new(0, 1).is_zero());
     }
 }

@@ -8,9 +8,11 @@ description = "SMB client — part of unified SDK (FileModule)"
 
 [dependencies]
 adrian-smb-core = { path = "../adrian-smb-core" }
-adrian-auth-core = { path = "../adrian-auth-core" }
 tokio.workspace = true
-rustls.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+adrian-smb-server = { path = "../adrian-smb-server" }
