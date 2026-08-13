@@ -77,3 +77,142 @@ pub async fn run() -> anyhow::Result<()> {
     // TODO: dispatch to adrian-sdk / adrian-migrate / adrian-gpo-translate
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `adrian-cli`. Per the task instructions these cover
+    //! CLI command structure (subcommand parsing + field propagation) and
+    //! the dispatch entry point — no real network join / Kerberos / GPO
+    //! translation is performed.
+
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parse_join_subcommand_populates_domain_and_user() {
+        // `adrian join --domain <d> --user <u>` — verifies the kebab-case
+        // `join` subcommand maps to `Command::Join` and the `--domain` /
+        // `--user` long options populate the struct variant fields.
+        let cli = Cli::try_parse_from([
+            "adrian",
+            "join",
+            "--domain",
+            "adrian.dev",
+            "--user",
+            "admin",
+        ])
+        .expect("join parse should succeed");
+        match cli.command {
+            Command::Join { domain, user } => {
+                assert_eq!(domain, "adrian.dev");
+                assert_eq!(user, "admin");
+            }
+            other => panic!("expected Command::Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_leaf_subcommands_without_args() {
+        // `Leave`, `Gpupdate`, `Klist` are unit variants — no flags. This
+        // guards the seam: if any of them accidentally gains a required
+        // arg in a later wave, parsing would fail and the test would break
+        // before the CLI ships.
+        for (argv, expected) in [
+            (vec!["adrian", "leave"], "leave"),
+            (vec!["adrian", "gpupdate"], "gpupdate"),
+            (vec!["adrian", "klist"], "klist"),
+        ] {
+            let cli = Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("parsing {expected} should succeed: {e}"));
+            let rendered = match cli.command {
+                Command::Join { .. } => "join",
+                Command::Leave => "leave",
+                Command::Gpupdate => "gpupdate",
+                Command::Klist => "klist",
+                Command::Kinit { .. } => "kinit",
+                Command::Migrate { .. } => "migrate",
+                Command::GpoTranslate { .. } => "gpo-translate",
+            };
+            assert_eq!(rendered, expected);
+        }
+    }
+
+    #[test]
+    fn parse_kinit_subcommand_populates_principal() {
+        let cli = Cli::try_parse_from(["adrian", "kinit", "--principal", "admin@ADRIAN.DEV"])
+            .expect("kinit parse should succeed");
+        match cli.command {
+            Command::Kinit { principal } => {
+                assert_eq!(principal, "admin@ADRIAN.DEV");
+            }
+            other => panic!("expected Command::Kinit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_migrate_subsubcommand_routes_to_migratesub() {
+        // `adrian migrate <sub>` — verifies the nested `#[command(subcommand)]`
+        // on `Command::Migrate` parses each `MigrateSub` variant and that
+        // clap's auto-kebab-casing (`audit-ntlm`, `plan-ntlm`) matches the
+        // documented CLI surface (ADR-086 / ADR-126 / ADR-129).
+        let cases: &[(&[&str], &str)] = &[
+            (&["adrian", "migrate", "audit-ntlm"], "audit-ntlm"),
+            (&["adrian", "migrate", "plan-ntlm"], "plan-ntlm"),
+            (&["adrian", "migrate", "sidhistory"], "sidhistory"),
+            (&["adrian", "migrate", "passwords"], "passwords"),
+        ];
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(*argv)
+                .unwrap_or_else(|e| panic!("parsing migrate {expected} should succeed: {e}"));
+            let sub = match cli.command {
+                Command::Migrate { subcommand } => subcommand,
+                other => panic!("expected Command::Migrate, got {other:?}"),
+            };
+            let rendered = match sub {
+                MigrateSub::AuditNtlm => "audit-ntlm",
+                MigrateSub::PlanNtlm => "plan-ntlm",
+                MigrateSub::Sidhistory => "sidhistory",
+                MigrateSub::Passwords => "passwords",
+            };
+            assert_eq!(rendered, *expected);
+        }
+    }
+
+    #[test]
+    fn parse_gpo_translate_subcommand_populates_source_and_out() {
+        // `adrian gpo-translate --source <s> --out <o>` — ADR-127 surface.
+        let cli = Cli::try_parse_from([
+            "adrian",
+            "gpo-translate",
+            "--source",
+            "GPO_IN",
+            "--out",
+            "policy.json",
+        ])
+        .expect("gpo-translate parse should succeed");
+        match cli.command {
+            Command::GpoTranslate { source, out } => {
+                assert_eq!(source, "GPO_IN");
+                assert_eq!(out, "policy.json");
+            }
+            other => panic!("expected Command::GpoTranslate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_missing_required_join_args() {
+        // `adrian join` without `--domain` / `--user` must surface a clap
+        // error (not panic, not silently succeed). This guards the seam so
+        // that a future refactor that drops `required = true` semantics
+        // fails loudly before shipping.
+        let result = Cli::try_parse_from(["adrian", "join"]);
+        assert!(result.is_err(), "join without args should error");
+        let err = result.unwrap_err();
+        assert!(
+            err.kind() == clap::error::ErrorKind::MissingRequiredArgument,
+            "expected MissingRequiredArgument, got {:?}",
+            err.kind()
+        );
+    }
+}
