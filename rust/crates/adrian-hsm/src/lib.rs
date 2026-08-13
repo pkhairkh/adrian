@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
 pub enum HsmError {
@@ -166,7 +167,14 @@ struct KeyEntry {
     key_type: KeyType,
     /// Raw key material. NEVER leaves the `SoftwareHsm` except via the
     /// `sign`/`verify`/`encrypt`/`decrypt` operations.
-    material: Vec<u8>,
+    ///
+    /// Wrapped in `Zeroizing<Vec<u8>>` so that the heap buffer is securely
+    /// zeroed when this entry is dropped (e.g. during `rotate_key` or HSM
+    /// teardown). Per EVALUATION.md P0 #7 / ADR-015: key material must not
+    /// persist in memory after the owning handle is dropped. Compare with
+    /// `adrian-ntlm-client`'s correct use of `Zeroizing<[u8; 16]>` for NT
+    /// hashes.
+    material: Zeroizing<Vec<u8>>,
     version: u32,
 }
 
@@ -285,13 +293,29 @@ impl Hsm for SoftwareHsm {
                 "RSA-2048 not implemented in SoftwareHsm (use hsm feature + PKCS#11)".into(),
             ));
         }
-        let material = Self::random_bytes(Self::key_len(key_type))?;
+        let mut keys = self.keys.write().await;
+        // Idempotent: if a key with the given `key_id` already exists, return
+        // the existing handle WITHOUT regenerating or overwriting material.
+        // This is critical for callers like `handle_kpasswd` (adrian-kdc
+        // kpasswd.rs) which call `generate_key("krbtgt-mac", ...)` on every
+        // request — a destructive overwrite would invalidate the
+        // pre-seeded/test-time MAC key and cause spurious bad_integrity
+        // failures. For explicit replacement, callers MUST use `rotate_key`
+        // (which is the documented destructive path).
+        // (Fixes EVALUATION.md P0 #8 / wave1c-auth-crypto.md Bug 3.)
+        if let Some(existing) = keys.get(key_id) {
+            return Ok(KeyHandle {
+                id: key_id.to_string(),
+                version: existing.version,
+                key_type: existing.key_type,
+            });
+        }
+        let material = Zeroizing::new(Self::random_bytes(Self::key_len(key_type))?);
         let entry = KeyEntry {
             key_type,
             material,
             version: 1,
         };
-        let mut keys = self.keys.write().await;
         keys.insert(key_id.to_string(), entry);
         Ok(KeyHandle {
             id: key_id.to_string(),
@@ -315,7 +339,7 @@ impl Hsm for SoftwareHsm {
             )));
         }
         match entry.key_type {
-            KeyType::HmacSha1 => Self::hmac_sha1_96(&entry.material, data),
+            KeyType::HmacSha1 => Self::hmac_sha1_96(entry.material.as_slice(), data),
             KeyType::Aes256 => Err(HsmError::Unsupported(
                 "Aes256 keys cannot sign (use encrypt/decrypt)".into(),
             )),
@@ -357,7 +381,7 @@ impl Hsm for SoftwareHsm {
             )));
         }
         match entry.key_type {
-            KeyType::Aes256 => Self::aes_256_gcm_encrypt(&entry.material, plaintext),
+            KeyType::Aes256 => Self::aes_256_gcm_encrypt(entry.material.as_slice(), plaintext),
             KeyType::HmacSha1 => Err(HsmError::Unsupported(
                 "HmacSha1 keys cannot encrypt (use sign/verify)".into(),
             )),
@@ -383,7 +407,7 @@ impl Hsm for SoftwareHsm {
             )));
         }
         match entry.key_type {
-            KeyType::Aes256 => Self::aes_256_gcm_decrypt(&entry.material, ciphertext),
+            KeyType::Aes256 => Self::aes_256_gcm_decrypt(entry.material.as_slice(), ciphertext),
             KeyType::HmacSha1 => Err(HsmError::Unsupported(
                 "HmacSha1 keys cannot decrypt (use sign/verify)".into(),
             )),
@@ -403,7 +427,11 @@ impl Hsm for SoftwareHsm {
                 "RSA-2048 not implemented in SoftwareHsm".into(),
             ));
         }
-        let new_material = Self::random_bytes(Self::key_len(entry.key_type))?;
+        let new_material = Zeroizing::new(Self::random_bytes(Self::key_len(entry.key_type))?);
+        // Re-assigning into `Zeroizing<Vec<u8>>` drops the OLD
+        // `Zeroizing<Vec<u8>>`, which securely zeroes the previous key
+        // material in place — this is the crypto-hygiene benefit of the
+        // wrapper (EVALUATION.md P0 #7).
         entry.material = new_material;
         entry.version = entry.version.saturating_add(1);
         Ok(KeyHandle {
@@ -646,5 +674,122 @@ mod tests {
         assert_eq!(s1.len(), 12);
         assert_eq!(s2.len(), 12);
         assert_ne!(s1, s2, "distinct keys must produce distinct signatures");
+    }
+
+    // ===== Wave 1c: idempotent generate_key + zeroize tests (P0 #7, #8) =====
+
+    /// Calling `generate_key` twice with the same `key_id` MUST return the
+    /// same `KeyHandle` (same `version`, same `key_type`) and MUST NOT
+    /// overwrite the underlying key material. We verify the no-overwrite
+    /// property by signing under the first handle and verifying with the
+    /// second handle — if the material had been regenerated, verification
+    /// would fail.
+    ///
+    /// This is the regression test for the destructive `generate_key` bug
+    /// (EVALUATION.md P0 #8 / wave1c-auth-crypto.md Bug 3) that was the
+    /// root cause of the kpasswd `bad_integrity` test failures: the kpasswd
+    /// handler called `generate_key("krbtgt-mac", ...)` on every request,
+    /// clobbering the pre-seeded MAC key.
+    #[tokio::test]
+    async fn generate_key_is_idempotent() {
+        let hsm = SoftwareHsm::new();
+        let kh1 = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .expect("first generate_key");
+        assert_eq!(kh1.version, 1);
+
+        // Second call MUST return the same handle (same version, same type).
+        let kh2 = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .expect("second generate_key");
+        assert_eq!(kh1, kh2, "second generate_key must return identical handle");
+
+        // Prove the underlying material was NOT regenerated: a signature
+        // produced under kh1 must verify under kh2.
+        let data = b"the quick brown fox";
+        let sig = hsm.sign(&kh1, data).await.expect("sign under kh1");
+        assert!(
+            hsm.verify(&kh2, data, &sig)
+                .await
+                .expect("verify under kh2"),
+            "idempotent generate_key must preserve key material"
+        );
+    }
+
+    /// `rotate_key` is the explicit destructive path: it MUST bump the
+    /// version and MUST replace the key material (old signatures do NOT
+    /// verify under the new handle — golden-ticket-rotation property from
+    /// ADR-015). This test pins the contract that `rotate_key` (not
+    /// `generate_key`) is the way callers request replacement.
+    #[tokio::test]
+    async fn rotate_key_changes_version_and_replaces_material() {
+        let hsm = SoftwareHsm::new();
+        let kh1 = hsm
+            .generate_key("kds-root", KeyType::HmacSha1)
+            .await
+            .expect("generate_key");
+        assert_eq!(kh1.version, 1);
+
+        let data = b"payload";
+        let sig_v1 = hsm.sign(&kh1, data).await.expect("sign under v1");
+
+        let kh2 = hsm.rotate_key("kds-root").await.expect("rotate_key");
+        assert_eq!(kh2.id, "kds-root");
+        assert_eq!(kh2.version, 2, "rotate_key MUST increment version");
+        assert_eq!(kh2.key_type, KeyType::HmacSha1);
+
+        // The old signature MUST NOT verify under the new key handle —
+        // this proves the material was replaced (not just version bumped).
+        let verify_res = hsm.verify(&kh2, data, &sig_v1).await.expect("verify call");
+        assert!(
+            !verify_res,
+            "rotate_key MUST replace material so old signatures no longer verify"
+        );
+
+        // And the new handle must produce+verify fresh signatures.
+        let sig_v2 = hsm.sign(&kh2, data).await.expect("sign under v2");
+        assert!(
+            hsm.verify(&kh2, data, &sig_v2).await.expect("verify v2"),
+            "v2 signature must verify under v2"
+        );
+
+        // Subsequent `rotate_key` calls MUST keep bumping.
+        let kh3 = hsm.rotate_key("kds-root").await.expect("rotate_key again");
+        assert_eq!(kh3.version, 3, "rotate_key MUST keep incrementing version");
+    }
+
+    /// `KeyEntry.material` is wrapped in `Zeroizing<Vec<u8>>` (P0 #7).
+    /// We cannot directly observe the zeroization of a dropped buffer
+    /// without `unsafe` (which this crate forbids), but we CAN pin the
+    /// type-level contract: constructing a `KeyEntry`, dropping it, and
+    /// re-binding the name does not panic, and the type checks confirm the
+    /// wrapper is in use. This guards against silent regressions where a
+    /// future refactor removes `Zeroizing`.
+    #[test]
+    fn key_entry_material_is_zeroizing() {
+        // Type-level assertion: `material` MUST be `Zeroizing<Vec<u8>>`.
+        // If a future refactor changes it back to `Vec<u8>`, this line
+        // fails to compile, surfacing the crypto-hygiene regression.
+        fn _assert_material_is_zeroizing(_m: &Zeroizing<Vec<u8>>) {}
+        let entry = KeyEntry {
+            key_type: KeyType::HmacSha1,
+            material: Zeroizing::new(vec![0u8; 20]),
+            version: 1,
+        };
+        _assert_material_is_zeroizing(&entry.material);
+
+        // The wrapper derefs to `&[u8]` so crypto helpers can read the key.
+        // (This is the same access pattern used by `sign`/`encrypt`/`decrypt`.)
+        let slice: &[u8] = entry.material.as_slice();
+        assert_eq!(slice.len(), 20);
+
+        // Dropping the entry runs `Zeroizing::drop`, which calls
+        // `zeroize()` on the inner `Vec<u8>` buffer. We can't observe the
+        // zeroed bytes here without `unsafe` (the buffer is freed by the
+        // time control returns), but the type system guarantees the drop
+        // impl runs.
+        drop(entry);
     }
 }
