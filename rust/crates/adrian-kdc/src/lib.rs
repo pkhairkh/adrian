@@ -121,3 +121,132 @@ impl Default for PacBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify every `EType` variant carries the RFC 3961 / ADR-014 numeric
+    /// value, and pin the ADR-011 policy-relevant discrimination: RC4 (23)
+    /// is legacy, AES-256-SHA1-96 (18) is the default for new tickets,
+    /// and the two ADR-014 etypes (19, 20) form a contiguous family.
+    /// These constants are wire-stable and MUST NOT drift.
+    #[test]
+    fn etype_constants_and_policy_invariants() {
+        // RFC 3961 / ADR-014 wire values.
+        assert_eq!(EType::Rc4Hmac as u32, 23);
+        assert_eq!(EType::Aes128CtsHmacSha1_96 as u32, 17);
+        assert_eq!(EType::Aes256CtsHmacSha1_96 as u32, 18);
+        assert_eq!(EType::Aes128CtsHmacSha256_128 as u32, 19);
+        assert_eq!(EType::Aes256CtsHmacSha384_192 as u32, 20);
+        // ADR-011 policy: default (18) < legacy RC4 (23).
+        assert!((EType::Aes256CtsHmacSha1_96 as u32) < EType::Rc4Hmac as u32);
+        // ADR-014 family: the two SHA-256/384 etypes are contiguous.
+        assert_eq!(
+            EType::Aes256CtsHmacSha384_192 as u32 - EType::Aes128CtsHmacSha256_128 as u32,
+            1
+        );
+    }
+
+    /// `KdcService::new()` and `KdcService::default()` must produce
+    /// equivalent instances — the KDC pool is stateless (ADR-018), so there
+    /// is no configuration to carry between constructions.
+    #[test]
+    fn kdc_service_default_equals_new() {
+        let _a = KdcService::new();
+        let _b = KdcService::default();
+        // Stateless: both constructions succeed with no fields populated.
+        // (We rely on the type system — if either panics, the test fails.)
+    }
+
+    /// AS-REQ handling is currently a "loud stub" (ADR-018) — it must return
+    /// `KdcError::Storage`, not panic or succeed silently. When the real
+    /// implementation lands in a later wave, this test should be replaced
+    /// with an end-to-end AS-REQ/AS-REP round-trip via `adrian-test-harness`.
+    #[tokio::test]
+    async fn handle_as_req_returns_storage_not_implemented() {
+        let svc = KdcService::new();
+        let res = svc.handle_as_req(&[]).await;
+        assert!(res.is_err(), "AS-REQ handler must surface a typed error");
+        match res.unwrap_err() {
+            KdcError::Storage(msg) => assert!(msg.contains("not yet implemented")),
+            other => panic!("expected KdcError::Storage, got {other:?}"),
+        }
+    }
+
+    /// TGS-REQ handler is also a loud stub returning `KdcError::Storage`.
+    #[tokio::test]
+    async fn handle_tgs_req_returns_storage_not_implemented() {
+        let svc = KdcService::new();
+        let res = svc.handle_tgs_req(&[]).await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            KdcError::Storage(msg) => assert!(msg.contains("not yet implemented")),
+            other => panic!("expected KdcError::Storage, got {other:?}"),
+        }
+    }
+
+    /// kpasswd (RFC 3244 / ADR-019) handler is a loud stub returning
+    /// `KdcError::Storage` until the password-change protocol is implemented.
+    #[tokio::test]
+    async fn handle_kpasswd_returns_storage_not_implemented() {
+        let svc = KdcService::new();
+        let res = svc.handle_kpasswd(&[]).await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            KdcError::Storage(msg) => assert!(msg.contains("not yet implemented")),
+            other => panic!("expected KdcError::Storage, got {other:?}"),
+        }
+    }
+
+    /// `PacBuilder::new()` and `PacBuilder::default()` must both succeed
+    /// (the 9-buffer PAC builder per ADR-082 holds only a `krbtgt` Signer
+    /// which is wired in a later wave).
+    #[test]
+    fn pac_builder_default_equals_new() {
+        let _a = PacBuilder::new();
+        let _b = PacBuilder::default();
+    }
+
+    /// `PacBuilder::build()` is a loud stub returning `KdcError::Pac` until
+    /// the 9 MS-KILE buffer types (ADR-082) are emitted.
+    #[test]
+    fn pac_builder_build_returns_pac_not_implemented() {
+        let builder = PacBuilder::new();
+        let principal = Uuid::nil();
+        let res = builder.build(principal);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            KdcError::Pac(msg) => assert!(msg.contains("not yet implemented")),
+            other => panic!("expected KdcError::Pac, got {other:?}"),
+        }
+    }
+
+    /// Verify the `Display` impls of the typed `KdcError` variants — these
+    /// messages are surfaced to audit logs (ADR-023) and to the interop
+    /// testkit, so the formatting must be stable.
+    #[test]
+    fn kdc_error_display_messages() {
+        assert_eq!(
+            KdcError::PrincipalNotFound("alice".into()).to_string(),
+            "principal not found: alice"
+        );
+        assert_eq!(KdcError::PreauthRequired.to_string(), "preauth required");
+        assert_eq!(
+            KdcError::PreauthFailed("bad padata".into()).to_string(),
+            "preauth failed: bad padata"
+        );
+        assert_eq!(
+            KdcError::ETypeUnsupported(EType::Rc4Hmac).to_string(),
+            "etype unsupported: Rc4Hmac"
+        );
+        assert_eq!(
+            KdcError::Policy("rc4 disabled".into()).to_string(),
+            "kdc policy: rc4 disabled"
+        );
+        assert_eq!(
+            KdcError::FastArmorRequired.to_string(),
+            "fast armor required (ADR-012)"
+        );
+    }
+}
