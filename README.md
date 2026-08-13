@@ -10,8 +10,12 @@ A research deliverable covering Microsoft Active Directory — its services, pro
 |------|----------|
 | [`docs/`](./docs/) | 72-file implementation-level knowledge base (AD overview, protocols, schema, GPO, PKI, federation, file/print, macOS/Linux equivalents, comparison matrices, code examples, references) |
 | [`catalog/`](./catalog/) | 16-file problem catalog (130 problems across 12 framework capabilities, 262 open research questions, cross-platform parity matrix) |
-| [`adr/`](./adr/) | 69 Architecture Decision Records covering high-confidence decisions for 69 of the 130 catalog problems (61 deferred pending Tier-1 ORQ resolution) |
-| [`draft/`](./draft/) | Rough draft synthesis document (executive summary, KB findings, problem catalog synthesis, prioritized research questions, roadmap) |
+| [`adr/`](./adr/) | 130 Architecture Decision Records — one ADR per catalog problem (69 original + 61 follow-up after workshop) |
+| [`workshop/`](./workshop/) | 12 Tier-1 ORQ resolution decisions + context briefing (resolves all 11 architectural ORQ clusters) |
+| [`finaldraft/`](./finaldraft/) | 7-section final draft synthesis (~32K words) — supersedes `draft/` as the definitive document |
+| [`specs/`](./specs/) | 12 per-capability technical specifications (crate structure, data model, protocol surface, configuration, testing) |
+| [`rust/`](./rust/) | Cargo workspace with 47 Rust crate stubs across 5 dependency layers (`cargo check` passes) |
+| [`draft/`](./draft/) | Rough draft synthesis (7 files, ~23K words) — superseded by `finaldraft/` |
 | [`scripts/`](./scripts/) | Working scripts and extraction artifacts |
 
 ## Audience

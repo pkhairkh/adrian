@@ -7,10 +7,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Planned
-- Resolution of the 11 Tier-1 open research questions (see `catalog/13-open-research-questions.md` and `draft/04-open-research-questions.md`)
-- Framework architecture proposal (successor deliverable to the problem catalog)
-- Per-capability design recommendations
-- Superseding ADRs for the 61 deferred problems once Tier-1 ORQs are resolved
+- Phase 1 MVP implementation (per `finaldraft/06-implementation-roadmap.md`)
+- Interop test lab setup (Windows Server 2022 + MIT krb5 + Samba)
+- Pilot customer recruitment
+- Per-crate implementation kickoff (starting with Layer 0-1 foundational crates)
+
+## [0.3.0] — 2026-08-13
+
+### Added — Workshop decisions, follow-up ADRs, final draft, Rust workspace, specs
+
+#### Workshop decisions (`workshop/`)
+
+- **`workshop/CONTEXT.md`** — context briefing for the Tier-1 ORQ resolution workshop (11 ORQ clusters, 61 deferred problems, 2-day agenda, 7 decision criteria)
+- **12 workshop decision documents** (`decision-01` through `decision-12`) resolving all 11 Tier-1 ORQ clusters:
+  1. Replication protocol (hybrid DRSUAPI + openraft)
+  2. Storage engine (FoundationDB 7.3.x)
+  3. Identity model (UUIDv7 + SID-as-attribute + mapping table)
+  4. Schema model (hybrid LDAP + typed Rust projection)
+  5. KDC implementation (fresh Rust KDC)
+  6. NTLM decision (drop server, client-only for legacy)
+  7. Policy format (hybrid declarative + ADMX compiler)
+  8. PKI enrollment (ACME primary + MS-WCCE bridge)
+  9. Federation layer (wrap Keycloak + Rust shim)
+  10. SMB server (fresh Rust SMB 3.1.1)
+  11. Client SDK (unified Rust core + platform bindings)
+  12. Linux tier strategy (SSSD primary + FreeIPA alternative)
+
+#### Follow-up ADRs (61 ADRs)
+
+- **ADR-070 through ADR-130** — 61 follow-up ADRs resolving all deferred problems. Every catalog problem (PC-001 through PC-130) now has an ADR.
+- **`adr/README.md`** updated to index all 130 ADRs
+- Total ADR count: **130** (69 original + 61 follow-up)
+- Total ADR words: **~313,688**
+
+#### Final draft synthesis (`finaldraft/`)
+
+- **`finaldraft/README.md`** — master index for 7-section final draft
+- **`01-executive-summary.md`** (~2,400 words) — headline findings, 12 architectural decisions, next steps
+- **`02-architecture-overview.md`** (~4,200 words) — architecture principles, 12 capabilities × Rust crates, dependency graph, storage/replication/identity/KDC/SDK/deployment/observability
+- **`03-capability-deep-dives.md`** (~5,900 words) — 12 capabilities × ~400 words each
+- **`04-rust-workspace-design.md`** (~3,900 words) — 47-crate workspace layout, 5-layer dependency hierarchy, key traits, error handling, async runtime, feature flags, testing, CI/CD
+- **`05-security-architecture.md`** (~3,700 words) — threat model, 8 STRIDE-classified mitigations, crypto policy, HSM integration
+- **`06-implementation-roadmap.md`** (~4,800 words) — 4-phase roadmap (MVP/v1/v2/v3), risks, success criteria, staffing
+- **`07-appendices.md`** (~6,000 words) — ADR index, workshop decisions, Rust crate inventory, external dependencies, glossary
+- Supersedes `draft/` as the definitive synthesis
+
+#### Rust workspace (`rust/`)
+
+- **Cargo workspace** with 47 member crates across 5 dependency layers:
+  - Layer 0 (foundation): `adrian-storage-core`, `adrian-sid`, `adrian-schema-traits`
+  - Layer 1 (abstraction): `adrian-storage-fdb`, `adrian-identity-core`, `adrian-repl-core`
+  - Layer 2 (domain): `adrian-drsuapi`, `adrian-raft`, `adrian-directory-service`, `adrian-identity-fdb`, `adrian-identity-ridpool`, `adrian-schema-compiler`, `adrian-dcerpc`, `adrian-smb-core`, `adrian-pac-validator`, `adrian-hsm`
+  - Layer 3 (services): `adrian-kdc`, `adrian-kdc-interop`, `adrian-ntlm-client`, `adrian-auth-core`, `adrian-policy-core`, `adrian-policy-executor`, `adrian-policy-cel`, `adrian-policy-preg`, `adrian-admx-compiler`, `adrian-ca`, `adrian-acme-server`, `adrian-wcce-bridge`, `adrian-federation-shim`, `adrian-claims-engine`, `adrian-smb-server`, `adrian-smb-client`, `adrian-print-service`, `adrian-sdk`, `adrian-sdk-c`, `adrian-sdk-jni`, `adrian-sdk-swift`, `adrian-sdk-python`
+  - Layer 4 (ops): `adrian-operator`, `adrian-cli`, `adrian-monitor`, `adrian-migrate`, `adrian-gpo-translate`
+  - Test kits: `adrian-test-harness`, `adrian-storage-testkit`, `adrian-repl-testkit`, `adrian-identity-testkit`
+- Each crate has `Cargo.toml` (workspace deps) + `src/lib.rs` (trait definitions, struct stubs, ADR citations)
+- **`cargo check` passes** on the entire workspace
+- Rust toolchain: `rustc 1.97.1` (latest stable)
+
+#### Per-capability specifications (`specs/`)
+
+- **12 specification documents** (`01-core-directory.md` through `12-migration.md`) + `README.md`
+- Each spec covers: crate structure, key types/traits, data model (FDB subspace layout), protocol surface, configuration (TOML), error handling, testing strategy, implementation phases (MVP/v1/v2), dependencies, references
+- ~350K bytes total across 12 specs
+
+### Changed
+
+- `adr/README.md` regenerated to index all 130 ADRs (was 69)
+- Top-level `README.md` updated to include `workshop/`, `finaldraft/`, `rust/`, and `specs/` directories
 
 ## [0.2.0] — 2026-08-13
 

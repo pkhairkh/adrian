@@ -12,7 +12,7 @@ last_updated: 2026-08-13
 
 # ADR Index — Architecture Decision Records
 
-This directory contains 69 Architecture Decision Records (ADRs) documenting high-confidence decisions for the Adrian framework. Each ADR resolves a specific problem from the [problem catalog](../catalog/README.md). A further 61 problems are deferred pending Tier-1 architectural ORQ resolution and research spike outcomes — see [TRIAGE.md](./TRIAGE.md) for the deferral rationale.
+This directory contains 130 Architecture Decision Records (ADRs) documenting high-confidence decisions for the Adrian framework. Each ADR resolves a specific problem from the [problem catalog](../catalog/README.md). A further 61 problems are deferred pending Tier-1 architectural ORQ resolution and research spike outcomes — see [TRIAGE.md](./TRIAGE.md) for the deferral rationale.
 
 ## How to use this directory
 
@@ -23,12 +23,12 @@ This directory contains 69 Architecture Decision Records (ADRs) documenting high
 
 ## Statistics
 
-- **Total ADRs**: 69
-- **High-confidence (full)**: 34
-- **Partial (confident part + deferred part)**: 35
+- **Total ADRs**: 130
+- **High-confidence (full)**: 83
+- **Partial (confident part + deferred part)**: 47
 - **Deferred problems (no ADR)**: 61 — gated by 11 Tier-1 ORQs
-- **Total words across all ADRs**: ~145,765
-- **Average words per ADR**: ~2,112
+- **Total words across all ADRs**: ~313,688
+- **Average words per ADR**: ~2,412
 
 ## ADR format
 
@@ -54,7 +54,7 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 
 ## ADRs by capability
 
-### Core Directory (10 ADRs)
+### Core Directory (22 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -68,8 +68,20 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-008](./ADR-008-declarative-replication-topology.md) | PC-016 | Declarative YAML Replication Topology as Primary Mechanism | medium |  |
 | [ADR-009](./ADR-009-constructed-attributes.md) | PC-018 | Constructed Attributes via DSA-Side Computation (PARTIAL) | high | ⚠️ |
 | [ADR-010](./ADR-010-backup-restore-snapshots.md) | PC-020 | Storage-Engine-Native Backup and Filesystem Snapshots (PARTIAL) | high | ⚠️ |
+| [ADR-070](./ADR-070-drsuapi-replication-protocol.md) | PC-001 | Fresh Rust DRSUAPI Server Implementation for AD-Interop Replication | blocker |  |
+| [ADR-071](./ADR-071-replication-model.md) | PC-002 | Hybrid Replication Model — DrSuapiReplicator + RaftReplicator behind Replicator Trait | blocker |  |
+| [ADR-072](./ADR-072-global-catalog-strategy.md) | PC-005 | Global Catalog as FDB Projection with AD-Interop PAS Replication | high |  |
+| [ADR-073](./ADR-073-storage-engine.md) | PC-007 | FoundationDB as Sole Storage Engine for All DCs | blocker |  |
+| [ADR-074](./ADR-074-tombstone-lifetime-lingering-objects.md) | PC-009 | Tombstone Lifetime, Lingering Object Detection, and Raft Log Truncation | high |  |
+| [ADR-075](./ADR-075-cross-domain-move.md) | PC-010 | Cross-Domain Move via UUID-Stable Identity with Atomic SID Rewrite | medium |  |
+| [ADR-076](./ADR-076-fsmo-role-replacement.md) | PC-014 | FSMO Role Replacement — Raft Consensus for Native Mode, Emulation for AD-Interop | high |  |
+| [ADR-077](./ADR-077-foreign-security-principals-rid-pool.md) | PC-015 | RID Pool Allocation, Foreign Security Principals, and sIDHistory Migration | high |  |
+| [ADR-078](./ADR-078-schema-model.md) | PC-017 | Hybrid Schema Model — LDAP Schema as Source of Truth with Rust Typed Projection | high |  |
+| [ADR-079](./ADR-079-dns-in-directory.md) | PC-019 | AD-Integrated DNS Zones via DRSUAPI Replication with Native-Mode CoreDNS+FDB Plugin | high |  |
+| [ADR-080](./ADR-080-instancetype-systemflags-bitmasks.md) | PC-021 | instanceType and systemFlags Bitmasks via Typed Projection with Bitflags Macros | medium |  |
+| [ADR-081](./ADR-081-multi-tenancy.md) | PC-022 | Multi-Tenancy via Per-Tenant FDB Keyspaces with Hard Isolation | high |  |
 
-### KDC (10 ADRs)
+### KDC (13 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -83,16 +95,23 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-018](./ADR-018-kdc-horizontal-scaling.md) | PC-033 | KDC as Horizontally-Scalable Stateless Pool Behind Load Balancer | high | ⚠️ |
 | [ADR-019](./ADR-019-kpasswd-password-change.md) | PC-034 | kpasswd (RFC 3244) as Primary Password-Change Protocol with REST Wrapper | medium |  |
 | [ADR-020](./ADR-020-gmsa-kds-rotation.md) | PC-035 | gMSA with HSM-Bound KDS Root Key and Automatic 30-Day Rotation | high |  |
+| [ADR-082](./ADR-082-ms-kile-pac-generation.md) | PC-023 | MS-KILE-Conformant PAC Generation in Fresh Rust KDC | blocker |  |
+| [ADR-083](./ADR-083-pac-validation-rpc.md) | PC-025 | PAC Validation via PAC_BUFFER_TICKET_CHECKSUM (Local) + NetrLogonSamLogonEx (Interop) | high |  |
+| [ADR-084](./ADR-084-pkinit-fido2-webauthn-bridge.md) | PC-027 | PKINIT via FIDO2/WebAuthn Bridge (with RFC 4556 Smart-Card Path for Compliance) | high |  |
 
-### Auth Provider (3 ADRs)
+### Auth Provider (7 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
 | [ADR-021](./ADR-021-ldap-signing-channel-binding.md) | PC-037 | LDAP Signing, TLS Channel Binding (RFC 5929), and EPA Mandatory by Default | blocker |  |
 | [ADR-022](./ADR-022-ntp-chrony-time-sync.md) | PC-041 | Standard NTP via chrony; Drop MS-SNTP; Alert on Clock Skew | high |  |
 | [ADR-023](./ADR-023-kerberos-audit-events.md) | PC-042 | Structured Kerberos Audit Events in OpenTelemetry Log Format | high |  |
+| [ADR-085](./ADR-085-ntlm-client-only-rust-crate.md) | PC-036 | Drop NTLM Server-Side; Client-Only NTLM via Rust Crate for Legacy Interop | high |  |
+| [ADR-086](./ADR-086-pass-the-hash-defense.md) | PC-038 | Pass-the-Hash Defense via NTLM Server Drop + HSM-Bound PEK + Platform Isolation | blocker |  |
+| [ADR-087](./ADR-087-s4u-constrained-delegation.md) | PC-039 | S4U2Self + S4U2Proxy Constrained Delegation (with RBCD) in Framework KDC | high |  |
+| [ADR-088](./ADR-088-unified-token-abstraction.md) | PC-040 | Unified Token Abstraction via adrian-sdk AuthModule (Windows LSA / Linux PAM / macOS OpenDirectory) | high |  |
 
-### Policy Engine (8 ADRs)
+### Policy Engine (14 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -104,8 +123,14 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-029](./ADR-029-json-canonical-policy-preg-adapter.md) | PC-052 | JSON canonical policy format; PReg adapter | medium |  |
 | [ADR-030](./ADR-030-role-based-policy-binding.md) | PC-054 | Role-based policy binding; deprecate Authenticated Users | medium |  |
 | [ADR-031](./ADR-031-git-backed-policy-history.md) | PC-056 | Git-backed policy history with PR review | medium |  |
+| [ADR-089](./ADR-089-declarative-policy-gpc-gpt-synthesis.md) | PC-043 | Declarative canonical policy format with INI/Registry.pol AD-interop adapter (resolves PC-043) | high |  |
+| [ADR-090](./ADR-090-admx-to-declarative-json-compiler.md) | PC-046 | ADMX-to-declarative-JSON compiler `admx2adrian` (resolves PC-046) | high |  |
+| [ADR-091](./ADR-091-gpp-preferences-cross-platform-compilation.md) | PC-045 | Group Policy Preferences cross-platform compilation targets (resolves PC-045) | blocker |  |
+| [ADR-092](./ADR-092-policy-executor-trait-synthetic-windows-cse.md) | PC-046 | Per-platform policy executor trait `PolicyExecutor` and synthetic Windows CSE (resolves PC-046) | high |  |
+| [ADR-093](./ADR-093-sssd-gpo-access-control-enhancement.md) | PC-053 | SSSD GPO access-control enhancement — full Security area coverage via `adrian-sssd-gpo` (resolves PC-053) | high |  |
+| [ADR-094](./ADR-094-sysvol-replication-git-backed.md) | PC-055 | SYSVOL-equivalent replication via Git-backed policy repository + SMB read surface (resolves PC-055) | blocker |  |
 
-### Cert Service (6 ADRs)
+### Cert Service (11 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -115,8 +140,13 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-035](./ADR-035-multi-cdp-ocsp-cluster-crl-fallback.md) | PC-063 | Multi-CDP HTTP fallback; HA OCSP cluster; CRL fallback | high |  |
 | [ADR-036](./ADR-036-trust-manager-cross-cert-interop.md) | PC-065 | Trust-manager model; cross-cert for interop only | low |  |
 | [ADR-037](./ADR-037-two-tier-ca-hsm-root.md) | PC-066 | Two-tier CA with HSM-bound root | medium |  |
+| [ADR-095](./ADR-095-acme-primary-mswcce-bridge.md) | PC-057 | ACME-primary cert enrollment with MS-WCCE bridge for Windows `autoenroll.dll` (resolves PC-057) | blocker |  |
+| [ADR-096](./ADR-096-cert-profile-yaml-replaces-templates.md) | PC-058 | Declarative `cert-profiles.yaml` replaces AD CS certificate templates (resolves PC-058) | high |  |
+| [ADR-097](./ADR-097-cross-platform-autoenroll-acme.md) | PC-059 | Cross-platform autoenrollment via Client SDK ACME client + attestation (resolves PC-059) | high |  |
+| [ADR-098](./ADR-098-ndes-scep-replacement-bridge.md) | PC-064 | NDES/SCEP replacement via standalone `adrian-scep-bridge` (resolves PC-064) | medium |  |
+| [ADR-099](./ADR-099-ntauthcertificates-pkinit-trust.md) | PC-067 | `NTAuthCertificates` replacement via `LogonAuthorizedCAs` directory attribute + trust-manager (resolves PC-067) | high |  |
 
-### Federation Gateway (5 ADRs)
+### Federation Gateway (10 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -125,8 +155,13 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-040](./ADR-040-saml-replay-clock-skew-policy.md) | PC-072 | SAML replay detection 60-min; per-RP skew policy | low |  |
 | [ADR-041](./ADR-041-strict-oidc-default-resource-compat.md) | PC-075 | Strict OIDC by default; resource= compat opt-in | medium | ⚠️ |
 | [ADR-042](./ADR-042-rms-out-of-scope-recommend-aip.md) | PC-077 | AD RMS out of scope; recommend AIP | low |  |
+| [ADR-100](./ADR-100-keycloak-replaces-adfs-farm-wid-sql-wap.md) | PC-068 | Replace AD FS farm (WID/SQL + WAP) with Keycloak StatefulSet + Rust shim sidecar | high |  |
+| [ADR-101](./ADR-101-adfs-claim-rule-language-compat.md) | PC-069 | AD FS claim rule language compatibility via Rust PEG-based engine | high |  |
+| [ADR-102](./ADR-102-rust-shim-wap-replacement.md) | PC-073 | Rust shim as cross-platform WAP replacement — no MS-ADFSPIP, no Windows Server in DMZ | medium |  |
+| [ADR-103](./ADR-103-keycloak-statefulset-no-primary-secondary.md) | PC-074 | PostgreSQL multi-primary replaces AD FS WID primary-secondary farm topology | medium |  |
+| [ADR-104](./ADR-104-keycloak-identity-brokering-hrd.md) | PC-076 | Keycloak identity brokering with home realm discovery — per-tenant IdP routing | medium |  |
 
-### File Gateway (5 ADRs)
+### File Gateway (7 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -135,8 +170,10 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-045](./ADR-045-abe-precomputed-index.md) | PC-082 | Access-Based Enumeration with Pre-computed Per-Share Index | medium | ⚠️ |
 | [ADR-046](./ADR-046-drop-msrprn-adopt-ipp-everywhere.md) | PC-083 | Drop MS-RPRN; Adopt IPP Everywhere | blocker | ⚠️ |
 | [ADR-047](./ADR-047-offline-files-out-of-scope.md) | PC-084 | Offline Files Out of Scope; Recommend Sync Clients | medium | ⚠️ |
+| [ADR-105](./ADR-105-fresh-rust-smb3-server.md) | PC-078 | Fresh Rust SMB 3.1.1 server — SHA-512 preauth integrity, AES-256-GCM, no Samba | blocker |  |
+| [ADR-106](./ADR-106-smb-client-persistent-handles-sdk-filemodule.md) | PC-081 | SMB client as Rust SDK FileModule — fresh implementation with persistent-handle reconnect for CA shares | high |  |
 
-### Client SDK (4 ADRs)
+### Client SDK (9 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -144,8 +181,13 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-049](./ADR-049-standardize-mit-krb5.md) | PC-090 | Standardize on MIT krb5 on Linux/macOS | medium | ⚠️ |
 | [ADR-050](./ADR-050-authselect-standard-pam.md) | PC-092 | Adopt authselect as Standard PAM Profile Mechanism | medium | ⚠️ |
 | [ADR-051](./ADR-051-kcm-linux-api-macos-cache-abstraction.md) | PC-093 | KCM on Linux; API: on macOS; Unified Cache Abstraction | medium | ⚠️ |
+| [ADR-107](./ADR-107-unified-rust-core-sdk.md) | PC-085 | Unified Rust Core SDK with Platform-Specific Bindings | blocker |  |
+| [ADR-108](./ADR-108-sspi-equivalent-auth-abstraction.md) | PC-086 | SSPI-Equivalent Unified Auth Abstraction in adrian-sdk | high |  |
+| [ADR-109](./ADR-109-cross-platform-ldap-client.md) | PC-088 | Cross-Platform LDAP Client Library (Wldap32 Equivalent) in adrian-sdk | high |  |
+| [ADR-110](./ADR-110-sid-to-uid-mapping-uuid-primary.md) | PC-089 | SID-to-UID Mapping via UUID-Primary Identity + Direct POSIX UID | blocker |  |
+| [ADR-111](./ADR-111-unified-ticket-cache-abstraction.md) | PC-091 | Unified Ticket Cache Abstraction — KCM on Linux, API: on macOS, LSA on Windows | medium |  |
 
-### Cross-Platform Parity (5 ADRs)
+### Cross-Platform Parity (12 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -154,8 +196,15 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-054](./ADR-054-per-host-laps-rotation.md) | PC-098 | Per-Host Local-Admin Password Rotation; LAPS Schema | medium | ⚠️ |
 | [ADR-055](./ADR-055-legacy-agent-migration-dzdo-sudoers.md) | PC-104 | Document Migration Paths; dzdo to sudoers Import | low | ⚠️ |
 | [ADR-056](./ADR-056-psso-modern-macos-kerberos-path.md) | PC-105 | PSSO as Modern macOS Kerberos Path | medium |  |
+| [ADR-112](./ADR-112-macos-ntlm-client-rust-crate.md) | PC-094 | macOS NTLM Client Gap Closed by adrian-ntlm-client Rust Crate | high |  |
+| [ADR-113](./ADR-113-gpo-preferences-cross-platform-policy.md) | PC-095 | GPO Preferences and Cross-Platform Policy Compilation | blocker |  |
+| [ADR-114](./ADR-114-linux-identity-stack-sssd-primary.md) | PC-099 | Linux Identity Stack — SSSD Primary, Winbind Deprecated, PBIS Unsupported | medium |  |
+| [ADR-115](./ADR-115-freeipa-alternative-linux-tier.md) | PC-100 | FreeIPA as Supported Alternative Linux Tier via Cross-Realm Trust | medium |  |
+| [ADR-116](./ADR-116-legacy-macos-agents-eol.md) | PC-101 | Legacy macOS Agents (NoMAD / Enterprise Connect / Jamf Connect / Centrify / PBIS) EOL | medium |  |
+| [ADR-117](./ADR-117-apple-heimdal-fork-staleness-mitigated.md) | PC-102 | Apple Heimdal Fork Staleness Mitigated by Fresh Rust KDC + Unified PAC Validator | medium |  |
+| [ADR-118](./ADR-118-mcx-legacy-macos-mdm-ddm-migration.md) | PC-103 | MCX Legacy on macOS — Migrate to MDM Configuration Profiles + DDM | low |  |
 
-### Operations (7 ADRs)
+### Operations (10 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -166,8 +215,11 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-061](./ADR-061-rest-grpc-api.md) | PC-112 | REST API for CRUD + gRPC for Streaming (GraphQL Deferred) | high | ⚠️ |
 | [ADR-062](./ADR-062-trust-password-auto-rotation.md) | PC-114 | Auto-Rotate Trust Passwords + Auto-Reset on Desync | medium | ⚠️ |
 | [ADR-063](./ADR-063-unified-cross-platform-cli.md) | PC-115 | Unified Cross-Platform CLI (Implementation Language Deferred) | medium | ⚠️ |
+| [ADR-119](./ADR-119-schema-as-code-gitops.md) | PC-107 | Schema-as-Code with GitOps — Reversible Migrations, Typed Projection Regeneration | high | ⚠️ |
+| [ADR-120](./ADR-120-multi-region-replication-topology.md) | PC-108 | Multi-Region Replication — Hybrid DRSUAPI + Raft with Locality-Aware Leader Placement | high | ⚠️ |
+| [ADR-121](./ADR-121-functional-levels-capability-flags.md) | PC-113 | Replace Functional Levels with Per-Feature Capability Flags + DC Capabilities Exchange | medium | ⚠️ |
 
-### Security (4 ADRs)
+### Security (8 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
@@ -175,13 +227,22 @@ Migration ADRs additionally include a **Migration state machine** section (sourc
 | [ADR-065](./ADR-065-krbtgt-hsm-rotation.md) | PC-118 | HSM-Bound krbtgt + Auto-Rotation for Golden-Ticket Mitigation | blocker | ⚠️ |
 | [ADR-066](./ADR-066-adminsdholder-declarative-rbac.md) | PC-122 | Replace AdminSDHolder with Declarative RBAC | medium | ⚠️ |
 | [ADR-067](./ADR-067-sigstore-supply-chain.md) | PC-123 | Sigstore Signing + in-toto Attestations for Supply-Chain Security | medium | ⚠️ |
+| [ADR-122](./ADR-122-dcsync-mitigation.md) | PC-117 | DCSync Mitigation — Per-Principal Replication-Get-Changes Audit + HSM-Bound Break-Glass | blocker | ⚠️ |
+| [ADR-123](./ADR-123-silver-ticket-mitigation.md) | PC-119 | Silver Ticket Mitigation — Mandatory PAC_BUFFER_TICKET_CHECKSUM + Default Service-Side Validation | high | ⚠️ |
+| [ADR-124](./ADR-124-sidhistory-injection-mitigation.md) | PC-120 | sIDHistory Injection Mitigation — Default-On Filtering on All Trusts + Per-Write Audit | high | ⚠️ |
+| [ADR-125](./ADR-125-selective-authentication-hbac.md) | PC-121 | Selective Authentication Replaced by HBAC-Equivalent Policy Rules + Per-Host Evaluation | medium | ⚠️ |
 
-### Migration (2 ADRs)
+### Migration (7 ADRs)
 
 | ADR | Problem | Title | Severity | Partial? |
 |-----|---------|-------|----------|----------|
 | [ADR-068](./ADR-068-subdomain-dns-strategy.md) | PC-128 | Subdomain-per-Directory DNS Strategy for Migration | medium |  |
 | [ADR-069](./ADR-069-cross-realm-capaths.md) | PC-129 | Auto-Generate Kerberos capaths + DNS SRV KDC Discovery | medium | ⚠️ |
+| [ADR-126](./ADR-126-sidhistory-migration.md) | PC-124 | sIDHistory Migration — DRSAddSidHistory + Time-Limited Passthrough Window + ACL Re-write Plan | high | ⚠️ |
+| [ADR-127](./ADR-127-gpo-translation.md) | PC-125 | GPO Translation — ADMX-to-Canonical-JSON Compiler + Per-Setting Review Workflow | high | ⚠️ |
+| [ADR-128](./ADR-128-kerberos-cross-realm-migration.md) | PC-126 | Kerberos Cross-Realm with AD During Migration — Per-SPN/Per-User/Per-Host Granularity | high | ⚠️ |
+| [ADR-129](./ADR-129-password-hash-migration.md) | PC-127 | Password Hash Migration — Framework-Side Sync Agent with DRSUAPI Pull + LDAP Modify Push | high | ⚠️ |
+| [ADR-130](./ADR-130-sysvol-migration.md) | PC-130 | SYSVOL Migration — SMB-Served Git-Backed Policy Share + HTTPS Distribution + DFS-N Referral | medium | ⚠️ |
 
 ⚠️ = PARTIAL ADR (defers a sub-decision to a Tier-1 ORQ; see ADR's "Open Questions")
 
@@ -226,6 +287,18 @@ These ADRs make a confident decision for part of the problem and explicitly defe
 | [ADR-066](./ADR-066-adminsdholder-declarative-rbac.md) | PC-122 | Replace AdminSDHolder with Declarative RBAC | ORQ-011 |
 | [ADR-067](./ADR-067-sigstore-supply-chain.md) | PC-123 | Sigstore Signing + in-toto Attestations for Supply-Chain Security | ORQ-011 |
 | [ADR-069](./ADR-069-cross-realm-capaths.md) | PC-129 | Auto-Generate Kerberos capaths + DNS SRV KDC Discovery | ORQ-042 |
+| [ADR-119](./ADR-119-schema-as-code-gitops.md) | PC-107 | Schema-as-Code with GitOps — Reversible Migrations, Typed Projection Regeneration | ORQ-030 |
+| [ADR-120](./ADR-120-multi-region-replication-topology.md) | PC-108 | Multi-Region Replication — Hybrid DRSUAPI + Raft with Locality-Aware Leader Placement | ORQ-001 |
+| [ADR-121](./ADR-121-functional-levels-capability-flags.md) | PC-113 | Replace Functional Levels with Per-Feature Capability Flags + DC Capabilities Exchange | ORQ-030 |
+| [ADR-122](./ADR-122-dcsync-mitigation.md) | PC-117 | DCSync Mitigation — Per-Principal Replication-Get-Changes Audit + HSM-Bound Break-Glass | ORQ-001 |
+| [ADR-123](./ADR-123-silver-ticket-mitigation.md) | PC-119 | Silver Ticket Mitigation — Mandatory PAC_BUFFER_TICKET_CHECKSUM + Default Service-Side Validation | ORQ-042 |
+| [ADR-124](./ADR-124-sidhistory-injection-mitigation.md) | PC-120 | sIDHistory Injection Mitigation — Default-On Filtering on All Trusts + Per-Write Audit | ORQ-026 |
+| [ADR-125](./ADR-125-selective-authentication-hbac.md) | PC-121 | Selective Authentication Replaced by HBAC-Equivalent Policy Rules + Per-Host Evaluation | ORQ-202 |
+| [ADR-126](./ADR-126-sidhistory-migration.md) | PC-124 | sIDHistory Migration — DRSAddSidHistory + Time-Limited Passthrough Window + ACL Re-write Plan | ORQ-026 |
+| [ADR-127](./ADR-127-gpo-translation.md) | PC-125 | GPO Translation — ADMX-to-Canonical-JSON Compiler + Per-Setting Review Workflow | ORQ-030, ORQ-090 |
+| [ADR-128](./ADR-128-kerberos-cross-realm-migration.md) | PC-126 | Kerberos Cross-Realm with AD During Migration — Per-SPN/Per-User/Per-Host Granularity | ORQ-001, ORQ-042 |
+| [ADR-129](./ADR-129-password-hash-migration.md) | PC-127 | Password Hash Migration — Framework-Side Sync Agent with DRSUAPI Pull + LDAP Modify Push | ORQ-026 |
+| [ADR-130](./ADR-130-sysvol-migration.md) | PC-130 | SYSVOL Migration — SMB-Served Git-Backed Policy Share + HTTPS Distribution + DFS-N Referral | ORQ-001, ORQ-154 |
 
 ## Cross-ADR clusters
 
