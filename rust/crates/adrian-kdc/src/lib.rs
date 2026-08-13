@@ -176,6 +176,9 @@ pub mod store;
 /// replace it with `rasn-kerberos` for MIT krb5 / Windows interop.
 pub mod handlers;
 
+/// MS-KILE PAC builder — 9 buffer types per ADR-082 (Wave 2b).
+pub mod pac;
+
 #[cfg(test)]
 mod tests {
     use super::*;
