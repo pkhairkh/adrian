@@ -149,19 +149,17 @@ pub struct KpasswdRequest {
     /// HMAC-SHA1-96 of the request body under the krbtgt key — proves the
     /// request was authenticated via a TGT (RFC 4120 §5.5.1 Authenticator).
     pub authenticator_mac: Vec<u8>,
-    /// New password. **PRODUCTION CALLERS MUST wrap this field via
-    /// [`KrbPrivEnvelope::encrypt`] before sending the request on the
-    /// wire** — RFC 3244 §3.2 requires the password change data be wrapped
-    /// in a KRB-PRIV (RFC 4120 §3.5) encrypted to the target principal's
-    /// key. Until the per-principal key derivation path is implemented
-    /// (RFC 3961 §3), the placeholder KRB-PRIV envelope uses the krbtgt
-    /// AES-256 key. See `KrbPrivEnvelope` docs for the gap.
+    /// New password. **v0.7.0: When `password_encrypted` is true, this field
+    /// contains the KRB-PRIV-encrypted password blob** (produced by
+    /// [`KrbPrivEnvelope::encrypt`]). The receiver decrypts it via
+    /// [`KrbPrivEnvelope::decrypt`] before processing.
     ///
-    /// The receiver (`handle_kpasswd`) currently treats this field as
-    /// cleartext (it does NOT call `KrbPrivEnvelope::decrypt`) — this is
-    /// documented as a known v0.6.0 limitation. Wire the decrypt path in
-    /// a future wave once the per-principal key lookup exists.
+    /// When `password_encrypted` is false (v0.6.0 backward-compatible mode),
+    /// this field is treated as cleartext.
     pub new_password: Vec<u8>,
+    /// v0.7.0: When true, `new_password` contains a KRB-PRIV-encrypted blob
+    /// (RFC 4120 §3.5). When false, `new_password` is cleartext (v0.6.0 mode).
+    pub password_encrypted: bool,
 }
 
 /// kpasswd response (RFC 3244 §3.3).
@@ -238,7 +236,8 @@ impl KpasswdRequest {
             + 2 + client.len()
             + 2 + target.len()
             + 2 + mac.len()
-            + 2 + pwd.len();
+            + 2 + pwd.len()
+            + 1; // password_encrypted flag (v0.7.0)
         let mut buf = Vec::with_capacity(2 + body_len);
         buf.extend_from_slice(&(body_len as u16).to_be_bytes());
         buf.extend_from_slice(&KPASSWD_VERSION_CHANGE.to_be_bytes());
@@ -250,6 +249,8 @@ impl KpasswdRequest {
         buf.extend_from_slice(mac);
         buf.extend_from_slice(&(pwd.len() as u16).to_be_bytes());
         buf.extend_from_slice(pwd);
+        // v0.7.0: 1-byte flag indicating whether new_password is KRB-PRIV-encrypted.
+        buf.push(if self.password_encrypted { 0x01 } else { 0x00 });
         buf
     }
 
@@ -304,11 +305,19 @@ impl KpasswdRequest {
             name: String::from_utf8(target)
                 .map_err(|_| KdcError::Storage("kpasswd: target principal not UTF-8".into()))?,
         };
+        // v0.7.0: Parse the optional password_encrypted flag. If the byte is
+        // absent (v0.6.0 backward-compatible mode), default to false (cleartext).
+        let password_encrypted = if p < bytes.len() {
+            bytes[p] == 0x01
+        } else {
+            false
+        };
         Ok(Self {
             client_principal,
             target_principal,
             authenticator_mac: mac,
             new_password: pwd,
+            password_encrypted,
         })
     }
 }
@@ -694,8 +703,22 @@ impl KpasswdService {
                 )));
             }
         };
+        // 5b. v0.7.0: If the password is KRB-PRIV-encrypted (RFC 4120 §3.5),
+        // decrypt it before processing. This closes P0 #9.
+        let cleartext_password = if req.password_encrypted {
+            let krbtgt_key = self.krbtgt.current_key().await;
+            KrbPrivEnvelope::decrypt(&self.hsm, &krbtgt_key, &req.new_password)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "kpasswd: KRB-PRIV decrypt failed");
+                    KdcError::Storage(format!("kpasswd: KRB-PRIV decrypt failed: {e}"))
+                })?
+        } else {
+            // v0.6.0 backward-compatible mode: password is cleartext.
+            req.new_password.clone()
+        };
         // 6. Password quality validation.
-        let pwd = &req.new_password;
+        let pwd = &cleartext_password;
         if pwd.len() < MIN_PASSWORD_LEN {
             let resp = KpasswdResponse::policy_violation(format!(
                 "Password too short (minimum {MIN_PASSWORD_LEN} characters)"
@@ -778,6 +801,7 @@ mod tests {
                 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
             ],
             new_password: b"new-password-12345!".to_vec(),
+            password_encrypted: false,
         };
         let bytes = req.encode();
         let parsed = KpasswdRequest::parse(&bytes).expect("parse");
@@ -837,6 +861,7 @@ mod tests {
             target_principal: PrincipalName::new("alice@ADRIAN.EXAMPLE.COM"),
             authenticator_mac: vec![], // ← unauthenticated
             new_password: b"some-password-here".to_vec(),
+            password_encrypted: false,
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse resp");
@@ -880,6 +905,7 @@ mod tests {
             target_principal: PrincipalName::new("alice@ADRIAN.EXAMPLE.COM"),
             authenticator_mac: vec![0xFF; 12], // ← tampered
             new_password: b"new-strong-password!".to_vec(),
+            password_encrypted: false,
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
@@ -935,6 +961,7 @@ mod tests {
             target_principal: PrincipalName::new(client),
             authenticator_mac: mac,
             new_password: pwd.to_vec(),
+            password_encrypted: false,
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
@@ -960,6 +987,162 @@ mod tests {
         assert_eq!(pwd_attr.value.len(), PBKDF2_SALT_LEN + PBKDF2_OUTPUT_LEN);
     }
 
+    /// v0.7.0: KRB-PRIV encrypted password flow (P0 #9). The password is
+    /// encrypted via `KrbPrivEnvelope::encrypt` under the krbtgt key, and
+    /// `handle_kpasswd` decrypts it before processing.
+    #[tokio::test]
+    async fn krb_priv_encrypted_password_succeeds() {
+        let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
+        let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
+        let dir: Arc<dyn DirectoryStore> = Arc::new(InMemoryDirectoryStore::new());
+        let obj = Object {
+            uuid: Uuid::from_u128(0xCCCC),
+            dn: DistinguishedName {
+                dn: "CN=bob,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            },
+            attributes: vec![],
+            dnt: UNASSIGNED_DNT,
+        };
+        dir.put(&obj).await.unwrap();
+        let svc = KpasswdService::new(dir.clone(), krbtgt.clone(), hsm.clone());
+        // Pre-generate the krbtgt-mac HMAC key.
+        let mac_kh = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .unwrap();
+        // Get the krbtgt AES key for KRB-PRIV encryption.
+        let krbtgt_key = krbtgt.current_key().await;
+        // Encrypt the password via KrbPrivEnvelope.
+        let cleartext_pwd = b"encrypted-password-123!";
+        let encrypted_pwd = KrbPrivEnvelope::encrypt(&hsm, &krbtgt_key, cleartext_pwd)
+            .await
+            .expect("encrypt");
+        // Compute the MAC over the ENCRYPTED password (not the cleartext).
+        let client = "bob@ADRIAN.EXAMPLE.COM";
+        let mut mac_input = Vec::new();
+        mac_input.extend_from_slice(client.as_bytes());
+        mac_input.extend_from_slice(client.as_bytes());
+        mac_input.extend_from_slice(&encrypted_pwd);
+        let mac = hsm.sign(&mac_kh, &mac_input).await.unwrap();
+        let req = KpasswdRequest {
+            client_principal: PrincipalName::new(client),
+            target_principal: PrincipalName::new(client),
+            authenticator_mac: mac,
+            new_password: encrypted_pwd,
+            password_encrypted: true,
+        };
+        let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
+        let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
+        assert_eq!(
+            resp.result_code,
+            result_code::KRB5_KPASSWD_SUCCESS,
+            "KRB-PRIV encrypted password must succeed: {}",
+            resp.result_string
+        );
+        // Verify the directory was updated.
+        let updated = dir
+            .get_by_dn(&DistinguishedName {
+                dn: "CN=bob,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            })
+            .await
+            .unwrap()
+            .expect("object exists");
+        let pwd_attr = updated
+            .attributes
+            .iter()
+            .find(|a: &&Attribute| a.name == "unicodePwd")
+            .expect("unicodePwd must be set");
+        assert_eq!(pwd_attr.value.len(), PBKDF2_SALT_LEN + PBKDF2_OUTPUT_LEN);
+    }
+
+    /// v0.7.0: KRB-PRIV decrypt with wrong key fails (P0 #9 negative test).
+    #[tokio::test]
+    async fn krb_priv_decrypt_with_wrong_key_fails() {
+        let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
+        let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
+        let dir: Arc<dyn DirectoryStore> = Arc::new(InMemoryDirectoryStore::new());
+        let obj = Object {
+            uuid: Uuid::from_u128(0xDDDD),
+            dn: DistinguishedName {
+                dn: "CN=eve,CN=Users,DC=adrian,DC=example,DC=com".into(),
+            },
+            attributes: vec![],
+            dnt: UNASSIGNED_DNT,
+        };
+        dir.put(&obj).await.unwrap();
+        let svc = KpasswdService::new(dir.clone(), krbtgt.clone(), hsm.clone());
+        let mac_kh = hsm
+            .generate_key("krbtgt-mac", KeyType::HmacSha1)
+            .await
+            .unwrap();
+        // Encrypt with a DIFFERENT key (not the krbtgt key).
+        let other_kh = hsm
+            .generate_key("other-enc", KeyType::Aes256)
+            .await
+            .unwrap();
+        let encrypted_pwd = KrbPrivEnvelope::encrypt(&hsm, &other_kh, b"wrong-key-password!")
+            .await
+            .expect("encrypt");
+        // Compute MAC over the encrypted blob.
+        let client = "eve@ADRIAN.EXAMPLE.COM";
+        let mut mac_input = Vec::new();
+        mac_input.extend_from_slice(client.as_bytes());
+        mac_input.extend_from_slice(client.as_bytes());
+        mac_input.extend_from_slice(&encrypted_pwd);
+        let mac = hsm.sign(&mac_kh, &mac_input).await.unwrap();
+        let req = KpasswdRequest {
+            client_principal: PrincipalName::new(client),
+            target_principal: PrincipalName::new(client),
+            authenticator_mac: mac,
+            new_password: encrypted_pwd,
+            password_encrypted: true,
+        };
+        let result = svc.handle_kpasswd(&req.encode()).await;
+        // The decrypt should fail because the password was encrypted with a
+        // different key than the krbtgt key.
+        assert!(result.is_err(), "KRB-PRIV decrypt with wrong key must fail");
+    }
+
+    /// v0.7.0: KRB-PRIV envelope round-trip via the krbtgt key.
+    #[tokio::test]
+    async fn krb_priv_envelope_round_trips_via_krbtgt() {
+        let hsm: Arc<dyn Hsm> = Arc::new(SoftwareHsm::new());
+        let krbtgt = Arc::new(KrbtgtManager::new(hsm.clone()).await.unwrap());
+        let key = krbtgt.current_key().await;
+        let plaintext = b"test-password-12345";
+        let encrypted = KrbPrivEnvelope::encrypt(&hsm, &key, plaintext)
+            .await
+            .expect("encrypt");
+        assert_ne!(
+            &encrypted[..],
+            &plaintext[..],
+            "encryption must change bytes"
+        );
+        let decrypted = KrbPrivEnvelope::decrypt(&hsm, &key, &encrypted)
+            .await
+            .expect("decrypt");
+        assert_eq!(
+            &decrypted[..],
+            &plaintext[..],
+            "round-trip must recover plaintext"
+        );
+    }
+
+    /// v0.7.0: password_encrypted flag round-trips through encode/parse.
+    #[test]
+    fn password_encrypted_flag_round_trips() {
+        let req = KpasswdRequest {
+            client_principal: PrincipalName::new("alice@ADRIAN.EXAMPLE.COM"),
+            target_principal: PrincipalName::new("alice@ADRIAN.EXAMPLE.COM"),
+            authenticator_mac: vec![0xAB; 12],
+            new_password: vec![0xCD; 32],
+            password_encrypted: true,
+        };
+        let bytes = req.encode();
+        let parsed = KpasswdRequest::parse(&bytes).expect("parse");
+        assert_eq!(parsed, req, "password_encrypted flag must round-trip");
+    }
+
     /// Unknown principal → `KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN` (RFC 3244 §3.3).
     #[tokio::test]
     async fn unknown_principal_returns_principal_unknown() {
@@ -983,6 +1166,7 @@ mod tests {
             target_principal: PrincipalName::new(client),
             authenticator_mac: mac,
             new_password: pwd.to_vec(),
+            password_encrypted: false,
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
@@ -1031,6 +1215,7 @@ mod tests {
             target_principal: PrincipalName::new(client),
             authenticator_mac: mac,
             new_password: pwd.to_vec(),
+            password_encrypted: false,
         };
         let resp_bytes = svc.handle_kpasswd(&req.encode()).await.expect("handle");
         let resp = KpasswdResponse::parse(&resp_bytes).expect("parse");
@@ -1080,6 +1265,7 @@ mod tests {
             target_principal: PrincipalName::new(client),
             authenticator_mac: mac.clone(),
             new_password: pwd.to_vec(),
+            password_encrypted: false,
         };
         // First request: success.
         let bytes = req.encode();
