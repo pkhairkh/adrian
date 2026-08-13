@@ -111,6 +111,15 @@ pub enum IdentityError {
     Backend(String),
 }
 
+impl From<adrian_sid::SidError> for IdentityError {
+    /// Convert a SID parse/encode error into a [`IdentityError::Backend`]
+    /// (a malformed SID is a backend data-integrity issue, not a missing
+    /// principal).
+    fn from(e: adrian_sid::SidError) -> Self {
+        IdentityError::Backend(format!("SID error: {e}"))
+    }
+}
+
 /// The SID↔UUID mapping trait (per Decision 3 §Decision).
 ///
 /// Implementations:
