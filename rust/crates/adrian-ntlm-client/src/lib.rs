@@ -337,13 +337,18 @@ fn ends_with_eol(target_info: &[u8]) -> bool {
 /// [`ntowfv2`] (which wraps the NT-hash with the user/domain derivation)
 /// for real authentication; the function accepts any 16-byte key for test
 /// / interop-vector use.
+///
+/// The return value is wrapped in [`Zeroizing<Vec<u8>>`] so the 16-byte
+/// `NTProofStr` (an authentication credential equivalent in sensitivity
+/// to the NT hash itself) is securely wiped on drop (Wave 1d —
+/// `eval/wave2a-security.md` S-006).
 pub fn compute_ntlmv2_response(
     nt_hash: &[u8; 16],
     server_challenge: &[u8; 8],
     target_info: &[u8],
     timestamp: u64,
     client_challenge: &[u8; 8],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let blob = build_ntlmv2_blob(timestamp, client_challenge, target_info);
     let mut mac = HmacMd5::new_from_slice(nt_hash).expect("HMAC accepts any key length");
     mac.update(server_challenge);
@@ -352,18 +357,22 @@ pub fn compute_ntlmv2_response(
     let mut out = Vec::with_capacity(16 + blob.len());
     out.extend_from_slice(&proof);
     out.extend_from_slice(&blob);
-    out
+    Zeroizing::new(out)
 }
 
 /// Compute the LMv2 response (legacy compatibility, MS-NLMP §3.3.1).
 ///
 /// Returns 24 bytes: the 16-byte `HMAC-MD5(NTOWFv2, ServerChallenge ++
 /// ClientChallenge)` proof followed by the 8-byte `ClientChallenge`.
+///
+/// Wrapped in [`Zeroizing<Vec<u8>>`] for parity with
+/// [`compute_ntlmv2_response`] — the 16-byte LMv2 proof is derived from
+/// the NTOWFv2 key and is therefore sensitive material (Wave 1d).
 pub fn compute_lmv2_response(
     ntowfv2: &[u8; 16],
     server_challenge: &[u8; 8],
     client_challenge: &[u8; 8],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let mut mac = HmacMd5::new_from_slice(ntowfv2).expect("HMAC accepts any key length");
     mac.update(server_challenge);
     mac.update(client_challenge);
@@ -371,7 +380,7 @@ pub fn compute_lmv2_response(
     let mut out = Vec::with_capacity(24);
     out.extend_from_slice(&proof);
     out.extend_from_slice(client_challenge);
-    out
+    Zeroizing::new(out)
 }
 
 /// Compute the RFC 5929 `tls-server-end-point` channel binding token
@@ -723,11 +732,18 @@ fn current_filetime() -> u64 {
 /// Holds the configured domain, workstation, and (optional) credentials
 /// (username + password). NT hash is derived lazily at authenticate time
 /// and zeroized after use (ADR-086 §Control 3).
+///
+/// The `password` field is wrapped in [`Zeroizing<String>`] so that the
+/// password's heap buffer is securely wiped when the client is dropped
+/// (Wave 1d — fixes `eval/wave1c-auth-crypto.md` S-004 /
+/// `eval/wave2a-security.md` S-004). Standard `String` does NOT zero its
+/// heap buffer on drop — the password would otherwise persist in memory
+/// until the allocator reuses the page.
 pub struct NtlmClient {
     domain: String,
     workstation: String,
     username: Option<String>,
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
 }
 
 impl NtlmClient {
@@ -755,10 +771,12 @@ impl NtlmClient {
         }
     }
 
-    /// Set credentials (username + password).
+    /// Set credentials (username + password). The password is stored as a
+    /// [`Zeroizing<String>`] so it is wiped from memory when the client is
+    /// dropped (ADR-086 §Control 3).
     pub fn set_credentials(&mut self, username: &str, password: &str) {
         self.username = Some(username.to_string());
-        self.password = Some(password.to_string());
+        self.password = Some(Zeroizing::new(password.to_string()));
     }
 
     /// Build NEGOTIATE message (type 1, MS-NLMP §2.2.1.1) using the
