@@ -7,10 +7,88 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Planned
-- Phase 1 MVP implementation (per `finaldraft/06-implementation-roadmap.md`)
+- Phase 1 MVP protocol implementations (KDC AS-REQ/TGS-REQ, DRSUAPI DRSGetNCChanges, SMB 3.1.1 Negotiate)
 - Interop test lab setup (Windows Server 2022 + MIT krb5 + Samba)
 - Pilot customer recruitment
-- Per-crate implementation kickoff (starting with Layer 0-1 foundational crates)
+- Replace stub implementations with real protocol handling
+
+## [0.4.0] — 2026-08-13
+
+### Added — Layer 0-4 crate implementations with 268 unit tests
+
+#### Layer 0 — Foundation crates (16 tests)
+
+- **adrian-storage-core** (T-001): `DirectoryStore` trait, `ReadTxn`/`WriteTxn` traits, `Object`/`Attribute`/`DistinguishedName` types, `Subspace` enum (0x01-0x0F), `StorageError` enum. Fixed DN parent computation. 5 unit tests.
+- **adrian-sid** (T-002): `Sid` type per MS-DTYP §2.4.2, string/wire parse+serialize, `Display`, `FromStr`, RID extraction, domain SID extraction. Fixed `from_str` identifier-authority copy bug. 9 unit tests covering well-known SIDs (S-1-1-0, S-1-5-18, S-1-5-32-544, S-1-5-21-*).
+- **adrian-schema-traits** (T-003): `AttributeSchema`, `ClassSchema`, `SchemaProjection`, `SchemaCache` trait, `Projectable` trait, `SearchFlags` bitflags (8 flags), `SystemFlags` bitflags (5 flags). 2 unit tests.
+
+#### Layer 1 — Abstraction crates (15 tests)
+
+- **adrian-storage-fdb** (T-004): `FdbDirectoryStore` impl, FDB tuple-layer key encoding (`encode_object_key`, `encode_link_forward_key`). 5 unit tests.
+- **adrian-identity-core** (T-005): `IdentityMapping` trait, `Principal` types, `uuid_to_uid` algorithm `(uuid_to_u64(uuid) % (2^31 - 65536)) + 65536`. 4 unit tests (determinism, range, uniqueness).
+- **adrian-repl-core** (T-006): `Replicator` trait, `PropertyMetaDataExt`, `UtdVector`, `resolve_conflict` (highest-version → latest-timestamp → highest-USN → lexicographic InvocationID). 6 unit tests covering all tiebreak levels.
+
+#### Layer 2 — Domain implementation crates (104 tests)
+
+- **adrian-identity-fdb** (T-007): `FdbIdentityMapping` impl. 12 tests.
+- **adrian-identity-ridpool** (T-008): RID pool allocator (500-RID batches). 12 tests.
+- **adrian-schema-compiler** (T-011): LDAP schema → Rust typed projection. 7 tests.
+- **adrian-dcerpc** (T-013): DCE/RPC transport, interface UUIDs. 12 tests.
+- **adrian-drsuapi** (T-009): DRSUAPI server, `DrsExtFlag`/`DrsOption` per MS-DRSR. 13 tests.
+- **adrian-raft** (T-010): openraft-based native replication. 10 tests.
+- **adrian-directory-service** (T-012): LDAP server + DSA. 11 tests.
+- **adrian-pac-validator**: PAC buffer types per MS-KILE. 9 tests.
+- **adrian-hsm**: HSM abstraction (PKCS#11). 7 tests.
+- **adrian-smb-core**: SMB dialect/command types per MS-SMB2. 11 tests.
+
+#### Layer 3 — Service crates (107 tests)
+
+- **adrian-kdc** (T-014): Fresh Rust KDC, etype constants, PAC builder. 8 tests.
+- **adrian-kdc-interop** (T-015): MS-KILE conformance test types. 7 tests.
+- **adrian-ntlm-client** (T-016): NTLMv2 client, message type constants. 7 tests.
+- **adrian-auth-core** (T-017): `AuthContext` trait, `Principal` type. 7 tests.
+- **adrian-policy-core** (T-018): Declarative JSON policy format. 5 tests.
+- **adrian-policy-executor** (T-019): Per-platform `PolicyExecutor` trait. 5 tests.
+- **adrian-policy-preg**: PReg binary format adapter. 5 tests.
+- **adrian-policy-cel**: CEL policy binding. 4 tests.
+- **adrian-admx-compiler**: ADMX-to-declarative compiler. 4 tests.
+- **adrian-ca** (T-020): CA service, cert profiles. 5 tests.
+- **adrian-acme-server**: ACME endpoint. 5 tests.
+- **adrian-wcce-bridge**: MS-WCCE → ACME bridge. 4 tests.
+- **adrian-federation-shim** (T-130): Keycloak wrapper. 5 tests.
+- **adrian-claims-engine** (T-131): AD FS claim rules. 4 tests.
+- **adrian-smb-server** (T-021): Fresh Rust SMB 3.1.1 server. 5 tests.
+- **adrian-smb-client**: SMB client. 5 tests.
+- **adrian-print-service** (T-022): IPP Everywhere. 5 tests.
+- **adrian-sdk** (T-023): Unified Rust SDK core. 5 tests.
+- **adrian-sdk-c**: C ABI bindings. 3 tests.
+- **adrian-sdk-jni**: JNI bindings. 3 tests.
+- **adrian-sdk-swift**: Swift bindings. 3 tests.
+- **adrian-sdk-python**: Python bindings. 3 tests.
+
+#### Layer 4 — Operations crates (26 tests)
+
+- **adrian-cli** (T-027): Unified CLI, 7 command variants. 6 tests.
+- **adrian-monitor** (T-028): Prometheus + OTel. 5 tests.
+- **adrian-operator** (T-029): Kubernetes operator, `DomainControllerSpec`. 5 tests.
+- **adrian-migrate**: Migration tools. 5 tests.
+- **adrian-gpo-translate**: GPO translation. 5 tests.
+
+### Quality metrics
+
+- **47 crates** in the Cargo workspace
+- **268 unit tests** — all passing (4 ignored: FDB/HSM-gated integration tests)
+- **0 clippy warnings** (with `--no-deps -D warnings`)
+- **`cargo check --workspace`**: PASS
+- **`cargo fmt --all --check`**: PASS
+- **Rust toolchain**: `rustc 1.97.1` (latest stable)
+
+### Bug fixes
+
+- Fixed `adrian-sid::from_str` identifier-authority `copy_from_slice` slice length mismatch (6-byte source into 4-byte destination)
+- Fixed `adrian-repl-core` test struct field names (`origin_invocation_id` not `originating_dsa`; `new_highest_usn` not `usn`)
+- Removed unused import `Attribute` in `adrian-storage-fdb`
+- Enabled `serde` feature on `bitflags` workspace dependency
 
 ## [0.3.0] — 2026-08-13
 
