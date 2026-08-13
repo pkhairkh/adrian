@@ -49,3 +49,92 @@ impl Default for SmbServer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_new_and_default_are_equivalent() {
+        // Per ADR-105: SmbServer is constructed once per accept loop. Both
+        // `new()` and `default()` must yield a ready-to-serve instance; the
+        // Default impl exists so the server can be plugged into generic
+        // service launchers.
+        let a = SmbServer::new();
+        let b = SmbServer::default();
+        // Both must be constructible without panicking — the only state they
+        // hold (today) is none, so any panic would be a regression.
+        let _ = (a, b);
+    }
+
+    #[tokio::test]
+    async fn serve_returns_loud_protocol_error() {
+        // Per the framework's "loud stub" convention: every unimplemented
+        // method must surface a typed error variant rather than panic or
+        // silently succeed. `serve` is not yet wired to bind TCP/445, so it
+        // MUST return `SmbServerError::Protocol` (the variant documented for
+        // SMB-protocol-level failures). ADR-105 / ADR-043.
+        let server = SmbServer::new();
+        let err = server
+            .serve()
+            .await
+            .expect_err("serve must surface Protocol until implemented");
+        assert!(matches!(err, SmbServerError::Protocol(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn error_variants_render_expected_prefixes() {
+        // Display strings are part of the public diagnostic contract — logs,
+        // CLI output, and audit entries key off these prefixes.
+        let protocol = SmbServerError::Protocol("negotiate dialect mismatch".into());
+        assert_eq!(
+            format!("{}", protocol),
+            "protocol: negotiate dialect mismatch"
+        );
+
+        let auth = SmbServerError::Auth("invalid signature".into());
+        assert_eq!(format!("{}", auth), "auth: invalid signature");
+
+        let storage = SmbServerError::Storage("fdb transaction retry exhausted".into());
+        assert_eq!(
+            format!("{}", storage),
+            "storage: fdb transaction retry exhausted"
+        );
+
+        let share = SmbServerError::ShareNotFound("SYSVOL".into());
+        assert_eq!(format!("{}", share), "share not found: SYSVOL");
+    }
+
+    #[test]
+    fn error_variants_are_distinct_debug_representations() {
+        // Error variants must remain distinguishable in Debug output so that
+        // `tracing` spans and error reporters can route them correctly.
+        let variants = [
+            SmbServerError::Protocol("p".into()),
+            SmbServerError::Auth("a".into()),
+            SmbServerError::Storage("s".into()),
+            SmbServerError::ShareNotFound("shr".into()),
+        ];
+        let debugs: Vec<String> = variants.iter().map(|e| format!("{:?}", e)).collect();
+        let unique: std::collections::HashSet<_> = debugs.iter().collect();
+        assert_eq!(
+            unique.len(),
+            variants.len(),
+            "error variant Debug reprs collided: {:?}",
+            debugs
+        );
+    }
+
+    #[test]
+    fn share_not_found_variant_is_unit_like_in_match() {
+        // Per ADR-105 + ADR-094 (SYSVOL git-backed replication), missing
+        // shares must surface as `ShareNotFound` — not the generic Storage
+        // variant — so the SDK FileModule can map them to a distinct
+        // client-facing error code.
+        let err = SmbServerError::ShareNotFound("netlogon".into());
+        match err {
+            SmbServerError::ShareNotFound(name) => assert_eq!(name, "netlogon"),
+            other => panic!("expected ShareNotFound, got {:?}", other),
+        }
+    }
+}

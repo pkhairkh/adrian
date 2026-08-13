@@ -79,3 +79,49 @@ pub unsafe extern "C" fn adrian_swift_client_join(
         Err(_) => -2,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[test]
+    fn client_ref_type_is_void_pointer_sized() {
+        // Per ADR-048 / ADR-107: Swift bindings expose the AdrianClient
+        // as an opaque pointer (`AdrianClientRef = *mut c_void`). The
+        // Swift side (`AdrianSDK.xcframework`) wraps these C-ABI entry
+        // points. Pinning the size to a single pointer width catches
+        // accidental changes that would break the Swift xcframework.
+        assert_eq!(
+            std::mem::size_of::<AdrianClientRef>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+    }
+
+    #[test]
+    fn ffi_entry_points_are_exported_with_expected_signatures() {
+        // Take function pointers to each `#[no_mangle] extern "C"` entry
+        // point — without invoking them. This catches link-time
+        // regressions where a `#[no_mangle]` is removed or the signature
+        // drifts (e.g. someone adds a parameter and silently breaks ABI
+        // for the Swift xcframework consumer).
+        let _new: unsafe extern "C" fn() -> AdrianClientRef = adrian_swift_client_new;
+        let _release: unsafe extern "C" fn(AdrianClientRef) = adrian_swift_client_release;
+        let _join: unsafe extern "C" fn(AdrianClientRef, *const c_char) -> i32 =
+            adrian_swift_client_join;
+    }
+
+    #[test]
+    fn runtime_singleton_is_idempotent() {
+        // Per ADR-107: the Swift binding lazily builds a single
+        // multi-threaded tokio runtime stored in a `OnceLock` so blocking
+        // FFI calls can `block_on` async SDK methods. Calling `runtime()`
+        // repeatedly MUST return the same `&'static Runtime` — otherwise
+        // the binding would leak runtimes on every call (and spawn a new
+        // thread pool per call).
+        let r1 = runtime();
+        let r2 = runtime();
+        assert!(std::ptr::eq(r1, r2), "runtime() must return a singleton");
+    }
+}

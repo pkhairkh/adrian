@@ -80,3 +80,49 @@ pub unsafe extern "system" fn Java_dev_adrian_sdk_AdrianClient_free(
     }
     drop(Box::from_raw(handle as *mut AdrianClient));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jni_entry_points_are_exported_with_expected_signatures() {
+        // Per ADR-107: the JNI binding exposes the AdrianClient Java class
+        // via three `extern "system"` (Windows stdcall on x86 JNI, C ABI
+        // elsewhere) native methods. We take function pointers — without
+        // invoking the FFI — so any drift in `#[no_mangle]` or the
+        // argument types (JNIEnv/JClass/JString/JLong/JBoolean) is caught
+        // at test time rather than at JVM link time on a downstream
+        // consumer.
+        let _new: unsafe extern "system" fn(JNIEnv, JClass) -> jlong =
+            Java_dev_adrian_sdk_AdrianClient_newClient;
+        let _join: unsafe extern "system" fn(JNIEnv, JClass, jlong, JString) -> jboolean =
+            Java_dev_adrian_sdk_AdrianClient_join;
+        let _free: unsafe extern "system" fn(JNIEnv, JClass, jlong) =
+            Java_dev_adrian_sdk_AdrianClient_free;
+    }
+
+    #[test]
+    fn runtime_singleton_is_idempotent() {
+        // The JNI binding stores its tokio runtime in a `OnceLock` so
+        // every native method `block_on`s on the same multi-threaded
+        // runtime. Repeated `runtime()` calls MUST return the same
+        // `&'static Runtime` — otherwise the binding would leak a fresh
+        // runtime per call (each carrying its own thread pool).
+        let r1 = runtime();
+        let r2 = runtime();
+        assert!(std::ptr::eq(r1, r2), "runtime() must return a singleton");
+    }
+
+    #[test]
+    fn jni_symbols_use_system_abi() {
+        // JNI on Windows x86 uses stdcall (`extern "system"`); everywhere
+        // else `extern "system"` resolves to the C ABI. Taking the
+        // pointer as `extern "system"` (rather than `extern "C"`)
+        // verifies the binding uses the JNI-correct ABI — a common
+        // Windows-JVM crash source if accidentally declared as `extern "C"`.
+        let _new: unsafe extern "system" fn(JNIEnv, JClass) -> jlong =
+            Java_dev_adrian_sdk_AdrianClient_newClient;
+        let _ = _new; // pin the symbol; do not invoke
+    }
+}

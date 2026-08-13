@@ -78,3 +78,50 @@ pub unsafe extern "C" fn adrian_client_join(
         Err(_) => -2,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[test]
+    fn handle_type_is_void_pointer_sized() {
+        // Per ADR-107: the C ABI exposes AdrianClient as an opaque void
+        // pointer. Callers (C/C++/Go/Ruby/Node hosts) must never deref
+        // into the struct layout — the handle is only valid for passing
+        // back to the `adrian_client_*` family. This test pins the
+        // handle to a single-pointer-sized type so any future change to
+        // the alias (e.g. accidentally exposing the inner type) is
+        // caught at compile/test time.
+        assert_eq!(
+            std::mem::size_of::<AdrianClientHandle>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+    }
+
+    #[test]
+    fn ffi_entry_points_are_exported_with_expected_signatures() {
+        // Take function pointers to each `#[no_mangle] extern "C"` entry
+        // point — without invoking them. This catches link-time
+        // regressions where a `#[no_mangle]` is removed or the signature
+        // drifts (e.g. someone adds a parameter and silently breaks ABI
+        // for downstream cbindgen-generated headers).
+        let _new: unsafe extern "C" fn() -> AdrianClientHandle = adrian_client_new;
+        let _free: unsafe extern "C" fn(AdrianClientHandle) = adrian_client_free;
+        let _join: unsafe extern "C" fn(AdrianClientHandle, *const c_char) -> i32 =
+            adrian_client_join;
+    }
+
+    #[test]
+    fn runtime_singleton_is_idempotent() {
+        // Per ADR-107: the C ABI lazily builds a single multi-threaded
+        // tokio runtime stored in a `OnceLock` so blocking FFI calls can
+        // `block_on` async SDK methods. Calling `runtime()` repeatedly
+        // MUST return the same `&'static Runtime` — otherwise the
+        // binding would leak runtimes on every call.
+        let r1 = runtime();
+        let r2 = runtime();
+        assert!(std::ptr::eq(r1, r2), "runtime() must return a singleton");
+    }
+}

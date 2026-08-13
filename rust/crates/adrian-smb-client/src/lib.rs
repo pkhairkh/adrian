@@ -52,3 +52,86 @@ impl Default for SmbClient {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_new_and_default_construct_without_state() {
+        // Per ADR-107 / ADR-106: the SMB client is constructed by the SDK
+        // FileModule. `new()` and `default()` must yield a usable handle
+        // (today, a zero-state struct) without touching the network.
+        let a = SmbClient::new();
+        let b = SmbClient::default();
+        let _ = (a, b);
+    }
+
+    #[tokio::test]
+    async fn connect_returns_loud_connect_error() {
+        // Loud stub convention — `connect` is not yet wired to TCP+TLS, so
+        // it MUST surface `SmbClientError::Connect` (the documented variant
+        // for connection-level failures). Returning Ok(()) would silently
+        // mislead the SDK FileModule into believing a session is open.
+        let client = SmbClient::new();
+        let err = client
+            .connect("dc01.adrian.example", "sysvol")
+            .await
+            .expect_err("connect must surface Connect until implemented");
+        assert!(matches!(err, SmbClientError::Connect(_)), "got {:?}", err);
+    }
+
+    #[tokio::test]
+    async fn open_returns_loud_share_error() {
+        // ADR-106: durable/persistent handle open is implemented later. The
+        // stub MUST surface `Share` (the variant documented for tree-level
+        // failures) rather than fabricating a handle id, so callers never
+        // mistake a stub for a real FileId.
+        let client = SmbClient::new();
+        let err = client
+            .open(r"\adrian\sysvol\policy.gpo")
+            .await
+            .expect_err("open must surface Share until implemented");
+        assert!(matches!(err, SmbClientError::Share(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn io_error_converts_via_from() {
+        // `SmbClientError::Io(#[from] std::io::Error)` — the `?` operator
+        // must transparently lift I/O errors (read/write on the TCP+TLS
+        // stream) into the client's error enum. Per ADR-106.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst by peer");
+        let smb_err: SmbClientError = io_err.into();
+        match smb_err {
+            SmbClientError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+            }
+            other => panic!("expected Io, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_variants_render_expected_prefixes() {
+        // Display strings are part of the public diagnostic contract —
+        // SDK FileModule maps them to platform-native error codes.
+        assert_eq!(
+            format!("{}", SmbClientError::Connect("tcp refused".into())),
+            "connect: tcp refused"
+        );
+        assert_eq!(
+            format!("{}", SmbClientError::Auth("spnego failed".into())),
+            "auth: spnego failed"
+        );
+        assert_eq!(
+            format!("{}", SmbClientError::Share("tree disconnected".into())),
+            "share: tree disconnected"
+        );
+        let io = SmbClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "eof",
+        ));
+        let msg = format!("{}", io);
+        assert!(msg.starts_with("io: "), "msg={}", msg);
+        assert!(msg.contains("eof"), "msg={}", msg);
+    }
+}
