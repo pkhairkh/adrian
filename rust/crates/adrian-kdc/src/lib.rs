@@ -167,6 +167,15 @@ pub mod kpasswd;
 /// lookups (principal-by-name, keytab lookup, etc.).
 pub mod store;
 
+/// AS-REQ / AS-REP / TGS-REQ / TGS-REP handlers (RFC 4120 §3.1 / §3.3).
+///
+/// Wave 2a: real AS-REQ → AS-REP and TGS-REQ → TGS-REP flows with RFC 3961
+/// §5.1 per-usage key derivation, PA-ENC-TIMESTAMP pre-auth verification,
+/// and TGT / service-ticket construction. The v0.6.0 wire format is a
+/// simplified self-consistent binary format (NOT ASN.1/DER); v0.7.0 will
+/// replace it with `rasn-kerberos` for MIT krb5 / Windows interop.
+pub mod handlers;
+
 #[cfg(test)]
 mod tests {
     use super::*;
