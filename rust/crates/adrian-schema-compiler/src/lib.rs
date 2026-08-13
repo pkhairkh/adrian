@@ -116,3 +116,154 @@ pub async fn read_schema_nc_head(
 // TODO: implement framework-native trait library projection (ServiceAccount, ManagedDevice, PolicySet, CertificateTemplate) per ADR-078 §Decision Layer 2.
 // TODO: implement #[derive(Projectable)] glue generation per ADR-078 §Decision Layer 2.
 // TODO: implement schema-as-code GitOps workflow per ADR-119 (pull LDIF from Git, apply via schemaModifyRequest).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adrian_storage_core_sub::StoreHandle;
+    use adrian_schema_traits::SchemaError;
+    use adrian_storage_core::{
+        DirectoryStore, DistinguishedName, Object, ReadTxn, StorageError, WriteTxn,
+    };
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// A no-op `DirectoryStore` stub used by the schema-compiler unit tests.
+    /// The compiler's methods are stubs that never actually read from the
+    /// store — the stub exists only so `SchemaCompiler::new` can be called
+    /// with a real `StoreHandle`.
+    #[derive(Debug, Default)]
+    struct StubStore;
+
+    #[async_trait]
+    impl DirectoryStore for StubStore {
+        async fn get(&self, _uuid: Uuid) -> Result<Option<Object>, StorageError> {
+            Ok(None)
+        }
+        async fn get_by_dn(&self, _dn: &DistinguishedName) -> Result<Option<Object>, StorageError> {
+            Ok(None)
+        }
+        async fn put(&self, _obj: &Object) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn delete(&self, _uuid: Uuid) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn begin_read(&self) -> Result<Box<dyn ReadTxn>, StorageError> {
+            Err(StorageError::Backend("stub store".into()))
+        }
+        async fn begin_write(&self) -> Result<Box<dyn WriteTxn>, StorageError> {
+            Err(StorageError::Backend("stub store".into()))
+        }
+        fn snapshot(&self) -> Box<dyn DirectoryStore> {
+            Box::new(StubStore)
+        }
+    }
+
+    fn make_compiler() -> SchemaCompiler {
+        let store: StoreHandle = Arc::new(StubStore);
+        SchemaCompiler::new(store)
+    }
+
+    #[test]
+    fn new_stores_handle_without_panic() {
+        // Construction must succeed — even with a stub store, the compiler
+        // stores the handle for later use by `compile` / `recompile_and_swap`.
+        let _compiler = make_compiler();
+    }
+
+    #[test]
+    fn store_handle_is_clone_via_arc() {
+        // `StoreHandle = Arc<dyn DirectoryStore>` — clones share the same
+        // underlying store. Verify the aliasing semantics hold so the
+        // compiler can hand the handle off to sub-components (e.g. a future
+        // schema-cache snapshot).
+        let store: StoreHandle = Arc::new(StubStore);
+        let store2 = store.clone();
+        // Two clones of an Arc point at the same allocation — a round-trip
+        // through `Arc::as_ptr` would confirm pointer equality, but we settle
+        // for verifying both are usable.
+        let compiler1 = SchemaCompiler::new(store);
+        let compiler2 = SchemaCompiler::new(store2);
+        // Both compilers should hold the same trait-object pointer.
+        let ptr1 = Arc::as_ptr(&compiler1.store) as *const ();
+        let ptr2 = Arc::as_ptr(&compiler2.store) as *const ();
+        assert_eq!(ptr1, ptr2, "Arc clones must point at the same store");
+    }
+
+    #[tokio::test]
+    async fn compile_returns_projection_compile_error() {
+        // Per ADR-078 / Decision 4 — the schema compiler is a stub in this
+        // wave; calling `compile` before implementation must surface a loud
+        // `SchemaError::ProjectionCompile` (per ADR-078 §Decision — loud
+        // failure at boot, never silent).
+        let compiler = make_compiler();
+        let result = compiler.compile().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SchemaError::ProjectionCompile(_))));
+    }
+
+    #[tokio::test]
+    async fn recompile_and_swap_returns_projection_compile_error() {
+        // Per ADR-003 — atomic pointer-swap of a new generation; the stub
+        // must surface `ProjectionCompile` until the real implementation
+        // lands (Wave 4b).
+        let compiler = make_compiler();
+        let result = compiler.recompile_and_swap().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SchemaError::ProjectionCompile(_))));
+    }
+
+    #[test]
+    fn dump_rust_returns_projection_compile_error() {
+        // `dump_rust` is the developer-only `adrian-schema dump-rust` command
+        // (per Decision 4 §Decision Layer 1) — NOT on the production code
+        // path. The stub returns `ProjectionCompile` until implemented.
+        let compiler = make_compiler();
+        let projection = SchemaProjection {
+            attributes: std::collections::HashMap::new(),
+            classes: std::collections::HashMap::new(),
+            attribute_name_to_id: std::collections::HashMap::new(),
+            class_name_to_id: std::collections::HashMap::new(),
+            generation: 1,
+        };
+        let result = compiler.dump_rust(&projection);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SchemaError::ProjectionCompile(_))));
+    }
+
+    #[tokio::test]
+    async fn read_schema_nc_head_returns_projection_compile_error() {
+        // Per ADR-003 — the schema NC head UUID is read from the directory
+        // config subspace at boot. The stub surfaces `ProjectionCompile`
+        // until implemented.
+        let store: StoreHandle = Arc::new(StubStore);
+        let result = read_schema_nc_head(&store).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SchemaError::ProjectionCompile(_))));
+    }
+
+    #[test]
+    fn projection_compile_error_displays_with_message() {
+        // Per ADR-078 §Decision — validation failures must be surfaced at
+        // projection compile time, not silently. Verify the error's Display
+        // implementation propagates the underlying message.
+        let err = SchemaError::ProjectionCompile("boom".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("boom"), "expected message in: {}", msg);
+        assert!(msg.contains("schema projection compile failed"));
+    }
+
+    // NOTE: Real-schema-NC integration tests (walking attributeSchema /
+    // classSchema objects, validating mustContain, linkID pairs, atomic
+    // generation swap) require a populated FDB-backed directory and the
+    // `fdb` feature flag. They are intentionally omitted from this
+    // unit-test module — see `adrian-test-harness` for integration tests.
+    #[tokio::test]
+    #[ignore = "requires a populated FDB-backed directory and the `fdb` feature flag"]
+    async fn integration_compile_walks_schema_nc() {
+        // Placeholder — will be implemented in `adrian-test-harness` once
+        // the FDB integration testkit is added in Wave 4b.
+    }
+}

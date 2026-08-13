@@ -197,3 +197,163 @@ pub async fn assign_sid(
         "assign_sid not yet implemented (gated by `fdb` feature)".into(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn rid_batch_size_matches_ad_default() {
+        // Per Decision 3 §Decision — must match AD's `RIDAllocationPoolSize`
+        // for AD-interop wire compatibility.
+        assert_eq!(RID_BATCH_SIZE, 500);
+    }
+
+    #[test]
+    fn warning_threshold_is_half_batch_size() {
+        // Per Decision 3 §Decision — defaults to AD's
+        // `rIDAllocationPoolRenewThreshold` (half the batch size). When the
+        // remaining pool drops below this threshold, the DC preemptively
+        // requests a new batch from the RID-master.
+        assert_eq!(RID_EXHAUSTION_WARNING_THRESHOLD, 250);
+        assert_eq!(RID_EXHAUSTION_WARNING_THRESHOLD, RID_BATCH_SIZE / 2);
+    }
+
+    #[test]
+    fn rid_type_alias_is_u32() {
+        // RIDs are 32-bit per MS-DTYP §2.4.2 — verify the alias is exactly
+        // `u32` so consumers can rely on its width.
+        let r: Rid = 0xFFFF_FFFF;
+        assert_eq!(r, u32::MAX);
+    }
+
+    #[test]
+    fn fdb_allocator_new_propagates_store() {
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(Some("/tmp/rid.cluster"));
+        let allocator = FdbRidPoolAllocator::new(store);
+        assert_eq!(
+            allocator.store.cluster_file.as_deref(),
+            Some("/tmp/rid.cluster")
+        );
+    }
+
+    #[test]
+    fn local_allocator_new_propagates_invocation_id_and_store() {
+        // Per Decision 3 — in native mode each DC allocates RIDs locally keyed
+        // by its `invocationId`. Verify both fields are stored.
+        let invocation_id = Uuid::from_u128(0xABCD_1234);
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        let allocator = LocalRidAllocator::new(invocation_id, store);
+        assert_eq!(allocator.local_dc_id, invocation_id);
+        assert!(allocator.store.cluster_file.is_none());
+    }
+
+    #[test]
+    fn rid_pool_state_serializes_round_trip() {
+        // `RidPoolState` is stored at FDB key (0x06, domain_sid_bytes) —
+        // serde round-trip must be lossless.
+        let state = RidPoolState {
+            next_rid: 1000,
+            last_allocated_rid: 1500,
+            warning_threshold: RID_EXHAUSTION_WARNING_THRESHOLD,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let decoded: RidPoolState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.next_rid, 1000);
+        assert_eq!(decoded.last_allocated_rid, 1500);
+        assert_eq!(decoded.warning_threshold, 250);
+    }
+
+    #[test]
+    fn rid_pool_state_default_warning_threshold_is_250() {
+        // Verify the documented default — even though `RidPoolState` has no
+        // `Default` impl, the canonical initial state uses
+        // `RID_EXHAUSTION_WARNING_THRESHOLD` for the warning_threshold field.
+        let initial = RidPoolState {
+            next_rid: 500,
+            last_allocated_rid: 1000,
+            warning_threshold: RID_EXHAUSTION_WARNING_THRESHOLD,
+        };
+        assert_eq!(initial.warning_threshold, 250);
+    }
+
+    #[tokio::test]
+    async fn fdb_allocator_allocate_returns_backend_error_without_fdb() {
+        // The FDB-backed allocator requires the `fdb` feature flag. Without
+        // it, `allocate` must surface a `Backend` error rather than panicking.
+        let allocator = FdbRidPoolAllocator::new(adrian_storage_fdb::FdbDirectoryStore::new(None));
+        let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
+        let result = allocator.allocate(&domain_sid).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn fdb_allocator_allocate_batch_returns_backend_error_without_fdb() {
+        let allocator = FdbRidPoolAllocator::new(adrian_storage_fdb::FdbDirectoryStore::new(None));
+        let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
+        let result = allocator.allocate_batch(&domain_sid, 500).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn fdb_allocator_state_returns_backend_error_without_fdb() {
+        let allocator = FdbRidPoolAllocator::new(adrian_storage_fdb::FdbDirectoryStore::new(None));
+        let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
+        let result = allocator.state(&domain_sid).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn local_allocator_returns_backend_error_without_fdb() {
+        // LocalRidAllocator is also FDB-backed (per-DC local counter at
+        // (0x06, local_dc_id, domain_sid) key). Verify it surfaces
+        // `Backend` for every method when the `fdb` feature is off.
+        let allocator = LocalRidAllocator::new(
+            Uuid::nil(),
+            adrian_storage_fdb::FdbDirectoryStore::new(None),
+        );
+        let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
+        assert!(matches!(
+            allocator.allocate(&domain_sid).await,
+            Err(IdentityError::Backend(_))
+        ));
+        assert!(matches!(
+            allocator.allocate_batch(&domain_sid, 10).await,
+            Err(IdentityError::Backend(_))
+        ));
+        assert!(matches!(
+            allocator.state(&domain_sid).await,
+            Err(IdentityError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn assign_sid_returns_backend_error_without_fdb() {
+        // The `assign_sid` helper composes RID allocation + SID construction +
+        // IdentityMapping insertion; all three require FDB. Without `fdb`,
+        // it must surface a `Backend` error.
+        let allocator: Box<dyn RidPoolAllocator> = Box::new(FdbRidPoolAllocator::new(
+            adrian_storage_fdb::FdbDirectoryStore::new(None),
+        ));
+        let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
+        let result = assign_sid(allocator.as_ref(), &domain_sid, Uuid::nil()).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    // NOTE: FDB-backed integration tests (RID-pool exhaustion, batch
+    // dispensation, RID-master coordination, lock-free atomic-add allocation)
+    // require a running FoundationDB cluster and the `fdb` feature flag. They
+    // are intentionally omitted from this unit-test module — see
+    // `adrian-test-harness` for integration tests.
+    #[tokio::test]
+    #[ignore = "requires a running FDB cluster and the `fdb` feature flag"]
+    async fn fdb_integration_rid_pool_exhaustion_triggers_batch_request() {
+        // Placeholder — will be implemented in `adrian-test-harness` once the
+        // FDB integration testkit is added in Wave 4b.
+    }
+}

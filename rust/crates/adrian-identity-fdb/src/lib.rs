@@ -117,3 +117,150 @@ impl IdentityMapping for FdbIdentityMapping {
 
 // TODO: implement FDB watches (tokio::sync::watch) for LRU cache invalidation per Decision 3 §Async runtime.
 // TODO: implement PosixId collision detection per Decision 3 §Trade-offs accepted.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adrian_identity_core::IdentityMapping;
+    use uuid::Uuid;
+
+    /// Construct a default-backed `FdbIdentityMapping` for tests. The store is
+    /// a stub and never reads/writes FDB — it is only used to verify the
+    /// struct's public construction surface.
+    fn make_mapping() -> FdbIdentityMapping {
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(None);
+        FdbIdentityMapping::new(store)
+    }
+
+    #[test]
+    fn new_sets_default_cache_capacity() {
+        // Per Decision 3 §Implementation impact — default cache capacity is
+        // 100_000 entries (~80 MB resident set on a mid-size forest).
+        let mapping = make_mapping();
+        assert_eq!(mapping.cache_capacity, 100_000);
+    }
+
+    #[test]
+    fn cache_capacity_is_mutable() {
+        // Callers can tune the cache capacity for memory-constrained
+        // deployments (e.g. edge DCs).
+        let mut mapping = make_mapping();
+        mapping.cache_capacity = 1_000;
+        assert_eq!(mapping.cache_capacity, 1_000);
+    }
+
+    #[test]
+    fn store_handle_is_propagated() {
+        // The store field is `pub` — verify the construction propagates the
+        // cluster file path through to the underlying store.
+        let store = adrian_storage_fdb::FdbDirectoryStore::new(Some("/tmp/test.cluster"));
+        let mapping = FdbIdentityMapping::new(store);
+        assert_eq!(
+            mapping.store.cluster_file.as_deref(),
+            Some("/tmp/test.cluster")
+        );
+    }
+
+    #[test]
+    fn clone_preserves_fields() {
+        let mapping = make_mapping();
+        let cloned = mapping.clone();
+        assert_eq!(mapping.cache_capacity, cloned.cache_capacity);
+        assert_eq!(mapping.store.cluster_file, cloned.store.cluster_file);
+    }
+
+    #[tokio::test]
+    async fn lookup_uid_returns_algorithmic_mapping() {
+        // Per Decision 3 — `lookup_uid` falls back to the algorithmic
+        // `uuid_to_uid` mapping when `uidNumber` is not directory-stored. The
+        // stub implementation must return `Some(uuid_to_uid(uuid))`.
+        let mapping = make_mapping();
+        let uuid = Uuid::from_u128(0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF);
+        let result = mapping.lookup_uid(uuid).await.unwrap();
+        let expected = adrian_identity_core::uuid_to_uid(uuid);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn lookup_uid_is_deterministic() {
+        let mapping = make_mapping();
+        let uuid = Uuid::nil();
+        let uid1 = mapping.lookup_uid(uuid).await.unwrap();
+        let uid2 = mapping.lookup_uid(uuid).await.unwrap();
+        assert_eq!(uid1, uid2);
+    }
+
+    #[tokio::test]
+    async fn lookup_uid_is_in_posix_range() {
+        // Per Decision 3 §Decision — UID must be in [65536, 2^31-1).
+        let mapping = make_mapping();
+        for i in 0..64u128 {
+            let uuid = Uuid::from_u128(i);
+            if let Some(uid) = mapping.lookup_uid(uuid).await.unwrap() {
+                assert!(uid >= 65536, "uid {} < 65536", uid);
+                assert!(uid < (1u32 << 31), "uid {} >= 2^31", uid);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_sid_returns_backend_error_when_fdb_unavailable() {
+        // The FDB-backed implementation is gated behind the `fdb` feature.
+        // Without the feature, `lookup_sid` must surface a `Backend` error
+        // (not panic), so callers can degrade gracefully.
+        let mapping = make_mapping();
+        let result = mapping.lookup_sid(Uuid::nil()).await;
+        assert!(result.is_err(), "expected an error");
+        assert!(
+            matches!(result, Err(IdentityError::Backend(_))),
+            "expected Backend error, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_uuid_returns_backend_error_when_fdb_unavailable() {
+        let mapping = make_mapping();
+        let sid: Sid = "S-1-5-21-100-200-300-1000".parse().unwrap();
+        let result = mapping.lookup_uuid(&sid).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn lookup_uuid_from_uid_returns_backend_error_when_fdb_unavailable() {
+        let mapping = make_mapping();
+        let result = mapping.lookup_uuid_from_uid(65536).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn insert_returns_backend_error_when_fdb_unavailable() {
+        let mapping = make_mapping();
+        let sid: Sid = "S-1-5-21-100-200-300-1000".parse().unwrap();
+        let result = mapping.insert(Uuid::nil(), &sid).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn remove_returns_backend_error_when_fdb_unavailable() {
+        let mapping = make_mapping();
+        let result = mapping.remove(Uuid::nil()).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdentityError::Backend(_))));
+    }
+
+    // NOTE: FDB-backed integration tests (forward/reverse index reads, LRU
+    // cache hit/miss, FDB watch invalidation) require a running FoundationDB
+    // cluster and the `fdb` feature flag. They are intentionally omitted from
+    // this unit-test module — see `adrian-test-harness` for integration tests
+    // that spin up a real FDB cluster via docker-compose.
+    #[tokio::test]
+    #[ignore = "requires a running FDB cluster and the `fdb` feature flag"]
+    async fn fdb_integration_lookup_sid_hits_lru_cache() {
+        // Placeholder — will be implemented in `adrian-test-harness` once the
+        // FDB integration testkit is added in Wave 4b.
+    }
+}

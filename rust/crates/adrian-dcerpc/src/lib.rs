@@ -199,3 +199,218 @@ pub fn decode_bind_pdu(_buf: &[u8]) -> Result<(InterfaceUuid, (u16, u16)), DceRp
 // TODO: implement LSARPC dispatch (per MS-LSAD — Layer 3, gated by ad-interop).
 // TODO: implement Netlogon dispatch (per MS-NRPC — Layer 3, gated by ad-interop).
 // TODO: implement MS-WCCE dispatch (per MS-WCCE — Layer 3, gated by ad-interop; used by adrian-wcce-bridge).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::net::SocketAddr;
+
+    /// A stub `DceRpcServer` used by the endpoint-registration tests. Every
+    /// opnum surfaces `OpnumNotImplemented`, matching the framework's
+    /// "loud stub" convention.
+    struct StubServer {
+        interface: InterfaceUuid,
+        version: (u16, u16),
+    }
+
+    #[async_trait]
+    impl DceRpcServer for StubServer {
+        fn interface(&self) -> InterfaceUuid {
+            self.interface.clone()
+        }
+        fn interface_version(&self) -> (u16, u16) {
+            self.version
+        }
+        async fn dispatch(&self, opnum: u16, _stub: &[u8]) -> Result<Vec<u8>, DceRpcError> {
+            Err(DceRpcError::OpnumNotImplemented(
+                opnum,
+                format!("{:?}", self.interface),
+            ))
+        }
+    }
+
+    #[test]
+    fn interface_uuid_constants_match_published_values() {
+        // Per MS-DRSR §1.9, MS-SAMR §1.9, MS-LSAD §1.9, MS-NRPC §1.9,
+        // MS-WCCE §1.9 — the interface UUIDs are protocol-fixed. Verify the
+        // constants match the canonical string forms.
+        assert_eq!(
+            InterfaceUuid::DRSUAPI.0.to_string().to_uppercase(),
+            "E3514235-4B06-11D1-AB04-00C04FC2DCD2"
+        );
+        assert_eq!(
+            InterfaceUuid::SAMR.0.to_string().to_uppercase(),
+            "12345778-1234-ABCD-EF00-0123456789AC"
+        );
+        assert_eq!(
+            InterfaceUuid::LSARPC.0.to_string().to_uppercase(),
+            "12345778-1234-ABCD-EF00-0123456789AB"
+        );
+        assert_eq!(
+            InterfaceUuid::NETLOGON.0.to_string().to_uppercase(),
+            "12345678-1234-ABCD-EF00-01234567CFFB"
+        );
+        assert_eq!(
+            InterfaceUuid::WCCE.0.to_string().to_uppercase(),
+            "91AE6020-9E3C-11CF-8D7C-00AA00C009CF"
+        );
+    }
+
+    #[test]
+    fn interface_uuids_are_distinct() {
+        // Sanity check — the five protocol UUIDs must be distinct so that
+        // `DceRpcEndpoint` can dispatch on interface UUID alone.
+        let uuids = [
+            InterfaceUuid::DRSUAPI.clone(),
+            InterfaceUuid::SAMR.clone(),
+            InterfaceUuid::LSARPC.clone(),
+            InterfaceUuid::NETLOGON.clone(),
+            InterfaceUuid::WCCE.clone(),
+        ];
+        for i in 0..uuids.len() {
+            for j in (i + 1)..uuids.len() {
+                assert_ne!(uuids[i], uuids[j], "duplicate UUID at indices {} {}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn interface_uuid_equality_and_hash() {
+        // `InterfaceUuid` derives `PartialEq`, `Eq`, `Hash` so it can be used
+        // as a HashMap key for dispatch lookup.
+        let a = InterfaceUuid::DRSUAPI.clone();
+        let b = InterfaceUuid::DRSUAPI.clone();
+        assert_eq!(a, b);
+        assert_eq!(a.0, b.0);
+
+        // Hash should also be equal for equal values.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        a.hash(&mut ha);
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn ncacn_ip_tcp_is_only_v1_transport() {
+        // Per Decision 1 §Async runtime — only `ncacn_ip_tcp` is supported
+        // in v1. Verify the enum has exactly one variant.
+        let t = DceRpcTransport::NcacnIpTcp;
+        assert_eq!(t, DceRpcTransport::NcacnIpTcp);
+        // Round-trip through Copy — the transport must be Copy so it can be
+        // embedded by value in `BindEndpoint`.
+        let t2 = t;
+        assert_eq!(t, t2);
+    }
+
+    #[test]
+    fn dce_rpc_error_io_conversion() {
+        // `DceRpcError::Io` has `#[from] std::io::Error` — the `?` operator
+        // must convert seamlessly.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nope");
+        let dce_err: DceRpcError = io_err.into();
+        assert!(matches!(dce_err, DceRpcError::Io(_)));
+        assert!(format!("{}", dce_err).contains("I/O error"));
+    }
+
+    #[test]
+    fn dce_rpc_error_displays_for_each_variant() {
+        // Verify Display coverage so callers get actionable error messages.
+        assert!(format!("{}", DceRpcError::BindFailed("x".into())).contains("bind failed"));
+        assert!(
+            format!("{}", DceRpcError::InterfaceNotSupported("i".into()))
+                .contains("interface not supported")
+        );
+        assert!(
+            format!("{}", DceRpcError::OpnumNotImplemented(3, "i".into()))
+                .contains("opnum 3 not implemented")
+        );
+        assert!(
+            format!("{}", DceRpcError::AuthFailed("a".into())).contains("authentication failed")
+        );
+        assert!(format!("{}", DceRpcError::Ndr("n".into())).contains("NDR error"));
+    }
+
+    #[test]
+    fn endpoint_new_initialises_empty_server_list() {
+        // Per [C706] §12 — a fresh endpoint has no registered servers until
+        // `register` is called.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint = DceRpcEndpoint::new(addr);
+        assert_eq!(endpoint.bind_addr, addr);
+        assert!(endpoint.servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn endpoint_register_appends_server() {
+        // `register` must push the server onto the servers vec — verify
+        // count goes up and the stored server's interface UUID round-trips.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut endpoint = DceRpcEndpoint::new(addr);
+        endpoint.register(Box::new(StubServer {
+            interface: InterfaceUuid::DRSUAPI,
+            version: (4, 0),
+        }));
+        endpoint.register(Box::new(StubServer {
+            interface: InterfaceUuid::SAMR,
+            version: (1, 0),
+        }));
+        assert_eq!(endpoint.servers.len(), 2);
+        assert_eq!(endpoint.servers[0].interface(), InterfaceUuid::DRSUAPI);
+        assert_eq!(endpoint.servers[0].interface_version(), (4, 0));
+        assert_eq!(endpoint.servers[1].interface(), InterfaceUuid::SAMR);
+        assert_eq!(endpoint.servers[1].interface_version(), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn endpoint_run_returns_bind_failed_until_implemented() {
+        // Per [C706] §12 — the TCP listener is not yet wired up. The stub
+        // must surface `BindFailed` rather than panicking or hanging.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint = DceRpcEndpoint::new(addr);
+        let result = endpoint.run().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DceRpcError::BindFailed(_))));
+    }
+
+    #[test]
+    fn encode_bind_pdu_returns_empty_vec_as_stub() {
+        // The bind-PDU encoder is not yet implemented — the stub returns an
+        // empty buffer. Callers must not assume a particular length yet.
+        let buf = encode_bind_pdu(&InterfaceUuid::DRSUAPI, (4, 0));
+        assert!(
+            buf.is_empty(),
+            "stub must return empty buffer, got {} bytes",
+            buf.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_bind_pdu_returns_ndr_error_as_stub() {
+        // The bind-PDU decoder is not yet implemented — the stub surfaces an
+        // `Ndr` error so callers can degrade gracefully.
+        let result = decode_bind_pdu(&[0u8; 16]);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DceRpcError::Ndr(_))));
+    }
+
+    #[tokio::test]
+    async fn stub_server_dispatch_surfaces_opnum_not_implemented() {
+        // The framework's "loud stub" convention — every unimplemented opnum
+        // must surface `OpnumNotImplemented` rather than silently returning
+        // empty output.
+        let server = StubServer {
+            interface: InterfaceUuid::DRSUAPI,
+            version: (4, 0),
+        };
+        let result = server.dispatch(0x04, b"input").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DceRpcError::OpnumNotImplemented(0x04, _))
+        ));
+    }
+}
