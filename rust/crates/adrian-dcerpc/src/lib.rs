@@ -12,11 +12,42 @@
 //!
 //! | Protocol | UUID | ADR | Status |
 //! |----------|------|-----|--------|
-//! | DRSUAPI  | `E3514235-4B06-11D1-AB04-00C04FC2DCD2` | ADR-070 | stub |
-//! | SAMR     | `12345778-1234-ABCD-EF00-0123456789AC` | ADR-066 | stub |
-//! | LSARPC   | `12345778-1234-ABCD-EF00-0123456789AB` | ADR-125 | stub |
-//! | Netlogon | `12345678-1234-ABCD-EF00-01234567CFFB` | ADR-086 | stub |
-//! | MS-WCCE  | `91AE6020-9E3C-11CF-8D7C-00AA00C009CF` | ADR-095 | stub |
+//! | DRSUAPI  | `E3514235-4B06-11D1-AB04-00C04FC2DCD2` | ADR-070 | transport ready; opnums in `adrian-drsuapi` |
+//! | SAMR     | `12345778-1234-ABCD-EF00-0123456789AC` | ADR-066 | transport ready; dispatch is Layer 3 |
+//! | LSARPC   | `12345778-1234-ABCD-EF00-0123456789AB` | ADR-125 | transport ready; dispatch is Layer 3 |
+//! | Netlogon | `12345678-1234-ABCD-EF00-01234567CFFB` | ADR-086 | transport ready; dispatch is Layer 3 |
+//! | MS-WCCE  | `91AE6020-9E3C-11CF-8D7C-00AA00C009CF` | ADR-095 | transport ready; dispatch is Layer 3 |
+//!
+//! ## What's real (Wave 2a)
+//!
+//! - NDR20 encoding/decoding ([`ndr`]) — primitives for NDR20 wire format:
+//!   `u8`/`u16`/`u32`/`u64` with natural alignment, conformant-varying
+//!   byte arrays, UTF-16LE strings, 16-byte UUIDs. Every `write_X(v)`
+//!   round-trips through `read_X()`.
+//! - Bind / Bind_ack PDU encode/decode ([`pdu`]) — full common header
+//!   (16 bytes) + Bind body + Bind_ack body with `sec_addr` padding and
+//!   `p_result_list`. `frag_length` is computed and patched in on encode,
+//!   validated on decode.
+//! - Request / Response PDU encode/decode ([`pdu`]) — minimal framing
+//!   for the TCP transport to send method calls.
+//! - TCP transport ([`transport::DcerpcTcpTransport`]) — async client
+//!   over any `AsyncRead + AsyncWrite + Unpin` (works with
+//!   `tokio::net::TcpStream` for real network and `tokio::io::duplex`
+//!   for tests).
+//!
+//! ## What's still stubbed
+//!
+//! - [`DceRpcEndpoint::run`] — the server-side dispatch loop. Now that
+//!   the transport primitives are in place, a follow-up wave can build
+//!   the listener on top of `tokio::net::TcpListener`.
+//! - RPC security (Kerberos/SPNEGO auth at `PKT_PRIVACY`) — deferred to
+//!   the wave that implements the KDC. Auth-level negotiation is stubbed
+//!   (auth_length = 0 on every PDU).
+//! - PDU types other than Bind / Bind_ack / Request / Response (Fault,
+//!   Bind_nak, Alter_context, Alter_context_resp, Auth3, Shutdown,
+//!   Orphaned) — deferred to the wave that needs them.
+//! - The Layer-3 protocol dispatches (DRSUAPI, SAMR, LSARPC, Netlogon,
+//!   MS-WCCE) — out of scope for this crate.
 //!
 //! ## ADRs
 //!
@@ -37,6 +68,24 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod ndr;
+pub mod pdu;
+pub mod transport;
+
+// Re-export the most-used types at the crate root for convenience.
+pub use ndr::{
+    NdrReader, NdrWriter, NDR_TRANSFER_SYNTAX_UUID, NDR_TRANSFER_SYNTAX_VERSION,
+    DEFAULT_MAX_RECV_FRAG, DEFAULT_MAX_XMIT_FRAG,
+};
+pub use pdu::{
+    ack_reason, ack_result, decode_bind_ack_pdu, decode_bind_pdu, decode_response_pdu,
+    encode_bind_ack_pdu, encode_bind_pdu, encode_request_pdu, BindAckPdu, BindPdu, PContextElem,
+    PResult, PFC_CONC_MPX, PFC_FIRST_FRAG, PFC_LAST_FRAG, PTYPE_BIND, PTYPE_BIND_ACK,
+    PTYPE_REQUEST, PTYPE_RESPONSE, NDR20_DATA_REP, COMMON_HEADER_SIZE, REQUEST_HEADER_SIZE,
+    RESPONSE_HEADER_SIZE,
+};
+pub use transport::DcerpcTcpTransport;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -45,8 +94,8 @@ use thiserror::Error;
 pub struct InterfaceUuid(pub uuid::Uuid);
 
 impl InterfaceUuid {
-    /// DRSUAPI interface UUID (`E3514235-4B06-11D1-AB04-00C04FC2DCD2`, per
-    /// MS-DRSR §1.9).
+    /// DRSUAPI interface UUID (matches the constant already pinned by the
+    /// existing test `interface_uuid_constants_match_published_values`).
     pub const DRSUAPI: Self = Self(uuid::Uuid::from_u128(
         0xE3514235_4B06_11D1_AB04_00C04FC2DCD2,
     ));
@@ -74,6 +123,24 @@ impl InterfaceUuid {
     pub const WCCE: Self = Self(uuid::Uuid::from_u128(
         0x91AE6020_9E3C_11CF_8D7C_00AA00C009CF,
     ));
+
+    /// Return the underlying [`uuid::Uuid`].
+    #[must_use]
+    pub fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+impl From<uuid::Uuid> for InterfaceUuid {
+    fn from(u: uuid::Uuid) -> Self {
+        Self(u)
+    }
+}
+
+impl From<InterfaceUuid> for uuid::Uuid {
+    fn from(i: InterfaceUuid) -> Self {
+        i.0
+    }
 }
 
 /// A DCE/RPC bind address (per [C706] §7.3 — `ncacn_ip_tcp:HOST[PORT]`).
@@ -144,6 +211,13 @@ pub trait DceRpcServer: Send + Sync {
 
 /// A DCE/RPC server endpoint — binds to a TCP port and dispatches incoming
 /// PDUs to the registered `DceRpcServer` implementations (per [C706] §12).
+///
+/// **Status (Wave 2a)**: `new()` and `register()` work; `run()` is still a
+/// stub returning [`DceRpcError::BindFailed`]. The transport primitives
+/// in [`transport::DcerpcTcpTransport`] (client-side) and the PDU
+/// encode/decode in [`pdu`] are real — a follow-up wave can implement
+/// `run()` on top of `tokio::net::TcpListener` + the existing
+/// `pdu::encode_bind_ack_pdu` / `pdu::encode_response_pdu` helpers.
 pub struct DceRpcEndpoint {
     /// The bind address.
     pub bind_addr: std::net::SocketAddr,
@@ -153,6 +227,7 @@ pub struct DceRpcEndpoint {
 
 impl DceRpcEndpoint {
     /// Construct a new `DceRpcEndpoint` on the given bind address.
+    #[must_use]
     pub fn new(bind_addr: std::net::SocketAddr) -> Self {
         Self {
             bind_addr,
@@ -167,38 +242,38 @@ impl DceRpcEndpoint {
 
     /// Run the endpoint — bind TCP, accept connections, dispatch PDUs.
     /// Blocks until shutdown.
+    ///
+    /// **Status (Wave 2a)**: not yet implemented. The transport
+    /// primitives are now in place ([`pdu`], [`transport`]); a
+    /// follow-up wave will wire up the listener on top of
+    /// `tokio::net::TcpListener` + `pdu::encode_bind_ack_pdu`.
     pub async fn run(&self) -> Result<(), DceRpcError> {
-        // TODO: implement per [C706] §12 — bind TCP listener on bind_addr,
-        // accept connections, read Bind PDU, negotiate interface, dispatch
-        // Request PDUs to the appropriate server.
+        // TODO(W2-followup): implement per [C706] §12 — bind TCP listener
+        // on bind_addr, accept connections, read Bind PDU, negotiate
+        // interface via pdu::encode_bind_ack_pdu, dispatch Request PDUs to
+        // the appropriate server. All the PDU/NDR primitives needed are
+        // now in the `pdu` and `ndr` modules.
         Err(DceRpcError::BindFailed(
-            "DceRpcEndpoint::run not yet implemented".into(),
+            "DceRpcEndpoint::run not yet implemented (Wave 2a delivered transport + PDU primitives; server-side dispatch loop is a follow-up wave)".into(),
         ))
     }
 }
 
-/// Encode a Bind PDU (per [C706] §12.6.1).
-pub fn encode_bind_pdu(_interface: &InterfaceUuid, _version: (u16, u16)) -> Vec<u8> {
-    // TODO: implement per [C706] §12.6.1 / MS-RPCE §2.2.1.
-    Vec::new()
-}
-
-/// Decode a Bind PDU (per [C706] §12.6.1).
-pub fn decode_bind_pdu(_buf: &[u8]) -> Result<(InterfaceUuid, (u16, u16)), DceRpcError> {
-    // TODO: implement per [C706] §12.6.1 / MS-RPCE §2.2.1.
-    Err(DceRpcError::Ndr(
-        "decode_bind_pdu not yet implemented".into(),
-    ))
-}
-
-// TODO: implement PDU framing (Request, Response, Bind, BindAck, BindNak, AlterContext, AlterContextResp) per [C706] §12.6.
-// TODO: implement NDR encoding/decoding (Type 1 + Type 3 conformant arrays, pointers, pipes) per [C706] §14.
-// TODO: implement RPC security (Kerberos auth, privacy/integrity) per [C706] §13 + ADR-021.
-// TODO: implement DRSUAPI dispatch (in adrian-drsuapi — uses this crate as transport).
-// TODO: implement SAMR dispatch (per MS-SAMR — Layer 3, gated by ad-interop).
-// TODO: implement LSARPC dispatch (per MS-LSAD — Layer 3, gated by ad-interop).
-// TODO: implement Netlogon dispatch (per MS-NRPC — Layer 3, gated by ad-interop).
-// TODO: implement MS-WCCE dispatch (per MS-WCCE — Layer 3, gated by ad-interop; used by adrian-wcce-bridge).
+// TODO(W2-followup): implement DceRpcEndpoint::run() on top of
+// tokio::net::TcpListener + the pdu/ndr/transport modules. All PDU/NDR
+// primitives are now in place — this is a thin listener loop, not a
+// protocol implementation.
+// TODO(W2-followup): implement RPC security (Kerberos auth, privacy/integrity)
+// per [C706] §13 + ADR-021. Auth-level negotiation is currently stubbed
+// (auth_length = 0 on every PDU).
+// TODO(W3): implement DRSUAPI dispatch (in adrian-drsuapi — uses this crate
+// as transport). The DRSUAPI opnums (DRSBind, DRSGetNCChanges, etc.) require
+// REPLENTIN_V3 NDR encoding on top of the primitives in this crate's ndr
+// module.
+// TODO(W3): implement SAMR dispatch (per MS-SAMR — Layer 3, gated by ad-interop).
+// TODO(W3): implement LSARPC dispatch (per MS-LSAD — Layer 3, gated by ad-interop).
+// TODO(W3): implement Netlogon dispatch (per MS-NRPC — Layer 3, gated by ad-interop).
+// TODO(W3): implement MS-WCCE dispatch (per MS-WCCE — Layer 3, gated by ad-interop; used by adrian-wcce-bridge).
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +370,17 @@ mod tests {
     }
 
     #[test]
+    fn interface_uuid_to_from_uuid_round_trips() {
+        // The `From<uuid::Uuid>` and `From<InterfaceUuid>` impls let callers
+        // convert losslessly in both directions.
+        let raw = uuid::Uuid::from_u128(0x12345678_1234_ABCD_EF00_01234567CFFB);
+        let iface: InterfaceUuid = raw.into();
+        assert_eq!(iface.as_uuid(), &raw);
+        let back: uuid::Uuid = iface.into();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
     fn ncacn_ip_tcp_is_only_v1_transport() {
         // Per Decision 1 §Async runtime — only `ncacn_ip_tcp` is supported
         // in v1. Verify the enum has exactly one variant.
@@ -367,8 +453,10 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_run_returns_bind_failed_until_implemented() {
-        // Per [C706] §12 — the TCP listener is not yet wired up. The stub
-        // must surface `BindFailed` rather than panicking or hanging.
+        // Per [C706] §12 — the server-side listener is not yet wired up
+        // (Wave 2a delivered transport + PDU primitives; the listener loop
+        // is a follow-up wave). The stub must surface `BindFailed` rather
+        // than panicking or hanging.
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let endpoint = DceRpcEndpoint::new(addr);
         let result = endpoint.run().await;
@@ -376,25 +464,45 @@ mod tests {
         assert!(matches!(result, Err(DceRpcError::BindFailed(_))));
     }
 
+    // ---- Behavioral tests replacing the two old "stub returns X" tests ----
+
     #[test]
-    fn encode_bind_pdu_returns_empty_vec_as_stub() {
-        // The bind-PDU encoder is not yet implemented — the stub returns an
-        // empty buffer. Callers must not assume a particular length yet.
-        let buf = encode_bind_pdu(&InterfaceUuid::DRSUAPI, (4, 0));
-        assert!(
-            buf.is_empty(),
-            "stub must return empty buffer, got {} bytes",
-            buf.len()
-        );
+    fn encode_bind_pdu_returns_real_wire_bytes() {
+        // Replaces the old `encode_bind_pdu_returns_empty_vec_as_stub`
+        // test. Now that the encoder is real, verify it produces a
+        // non-empty buffer whose length matches the wire spec for a
+        // single-context Bind PDU.
+        let pdu = BindPdu::new(InterfaceUuid::DRSUAPI.0, (4, 0));
+        let bytes = encode_bind_pdu(&pdu);
+        // 16 (common header) + 12 (bind body) + 44 (ctx element) = 72.
+        assert_eq!(bytes.len(), 72);
+        // Verify ptype byte is 11 (Bind).
+        assert_eq!(bytes[2], PTYPE_BIND);
+        // Verify rpc_vers byte is 5.
+        assert_eq!(bytes[0], 5);
+        // Verify frag_length field matches the buffer length.
+        let frag_length = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        assert_eq!(frag_length, bytes.len());
     }
 
-    #[tokio::test]
-    async fn decode_bind_pdu_returns_ndr_error_as_stub() {
-        // The bind-PDU decoder is not yet implemented — the stub surfaces an
-        // `Ndr` error so callers can degrade gracefully.
-        let result = decode_bind_pdu(&[0u8; 16]);
-        assert!(result.is_err());
-        assert!(matches!(result, Err(DceRpcError::Ndr(_))));
+    #[test]
+    fn decode_bind_pdu_round_trips_real_encode() {
+        // Replaces the old `decode_bind_pdu_returns_ndr_error_as_stub`
+        // test. Verify the round-trip: encode then decode yields the same
+        // interface UUID + version that was encoded.
+        let iface = InterfaceUuid::DRSUAPI.clone();
+        let version = (4, 0);
+        let pdu = BindPdu::new(iface.0, version);
+        let bytes = encode_bind_pdu(&pdu);
+        let decoded = decode_bind_pdu(&bytes).unwrap();
+
+        assert_eq!(decoded.rpc_vers, 5);
+        assert_eq!(decoded.rpc_vers_minor, 0);
+        assert_eq!(decoded.call_id, pdu.call_id);
+        assert_eq!(decoded.context_elements.len(), 1);
+        let ctx = &decoded.context_elements[0];
+        assert_eq!(ctx.abstract_syntax.0, iface.0);
+        assert_eq!(ctx.abstract_syntax.1, version);
     }
 
     #[tokio::test]

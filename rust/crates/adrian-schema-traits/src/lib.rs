@@ -137,6 +137,32 @@ pub struct SchemaProjection {
     pub generation: u64,
 }
 
+impl SchemaProjection {
+    /// Construct an empty projection at generation 0 (per ADR-003 — boot
+    /// before the schema compiler has run).
+    pub fn empty() -> Self {
+        Self {
+            attributes: std::collections::HashMap::new(),
+            classes: std::collections::HashMap::new(),
+            attribute_name_to_id: std::collections::HashMap::new(),
+            class_name_to_id: std::collections::HashMap::new(),
+            generation: 0,
+        }
+    }
+
+    /// Copy-on-write: clone the projection with `generation + 1`, ready for
+    /// mutation per ADR-003 §Decision. The previous generation remains
+    /// immutable for in-flight readers; the new generation is the only one
+    /// that may be mutated.
+    ///
+    /// Saturates at `u64::MAX` to keep the counter monotonic.
+    pub fn next_generation(&self) -> Self {
+        let mut next = self.clone();
+        next.generation = self.generation.saturating_add(1);
+        next
+    }
+}
+
 /// A trait for cache lookups against the schema projection (per ADR-003).
 ///
 /// Implementations:

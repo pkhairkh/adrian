@@ -21,3 +21,4 @@ rasn.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+adrian-storage-testkit = { workspace = true }

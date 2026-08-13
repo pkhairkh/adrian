@@ -104,7 +104,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # `cargo check` passes on systems without libclang.
 foundationdb = { version = "0.9", default-features = false }
 # Native Raft consensus (per Decision 1).
-openraft = "0.9"
+# Wave 2c: enable `serde` feature so openraft's `LogId<NID>`, `Vote<NID>`,
+# and `Entry<C>` types derive serde::{Serialize, Deserialize} — used by
+# `adrian-raft` to map our `RaftLogEntry` to openraft's types for the
+# eventual full integration (and for the `to_openraft_log_id()` /
+# `to_openraft_vote()` conversion helpers exercised in tests).
+openraft = { version = "0.9", features = ["serde"] }
 # ASN.1 codecs for Kerberos, LDAP, DRSUAPI NDR, X.509 PKIX (per Decision 1, 5, 8).
 rasn = "0.22"
 rasn-kerberos = "0.22"
