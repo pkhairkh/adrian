@@ -15,13 +15,41 @@ adrian-repl-core = { workspace = true }
 adrian-repl-testkit = { workspace = true }
 adrian-sid = { workspace = true }
 adrian-schema-traits = { workspace = true }
+# Wave 4a: in-process KDC + kpasswd fixtures. Wraps `adrian-kdc`'s
+# `handlers::{handle_as_req, handle_tgs_req}` free functions (real RFC 4120
+# flows) and `KpasswdService::handle_kpasswd` (real RFC 3244 flow).
+adrian-kdc = { workspace = true }
+adrian-hsm = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 tokio = { workspace = true }
+# Crypto primitives reused from the workspace (AES-256-CTS, HMAC-SHA1-96,
+# PBKDF2) — needed for the in-process encrypt_for_usage / decrypt_for_usage
+# helpers that mirror `adrian_kdc::handlers`'s `pub(crate)` functions.
+aes.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+subtle.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "as_req"
+harness = false
+
+[[bench]]
+name = "tgs_req"
+harness = false
+
+[[bench]]
+name = "aes_cts"
+harness = false
