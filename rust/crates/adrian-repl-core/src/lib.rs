@@ -349,3 +349,70 @@ pub fn resolve_conflict(local: &PropertyMetaDataExt, incoming: &PropertyMetaData
 // TODO: implement DrSuapiReplicator in adrian-drsuapi per Decision 1 (fresh Rust MS-DRSR via rasn).
 // TODO: implement RaftReplicator in adrian-raft per Decision 1 (openraft integration).
 // TODO: implement InMemoryReplicator in adrian-repl-testkit per Decision 1.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pmd(version: u32, ts: u64, usn: u64, inv: Uuid) -> PropertyMetaDataExt {
+        PropertyMetaDataExt {
+            version,
+            origin_invocation_id: inv,
+            origin_usn: usn,
+            last_write_timestamp: ts,
+        }
+    }
+
+    #[test]
+    fn conflict_resolution_higher_version_wins() {
+        let local = pmd(1, 100, 50, Uuid::nil());
+        let incoming = pmd(2, 100, 50, Uuid::nil());
+        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+        assert_eq!(resolve_conflict(&incoming, &local), Resolution::LocalWins);
+    }
+
+    #[test]
+    fn conflict_resolution_tiebreak_timestamp() {
+        let local = pmd(1, 100, 50, Uuid::nil());
+        let incoming = pmd(1, 200, 50, Uuid::nil());
+        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+    }
+
+    #[test]
+    fn conflict_resolution_tiebreak_usn() {
+        let local = pmd(1, 100, 50, Uuid::nil());
+        let incoming = pmd(1, 100, 60, Uuid::nil());
+        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+    }
+
+    #[test]
+    fn conflict_resolution_tiebreak_invocation_id() {
+        let local = pmd(1, 100, 50, Uuid::nil());
+        let incoming = pmd(1, 100, 50, Uuid::from_u128(1));
+        assert_eq!(resolve_conflict(&local, &incoming), Resolution::IncomingWins);
+    }
+
+    #[test]
+    fn conflict_resolution_all_equal_local_wins() {
+        let local = pmd(1, 100, 50, Uuid::nil());
+        let incoming = pmd(1, 100, 50, Uuid::nil());
+        assert_eq!(resolve_conflict(&local, &incoming), Resolution::LocalWins);
+    }
+
+    #[test]
+    fn utd_vector_construction() {
+        let vec = UtdVector {
+            entries: vec![UtdVectorEntry {
+                invocation_id: Uuid::nil(),
+                highest_usn: 100,
+            }],
+        };
+        assert_eq!(vec.entries.len(), 1);
+
+        let delta = UtdDelta {
+            invocation_id: Uuid::nil(),
+            new_highest_usn: 200,
+        };
+        assert_eq!(delta.new_highest_usn, 200);
+    }
+}

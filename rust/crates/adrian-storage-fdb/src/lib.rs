@@ -241,3 +241,45 @@ pub fn encode_link_forward_key(link_dnt: u64, link_id: u32, backlink_dnt: u64) -
 // the real implementation (gated by `fdb`).
 #[allow(unused_imports)]
 use adrian_storage_core::{Attribute as _Attribute, DistinguishedName as _Dn};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_object_key_structure() {
+        let key = encode_object_key(0x01, 42, 3, 0);
+        // Key should start with the subspace byte
+        assert_eq!(key[0], 0x01);
+        // Key should be longer than just the subspace
+        assert!(key.len() > 1);
+    }
+
+    #[test]
+    fn encode_object_key_different_dnts() {
+        let k1 = encode_object_key(0x01, 42, 3, 0);
+        let k2 = encode_object_key(0x01, 43, 3, 0);
+        assert_ne!(k1, k2, "different DNTs should produce different keys");
+    }
+
+    #[test]
+    fn encode_object_key_different_subspaces() {
+        let k1 = encode_object_key(0x01, 42, 3, 0);
+        let k2 = encode_object_key(0x02, 42, 3, 0);
+        assert_ne!(k1, k2, "different subspaces should produce different keys");
+    }
+
+    #[test]
+    fn encode_link_forward_key_structure() {
+        let key = encode_link_forward_key(10, 5, 20);
+        // Should produce a non-empty key
+        assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn encode_link_forward_key_different_links() {
+        let k1 = encode_link_forward_key(10, 5, 20);
+        let k2 = encode_link_forward_key(10, 5, 21);
+        assert_ne!(k1, k2, "different backlink DNTs should produce different keys");
+    }
+}

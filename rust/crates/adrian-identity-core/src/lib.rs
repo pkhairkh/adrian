@@ -183,3 +183,54 @@ pub fn uuid_to_uid(uuid: PrincipalId) -> PosixId {
 // TODO: implement FdbIdentityMapping in adrian-identity-fdb per Decision 3 (FDB subspace 0x0D).
 // TODO: implement InMemoryIdentityMapping in adrian-identity-testkit per Decision 3.
 // TODO: implement RID pool allocator in adrian-identity-ridpool per Decision 3 (FDB subspace 0x06).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_to_uid_is_deterministic() {
+        let uuid = Uuid::nil();
+        let uid1 = uuid_to_uid(uuid);
+        let uid2 = uuid_to_uid(uuid);
+        assert_eq!(uid1, uid2, "same UUID must produce same UID");
+    }
+
+    #[test]
+    fn uuid_to_uid_in_range() {
+        // UID must be in [65536, 2^31-1)
+        for i in 0..100u128 {
+            let uuid = Uuid::from_u128(i);
+            let uid = uuid_to_uid(uuid);
+            assert!(uid >= 65536, "uid {} < 65536", uid);
+            assert!(uid < (1u32 << 31), "uid {} >= 2^31", uid);
+        }
+    }
+
+    #[test]
+    fn uuid_to_uid_different_uuids_different_uids() {
+        let uid1 = uuid_to_uid(Uuid::from_u128(1));
+        let uid2 = uuid_to_uid(Uuid::from_u128(2));
+        assert_ne!(uid1, uid2, "different UUIDs should produce different UIDs (with high probability)");
+    }
+
+    #[test]
+    fn principal_type_variants() {
+        let user = PrincipalType::User;
+        let group = PrincipalType::Group;
+        let computer = PrincipalType::Computer;
+        // Just verify they exist and can be matched
+        match user {
+            PrincipalType::User => {}
+            _ => panic!(),
+        }
+        match group {
+            PrincipalType::Group => {}
+            _ => panic!(),
+        }
+        match computer {
+            PrincipalType::Computer => {}
+            _ => panic!(),
+        }
+    }
+}
