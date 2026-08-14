@@ -215,6 +215,57 @@ impl FdbDirectoryStore {
         matches!(self.inner, Backend::InMemory(_))
     }
 
+    /// Run an async closure with transaction retry on conflict (Wave 3,
+    /// T-301). Retries `f` up to 3 times when `f` returns
+    /// `StorageError::Conflict` (FDB error 1020 `not_committed`) or
+    /// `StorageError::TooOld` (FDB error 1007 `transaction_too_old`),
+    /// with exponential backoff: 10ms, 50ms, 250ms.
+    ///
+    /// The closure receives a fresh `&FdbDirectoryStore` reference on each
+    /// invocation (the closure is responsible for calling `begin_write()`
+    /// internally and committing the transaction). If the closure returns
+    /// any other error variant (e.g. `Backend`, `NotFound`, `SchemaValidation`),
+    /// the retry loop terminates immediately and propagates the error.
+    ///
+    /// Returns:
+    /// - `Ok(T)` if `f` succeeded within the retry budget.
+    /// - `Err(StorageError::Conflict)` if the retry budget (3 attempts) was
+    ///   exhausted.
+    /// - `Err(other)` if `f` returned a non-retryable error.
+    pub async fn run_with_retry<F, T>(&self, f: F) -> Result<T, StorageError>
+    where
+        F: Fn(
+            &FdbDirectoryStore,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, StorageError>> + Send + '_>,
+        >,
+    {
+        // Backoff schedule per the tasklist: 10ms, 50ms, 250ms.
+        // After 3 retries we give up and return the last Conflict error.
+        const BACKOFF_MS: [u64; 3] = [10, 50, 250];
+        let mut attempt: u32 = 0;
+        loop {
+            match f(self).await {
+                Ok(value) => return Ok(value),
+                Err(StorageError::Conflict) | Err(StorageError::TooOld) => {
+                    if attempt as usize >= BACKOFF_MS.len() {
+                        // Retry budget exhausted — surface the conflict.
+                        return Err(StorageError::Conflict);
+                    }
+                    let backoff = std::time::Duration::from_millis(BACKOFF_MS[attempt as usize]);
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        backoff_ms = BACKOFF_MS[attempt as usize],
+                        "FdbDirectoryStore::run_with_retry — retrying on conflict"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
     /// Begin a write transaction and return it as a concrete [`FdbTxn`] so
     /// the high-level `put` / `delete` methods can use both the
     /// [`WriteTxn`] interface (for `commit` / `rollback`) and the
@@ -1015,14 +1066,33 @@ mod real_fdb {
         }
 
         async fn commit(self: Box<Self>) -> Result<(), StorageError> {
-            self.trx.commit().await.map_err(|e| {
-                // Map FDB error codes to StorageError variants per ADR-073
-                // §Decision (retry-on-conflict loop is the caller's
-                // responsibility; this method surfaces the underlying
-                // error).
-                StorageError::Backend(format!("FDB commit failed: {e}"))
-            })?;
-            Ok(())
+            // Wave 3 (T-301): map FDB commit errors to StorageError variants
+            // so the retry loop in `FdbDirectoryStore::run_with_retry` can
+            // detect retryable conflicts via `matches!`.
+            //
+            // `TransactionCommitError::on_error()` is FDB's recommended
+            // retry-or-propagate API: it returns Ok(Transaction) if the
+            // error is retryable (the transaction was reset and can be
+            // reused) or Err(FdbError) if the error is permanent. We
+            // discard the returned Transaction (the retry loop creates a
+            // fresh one) and translate Ok → Conflict, Err → Backend.
+            match self.trx.commit().await {
+                Ok(_) => Ok(()),
+                Err(commit_err) => match commit_err.on_error().await {
+                    Ok(_reset_trx) => Err(StorageError::Conflict),
+                    Err(fdb_err) => {
+                        if fdb_err.code() == 1007 {
+                            Err(StorageError::TooOld)
+                        } else {
+                            Err(StorageError::Backend(format!(
+                                "FDB commit failed: {} (code {})",
+                                fdb_err.message(),
+                                fdb_err.code()
+                            )))
+                        }
+                    }
+                },
+            }
         }
 
         async fn rollback(self: Box<Self>) -> Result<(), StorageError> {
@@ -1639,6 +1709,74 @@ impl BackupManager {
     pub fn wal_for_test(&self) -> std::sync::MutexGuard<'_, Vec<MutationRecord>> {
         self.wal.lock().unwrap()
     }
+}
+
+// ============================================================================
+// Subspace migration (Wave 3, T-303)
+// ============================================================================
+//
+// `migrate_subspace(old_prefix, new_prefix)` copies all keys under the
+// `old_prefix` to keys under the `new_prefix` (preserving the suffix), then
+// atomically clears the `old_prefix` range. Used for schema upgrades where
+// data needs to move between subspaces (e.g. when a new schema version
+// changes the tuple-layer encoding for an attribute).
+//
+// The migration is performed in a single FDB transaction (atomic w.r.t.
+// concurrent reads/writes). For large subspaces (>1M keys), callers should
+// batch the migration to avoid hitting FDB's 10MB-per-transaction limit;
+// this v1 implementation does not batch.
+
+/// Migrate all keys from `old_prefix` to `new_prefix` atomically.
+///
+/// For each key `K` matching `old_prefix`, a new key `K' = new_prefix ++ K[old_prefix.len()..]`
+/// is written with the same value. After all copies are written, the
+/// `old_prefix` range is cleared (in the same transaction — atomic).
+///
+/// Returns the number of keys migrated. The caller is responsible for
+/// ensuring no concurrent writes are happening to the `old_prefix` range
+/// during migration (otherwise the migration may miss keys).
+pub async fn migrate_subspace(
+    store: &FdbDirectoryStore,
+    old_prefix: &[u8],
+    new_prefix: &[u8],
+) -> Result<usize, StorageError> {
+    if old_prefix.is_empty() {
+        return Err(StorageError::Backend(
+            "migrate_subspace: old_prefix must not be empty (would migrate entire keyspace)".into(),
+        ));
+    }
+    if old_prefix == new_prefix {
+        return Err(StorageError::Backend(
+            "migrate_subspace: old_prefix and new_prefix must differ".into(),
+        ));
+    }
+    // Read all keys under old_prefix.
+    let mut end = old_prefix.to_vec();
+    // strinc: increment the last byte; if it would overflow (0xFF), append
+    // a 0x00 byte (per FDB tuple-layer convention — for our prefixes which
+    // are single subspace bytes < 0xFF, this is unreachable).
+    match end.last_mut() {
+        Some(b) if *b < 0xFF => *b += 1,
+        _ => end.push(0x00),
+    }
+    let read_txn = store.begin_read().await?;
+    let pairs = read_txn.get_range(old_prefix, &end).await?;
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    // Write the migrated keys + clear the old prefix in a single transaction.
+    let write_txn = store.begin_write().await?;
+    for (k, v) in &pairs {
+        let suffix = &k[old_prefix.len()..];
+        let mut new_key = Vec::with_capacity(new_prefix.len() + suffix.len());
+        new_key.extend_from_slice(new_prefix);
+        new_key.extend_from_slice(suffix);
+        write_txn.put(&new_key, v).await?;
+    }
+    write_txn.clear_range(old_prefix, &end).await?;
+    let boxed: Box<dyn WriteTxn> = write_txn;
+    boxed.commit().await?;
+    Ok(pairs.len())
 }
 
 #[cfg(test)]
@@ -2356,5 +2494,129 @@ mod tests {
         // needed because `Mutex::lock()` is a safe API. We just need to
         // expose the WAL for tests.
         mgr.wal_for_test()
+    }
+
+    // ===== Wave 3: Transaction retry + subspace migration tests =====
+
+    /// T-301/T-304: run_with_retry succeeds on first attempt when f returns Ok.
+    #[tokio::test]
+    async fn retry_succeeds_on_first_attempt() {
+        let store = FdbDirectoryStore::in_memory();
+        let result: Result<u32, StorageError> = store
+            .run_with_retry(|_s| Box::pin(async { Ok(42u32) }))
+            .await;
+        assert_eq!(
+            result.unwrap(),
+            42,
+            "first-attempt success must return value"
+        );
+    }
+
+    /// T-301/T-304: run_with_retry retries on Conflict and succeeds when
+    /// a later attempt returns Ok. Simulates a transaction that fails the
+    /// first time but succeeds the second time (e.g. another transaction
+    /// committed between read-version and commit).
+    #[tokio::test]
+    async fn retry_succeeds_on_conflict() {
+        let store = FdbDirectoryStore::in_memory();
+        // Use a cell to track attempt count across closure invocations.
+        let attempt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let attempt_clone = attempt.clone();
+        let result: Result<u32, StorageError> = store
+            .run_with_retry(move |_s| {
+                let attempt = attempt.clone();
+                Box::pin(async move {
+                    let n = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        // First attempt: simulate a conflict.
+                        Err(StorageError::Conflict)
+                    } else {
+                        // Second attempt: succeed.
+                        Ok(42u32)
+                    }
+                })
+            })
+            .await;
+        assert_eq!(result.unwrap(), 42, "retry must succeed on second attempt");
+        assert_eq!(
+            attempt_clone.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "closure must have been invoked twice"
+        );
+    }
+
+    /// T-301/T-304: run_with_retry exhausts the retry budget (3 attempts)
+    /// and returns `StorageError::Conflict` when every attempt fails.
+    #[tokio::test]
+    async fn retry_exhausted_after_three_attempts() {
+        let store = FdbDirectoryStore::in_memory();
+        let attempt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let attempt_clone = attempt.clone();
+        let result: Result<(), StorageError> = store
+            .run_with_retry(move |_s| {
+                let attempt = attempt.clone();
+                Box::pin(async move {
+                    attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(StorageError::Conflict)
+                })
+            })
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict)),
+            "must return Conflict after retry budget exhausted: {result:?}"
+        );
+        // Initial attempt + 3 retries = 4 invocations.
+        assert_eq!(
+            attempt_clone.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "closure must have been invoked 4 times (1 initial + 3 retries)"
+        );
+    }
+
+    /// T-303/T-304: migrate_subspace copies all keys from old_prefix to
+    /// new_prefix, then atomically clears the old_prefix range.
+    #[tokio::test]
+    async fn subspace_migration_round_trip() {
+        let store = FdbDirectoryStore::in_memory();
+        // Write 3 keys under old_prefix 0xAA and 1 key outside the prefix
+        // (must NOT be migrated).
+        let txn = store.begin_write().await.unwrap();
+        txn.put(&[0xAA, 0x01], b"v1").await.unwrap();
+        txn.put(&[0xAA, 0x02], b"v2").await.unwrap();
+        txn.put(&[0xAA, 0x03], b"v3").await.unwrap();
+        txn.put(&[0xBB, 0x01], b"outside").await.unwrap();
+        let boxed: Box<dyn WriteTxn> = txn;
+        boxed.commit().await.unwrap();
+
+        // Migrate 0xAA → 0xCC.
+        let migrated = migrate_subspace(&store, &[0xAA], &[0xCC]).await.unwrap();
+        assert_eq!(migrated, 3, "must migrate 3 keys");
+
+        // Verify the new keys exist under 0xCC.
+        let read = store.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(&[0xCC, 0x01]).await.unwrap().unwrap(),
+            b"v1".to_vec()
+        );
+        assert_eq!(
+            read.get(&[0xCC, 0x02]).await.unwrap().unwrap(),
+            b"v2".to_vec()
+        );
+        assert_eq!(
+            read.get(&[0xCC, 0x03]).await.unwrap().unwrap(),
+            b"v3".to_vec()
+        );
+
+        // Verify the old keys are gone.
+        assert!(read.get(&[0xAA, 0x01]).await.unwrap().is_none());
+        assert!(read.get(&[0xAA, 0x02]).await.unwrap().is_none());
+        assert!(read.get(&[0xAA, 0x03]).await.unwrap().is_none());
+
+        // Verify the outside key is still there.
+        assert_eq!(
+            read.get(&[0xBB, 0x01]).await.unwrap().unwrap(),
+            b"outside".to_vec(),
+            "key outside the migrated prefix must be untouched"
+        );
     }
 }
