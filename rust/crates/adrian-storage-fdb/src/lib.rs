@@ -76,7 +76,17 @@
 //! snapshot-isolated `BTreeMap` — this is a workspace-internal convenience
 //! to avoid duplicating the testkit's transactional KV implementation.
 
-#![forbid(unsafe_code)]
+// NOTE (Wave 1 / T-102): The crate was originally `#![forbid(unsafe_code)]`, but
+// `foundationdb` 0.9 marks `FdbApiBuilder::boot()` as `unsafe` because the
+// returned `NetworkAutoStop` guard MUST be dropped before the program exits.
+// We intentionally leak the guard (the FDB network runs for the lifetime of
+// the process), which is the documented pattern for long-running services.
+// The `unsafe` is confined to a single helper (`ensure_fdb_network_started`)
+// which is `#[allow(unsafe_code)]`-gated and contains a SAFETY comment.
+//
+// All other code paths remain `unsafe`-free. `deny` (not `forbid`) lets us
+// grant the single targeted `allow`.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 use adrian_storage_core::{
@@ -224,7 +234,7 @@ impl FdbDirectoryStore {
             #[cfg(feature = "fdb")]
             Backend::Real(s) => {
                 let txn = s.begin_write().await?;
-                Ok(FdbTxn::from_write_boxed(txn))
+                Ok(FdbTxn::from_write_boxed(Box::new(txn)))
             }
         }
     }
@@ -410,7 +420,7 @@ impl DirectoryStore for FdbDirectoryStore {
             #[cfg(feature = "fdb")]
             Backend::Real(s) => {
                 let txn = s.begin_read().await?;
-                Ok(Box::new(FdbTxn::from_read_boxed(txn)))
+                Ok(Box::new(FdbTxn::from_read_boxed(Box::new(txn))))
             }
         }
     }
@@ -424,7 +434,7 @@ impl DirectoryStore for FdbDirectoryStore {
             #[cfg(feature = "fdb")]
             Backend::Real(s) => {
                 let txn = s.begin_write().await?;
-                Ok(Box::new(FdbTxn::from_write_boxed(txn)))
+                Ok(Box::new(FdbTxn::from_write_boxed(Box::new(txn))))
             }
         }
     }
@@ -689,6 +699,15 @@ impl WriteTxn for FdbTxn {
         }
     }
 
+    async fn clear_range(&self, begin: &[u8], end: &[u8]) -> Result<(), StorageError> {
+        match &self.inner {
+            FdbTxnInner::Write(t) => t.clear_range(begin, end).await,
+            FdbTxnInner::Read(_) => Err(StorageError::Backend(
+                "clear_range() called on a read-only transaction".into(),
+            )),
+        }
+    }
+
     async fn commit(self: Box<Self>) -> Result<(), StorageError> {
         // Destructure `self` (the `Box<FdbTxn>`) to extract the inner
         // `Box<dyn WriteTxn>` and call its `commit()`. Read-only txns
@@ -772,19 +791,54 @@ impl DirectoryTransaction for FdbTxn {
 // ---- Real FDB backend (gated by `fdb` feature) ----
 //
 // The real FDB backend wraps a `foundationdb::Database` and spawns
-// transactions on demand. The implementation below is best-effort: it is
-// NOT compile-tested in this sandbox (libclang is not available, so the
-// `foundationdb-sys` bindgen step fails). It is written to match the
-// `foundationdb` 0.9 API as documented at https://docs.rs/foundationdb/0.9.
-// Any compile errors in this code path should be fixed in a follow-up wave
-// that has access to libclang + a running FDB cluster.
+// transactions on demand. Wave 1 (T-102) compiles this code path against
+// `foundationdb` 0.9.2 with libclang + the FDB C client installed.
+
+// ---- FDB network startup (gated by `fdb` feature) ----
+//
+// `foundationdb` 0.9 marks `FdbApiBuilder::boot()` as `unsafe` because the
+// returned `NetworkAutoStop` guard MUST be dropped before the program exits.
+// For a long-running service we want the FDB network to run for the lifetime
+// of the process, so we leak the guard on first use. The leak is intentional
+// and matches the documented pattern for servers / long-running services.
+
+#[cfg(feature = "fdb")]
+static FDB_NETWORK_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Initialise the FDB network exactly once per process. Subsequent calls are
+/// no-ops. The `NetworkAutoStop` guard returned by `boot()` is intentionally
+/// leaked (`mem::forget`) so the FDB network thread runs for the lifetime of
+/// the process. This matches the recommended pattern for long-running services.
+#[cfg(feature = "fdb")]
+#[allow(unsafe_code)] // see SAFETY comment below
+fn ensure_fdb_network_started() -> Result<(), StorageError> {
+    if FDB_NETWORK_STARTED.set(()).is_ok() {
+        // First call — actually boot the network.
+        let network_builder = foundationdb::api::FdbApiBuilder::default()
+            .build()
+            .map_err(|e| StorageError::Backend(format!("FdbApiBuilder::build failed: {e}")))?;
+        // SAFETY: `NetworkBuilder::boot()` is marked `unsafe` because the
+        // returned `NetworkAutoStop` MUST be dropped before the program
+        // exits (otherwise the background network thread may race with
+        // process teardown). We intentionally `mem::forget` the guard so
+        // the network runs for the lifetime of the process. When the
+        // process exits, the OS reclaims all resources (including the FDB
+        // network thread) — this is the documented pattern for
+        // long-running services in the `foundationdb` crate's own
+        // examples. There is no soundness hazard to Rust memory.
+        let guard = unsafe { network_builder.boot() }
+            .map_err(|e| StorageError::Backend(format!("NetworkBuilder::boot failed: {e}")))?;
+        std::mem::forget(guard);
+    }
+    Ok(())
+}
 
 #[cfg(feature = "fdb")]
 mod real_fdb {
     use super::*;
 
     /// Real FDB backend.
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct RealFdbBackend {
         /// The `foundationdb::Database` handle. Wrapped in `Arc` so the
         /// backend is cheaply clonable (matching the in-memory fallback's
@@ -792,20 +846,26 @@ mod real_fdb {
         db: std::sync::Arc<foundationdb::Database>,
     }
 
+    impl std::fmt::Debug for RealFdbBackend {
+        // `foundationdb::Database` doesn't implement `Debug` in 0.9 (the
+        // inner FFI handle is a raw pointer). We provide a stub that
+        // prints the backend's static type name + cluster_file hint.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RealFdbBackend")
+                .field("db", &"<foundationdb::Database>")
+                .finish()
+        }
+    }
+
     impl RealFdbBackend {
         /// Open a real FDB connection. The `cluster_file` may be `None`,
         /// in which case the `FDB_CLUSTER_FILE` env var is used by the
         /// `foundationdb` crate.
         pub async fn connect(cluster_file: Option<&str>) -> Result<Self, StorageError> {
-            // Initialise the FDB network. `foundationdb::boot()` is
-            // idempotent and starts the background network thread.
-            let _guard = foundationdb::boot()
-                .map_err(|e| StorageError::Backend(format!("foundationdb::boot failed: {e}")))?;
-            // The boot guard must be held for the lifetime of the process.
-            // We leak it here (the network runs forever once booted) —
-            // this is the recommended pattern for long-running services
-            // per the `foundationdb` crate docs.
-            std::mem::forget(_guard);
+            // Initialise the FDB network exactly once per process. The
+            // network guard is intentionally leaked (the FDB network runs
+            // for the lifetime of the process).
+            ensure_fdb_network_started()?;
             let db = match cluster_file {
                 Some(path) => foundationdb::Database::from_path(path).map_err(|e| {
                     StorageError::Backend(format!("Database::from_path failed: {e}"))
@@ -838,9 +898,14 @@ mod real_fdb {
     }
 
     /// Real FDB read transaction (snapshot).
-    #[derive(Debug)]
     pub struct RealFdbReadTxn {
         trx: foundationdb::Transaction,
+    }
+
+    impl std::fmt::Debug for RealFdbReadTxn {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RealFdbReadTxn").finish_non_exhaustive()
+        }
     }
 
     #[async_trait]
@@ -859,11 +924,17 @@ mod real_fdb {
             end: &[u8],
         ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             use foundationdb::RangeOption;
-            let opt = RangeOption::from((begin..end));
-            let futs = self.trx.get_ranges(&opt, true /* snapshot */);
-            let result = futs
+            let opt = RangeOption::from(begin..end);
+            // Wave 1 (T-102): in `foundationdb` 0.9, `get_ranges` returns a
+            // `Stream` (not a `Future`). For our per-DNT ranges — which
+            // are typically <100 rows and well under FDB's 1MB per-chunk
+            // default — a single `get_range` (singular) call suffices.
+            // `iteration=1` is the documented first-call value.
+            let result = self
+                .trx
+                .get_range(&opt, 1, true /* snapshot */)
                 .await
-                .map_err(|e| StorageError::Backend(format!("FDB get_ranges failed: {e}")))?;
+                .map_err(|e| StorageError::Backend(format!("FDB get_range failed: {e}")))?;
             let mut out = Vec::new();
             for kv in result.iter() {
                 out.push((kv.key().to_vec(), kv.value().to_vec()));
@@ -873,9 +944,14 @@ mod real_fdb {
     }
 
     /// Real FDB read-write transaction.
-    #[derive(Debug)]
     pub struct RealFdbWriteTxn {
         trx: foundationdb::Transaction,
+    }
+
+    impl std::fmt::Debug for RealFdbWriteTxn {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RealFdbWriteTxn").finish_non_exhaustive()
+        }
     }
 
     #[async_trait]
@@ -894,11 +970,14 @@ mod real_fdb {
             end: &[u8],
         ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             use foundationdb::RangeOption;
-            let opt = RangeOption::from((begin..end));
-            let futs = self.trx.get_ranges(&opt, false);
-            let result = futs
+            let opt = RangeOption::from(begin..end);
+            // See RealFdbReadTxn::get_range for rationale on `get_range`
+            // (singular) vs `get_ranges` (plural Stream).
+            let result = self
+                .trx
+                .get_range(&opt, 1, false /* not snapshot */)
                 .await
-                .map_err(|e| StorageError::Backend(format!("FDB get_ranges failed: {e}")))?;
+                .map_err(|e| StorageError::Backend(format!("FDB get_range failed: {e}")))?;
             let mut out = Vec::new();
             for kv in result.iter() {
                 out.push((kv.key().to_vec(), kv.value().to_vec()));
@@ -927,6 +1006,14 @@ mod real_fdb {
             Ok(())
         }
 
+        async fn clear_range(&self, begin: &[u8], end: &[u8]) -> Result<(), StorageError> {
+            // `Transaction::clear_range` is a single atomic op that wipes
+            // the half-open range `[begin, end)` in the FDB cluster —
+            // equivalent to many `clear()` calls but committed atomically.
+            self.trx.clear_range(begin, end);
+            Ok(())
+        }
+
         async fn commit(self: Box<Self>) -> Result<(), StorageError> {
             self.trx.commit().await.map_err(|e| {
                 // Map FDB error codes to StorageError variants per ADR-073
@@ -951,7 +1038,7 @@ mod real_fdb {
 
 // Re-export the real-FDB types for the rest of the crate.
 #[cfg(feature = "fdb")]
-use real_fdb::{RealFdbBackend, RealFdbReadTxn, RealFdbWriteTxn};
+use real_fdb::RealFdbBackend;
 
 // ---- Legacy tuple-layer key-encoding helpers ----
 //
@@ -1344,25 +1431,47 @@ mod tests {
 
     // ===== Real-FDB integration tests (require `--features fdb` + cluster) =====
     //
-    // These tests are `#[ignore]` because they require (a) the `fdb` cargo
-    // feature (which in turn requires libclang at build time and the FDB C
-    // client at runtime) and (b) a running FDB cluster reachable at the
-    // address in `FDB_CLUSTER_FILE` (or `docker.cluster:4500` by default).
+    // Wave 1 (T-104): these tests are now un-ignored and run as part of the
+    // default `cargo test --features fdb` invocation against a real FDB
+    // cluster. Each test calls `clear_all_keys(&store)` at the start to
+    // ensure idempotency across repeated test runs (so running the suite
+    // twice doesn't fail with stale-state errors).
     //
-    // To run them:
-    //   1. Install libclang: `apt-get install -y libclang-dev clang`
-    //   2. Start an FDB cluster:
-    //        docker run -d --name fdb -e FDB_NETWORKING_MODE=host \
-    //          -p 4500:4500/udp foundationdb/foundationdb:7.3.30
-    //   3. Write a cluster file at /etc/foundationdb/fdb.cluster pointing
-    //      at the running cluster.
-    //   4. cargo test --features fdb -- --ignored
+    // To run them, the build/runtime environment MUST have:
+    //   1. libclang (for `foundationdb-sys`'s bindgen step).
+    //   2. The FDB C client library (`libfdb_c.so`) on the linker path
+    //      (e.g. via `LD_LIBRARY_PATH`).
+    //   3. A running FDB cluster reachable at the address in
+    //      `FDB_CLUSTER_FILE` (or `docker.cluster:4500` by default).
+
+    /// Wave 1 (T-104): helper that wipes all keys in the cluster so each
+    /// integration test starts from a clean slate. Uses the half-open range
+    /// `[b"\x00", b"\xff")` which covers the entire FDB keyspace.
+    #[cfg(feature = "fdb")]
+    async fn clear_all_keys(store: &FdbDirectoryStore) {
+        let txn = store.begin_write().await.expect("begin_write");
+        txn.clear_range(b"\x00", b"\xff")
+            .await
+            .expect("clear_range");
+        let boxed: Box<dyn WriteTxn> = txn;
+        boxed.commit().await.expect("commit");
+    }
+
+    /// Wave 1 (T-104): a process-wide Mutex that serializes the real-FDB
+    /// integration tests. Without this, cargo's parallel test runner would
+    /// execute `real_fdb_*` tests concurrently and one test's
+    /// `clear_all_keys` would wipe another test's data mid-flight. Each
+    /// real-FDB test acquires this lock at the start and holds it for the
+    /// duration of the test body (across all `.await` points).
+    #[cfg(feature = "fdb")]
+    static REAL_FDB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[cfg(feature = "fdb")]
     #[tokio::test]
-    #[ignore = "requires `--features fdb`, libclang, and a running FDB cluster"]
     async fn real_fdb_put_then_get_roundtrip() {
+        let _guard = REAL_FDB_TEST_LOCK.lock().await;
         let store = FdbDirectoryStore::connect(None).await.unwrap();
+        clear_all_keys(&store).await;
         assert!(!store.is_in_memory_fallback());
         let uuid = test_uuid(1);
         let obj = make_obj(
@@ -1375,13 +1484,15 @@ mod tests {
         assert_eq!(got.uuid, uuid);
         assert_eq!(got.dn.dn, "CN=real,DC=corp,DC=com");
         store.delete(uuid).await.unwrap();
+        assert!(store.get(uuid).await.unwrap().is_none());
     }
 
     #[cfg(feature = "fdb")]
     #[tokio::test]
-    #[ignore = "requires `--features fdb`, libclang, and a running FDB cluster"]
     async fn real_fdb_delete_creates_tombstone() {
+        let _guard = REAL_FDB_TEST_LOCK.lock().await;
         let store = FdbDirectoryStore::connect(None).await.unwrap();
+        clear_all_keys(&store).await;
         let uuid = test_uuid(2);
         store
             .put(&make_obj(uuid, "CN=tomb,DC=corp,DC=com", vec![]))
@@ -1399,9 +1510,10 @@ mod tests {
 
     #[cfg(feature = "fdb")]
     #[tokio::test]
-    #[ignore = "requires `--features fdb`, libclang, and a running FDB cluster"]
     async fn real_fdb_atomic_add_dnt_counter() {
+        let _guard = REAL_FDB_TEST_LOCK.lock().await;
         let store = FdbDirectoryStore::connect(None).await.unwrap();
+        clear_all_keys(&store).await;
         store
             .put(&make_obj(test_uuid(10), "CN=a,DC=corp,DC=com", vec![]))
             .await

@@ -28,7 +28,17 @@ tracing.workspace = true
 # systems without libclang (foundationdb-sys requires it for bindgen). The
 # `fdb` feature flag enables the real backend; the in-memory fallback path
 # below does not use the FDB client API. See ADR-073.
-foundationdb = { workspace = true, optional = true }
+#
+# Wave 1 (T-102): enable `fdb-7_3` (sets FDB_API_VERSION=730 so the bindgen
+# build.rs in foundationdb-sys can resolve `api_version` to a const) and
+# `embedded-fdb-include` (uses the bundled fdb_c.h shipped inside the
+# foundationdb-sys crate so we don't need /usr/include/foundationdb/).
+# Both features are required at compile time — they propagate to
+# `foundationdb-sys` via the foundationdb meta-crate.
+foundationdb = { workspace = true, optional = true, features = [
+    "fdb-7_3",
+    "embedded-fdb-include",
+] }
 
 [features]
 default = []

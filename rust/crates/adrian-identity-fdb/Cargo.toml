@@ -21,7 +21,12 @@ tokio = { workspace = true }
 tracing.workspace = true
 bytes.workspace = true
 # `foundationdb` is optional — see adrian-storage-fdb/Cargo.toml for rationale.
-foundationdb = { workspace = true, optional = true }
+# Wave 1 (T-102): enables fdb-7_3 + embedded-fdb-include so bindgen resolves
+# FDB_API_VERSION and uses the bundled fdb_c.h shipped inside foundationdb-sys.
+foundationdb = { workspace = true, optional = true, features = [
+    "fdb-7_3",
+    "embedded-fdb-include",
+] }
 
 [features]
 default = []
