@@ -15,6 +15,14 @@ adrian-sdk = { path = "../adrian-sdk" }
 adrian-migrate = { path = "../adrian-migrate" }
 adrian-policy-core = { path = "../adrian-policy-core" }
 adrian-gpo-translate = { path = "../adrian-gpo-translate" }
+# Wave 2: adrian-ca + rasn + rasn-pkix + ring + bitvec are used by the
+# `adrian cert enroll` subcommand to generate a self-signed ECDSA-P256
+# PKCS#10 CSR via `ring` for submission to `AcmeCertModule::enroll`.
+adrian-ca = { path = "../adrian-ca" }
+rasn.workspace = true
+rasn-pkix.workspace = true
+ring.workspace = true
+bitvec = "1"
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -23,3 +31,14 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Wave 2 tests inject wired SDKs (with mock auth modules + real CaService
+# + real SmbServer) and verify the dispatch path writes ccache files,
+# issues real certs, and mounts real SMB shares. `tempfile` provides
+# per-test temp directories for the ccache + cert outputs.
+# `async-trait` is used by the MockAuthModule impl in tests.
+adrian-smb-server = { path = "../adrian-smb-server" }
+async-trait.workspace = true
+uuid.workspace = true
+tempfile = "3"

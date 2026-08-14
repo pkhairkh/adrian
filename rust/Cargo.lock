@@ -96,18 +96,27 @@ dependencies = [
 name = "adrian-cli"
 version = "0.1.0"
 dependencies = [
+ "adrian-ca",
  "adrian-gpo-translate",
  "adrian-migrate",
  "adrian-policy-core",
  "adrian-sdk",
+ "adrian-smb-server",
  "anyhow",
+ "async-trait",
+ "bitvec",
  "clap",
+ "rasn",
+ "rasn-pkix",
+ "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
