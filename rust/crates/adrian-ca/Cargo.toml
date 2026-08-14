@@ -38,3 +38,6 @@ uuid.workspace = true
 chrono.workspace = true
 bytes = "1"
 bitvec = "1"
+# Domain-06 Wave 2: OCSP responder HTTP endpoint (RFC 6960).
+axum.workspace = true
+http-body-util = "0.1"

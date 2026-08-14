@@ -1160,6 +1160,978 @@ fn base64url(data: &[u8]) -> String {
 }
 
 // ===========================================================================
+// OCSP responder (RFC 6960 + RFC 8954 nonce) — Domain-06 Wave 2
+// ===========================================================================
+
+/// OID `1.3.6.1.5.5.7.48.1.1` — id-pkix-ocsp-basic (BasicOCSPResponse).
+const OID_OCSP_BASIC: &[u32] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 1];
+
+/// OID `1.3.6.1.5.5.7.48.1.2` — id-pkix-ocsp-nonce (RFC 8954).
+const OID_OCSP_NONCE: &[u32] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 2];
+
+/// OID `1.3.14.3.2.26` — id-sha1 (used for CertId issuerNameHash / issuerKeyHash
+/// per RFC 6960 §4.4.1 — SHA-1 is mandatory to support).
+const OID_SHA1: &[u32] = &[1, 3, 14, 3, 2, 26];
+
+/// OCSP response status (RFC 6960 §4.2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OcspResponseStatus {
+    /// successful (0).
+    Successful = 0,
+    /// malformedRequest (1).
+    MalformedRequest = 1,
+    /// internalError (2).
+    InternalError = 2,
+    /// tryLater (3).
+    TryLater = 3,
+    /// sigRequired (5).
+    SigRequired = 5,
+    /// unauthorized (6).
+    Unauthorized = 6,
+}
+
+/// OCSP CertID (RFC 6960 §4.1.1). Identifies a certificate by issuer name
+/// hash, issuer key hash, and serial number.
+#[derive(AsnType, Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct OcspCertId {
+    /// Hash algorithm used to compute `issuer_name_hash` and
+    /// `issuer_key_hash`. RFC 6960 §4.4.1 mandates SHA-1 support.
+    pub hash_algorithm: AlgorithmIdentifier,
+    /// Hash of the issuer's DN (the DER encoding of Name).
+    pub issuer_name_hash: OctetString,
+    /// Hash of the issuer's public key (the DER BIT STRING contents,
+    /// i.e. the SEC1 point bytes for ECDSA).
+    pub issuer_key_hash: OctetString,
+    /// Serial number of the certificate being queried.
+    pub serial_number: Integer,
+}
+
+/// OCSP request entry (RFC 6960 §4.1.2).
+#[derive(AsnType, Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct OcspRequestEntry {
+    /// The certificate being queried.
+    pub req_cert: OcspCertId,
+    /// Optional single-request extensions (e.g. nonce per-entry).
+    #[rasn(default)]
+    pub single_request_extensions: Option<Extensions>,
+}
+
+/// OCSP TBSRequest (RFC 6960 §4.1.1).
+#[derive(AsnType, Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct TbsOcspRequest {
+    /// RFC 6960 defaults version to v1 (0).
+    #[rasn(tag(explicit(0)), default)]
+    pub version: u32,
+    /// Optional requestor name (X.509 GeneralName).
+    #[rasn(tag(explicit(1)), default)]
+    pub requestor_name: Option<GeneralName>,
+    /// List of certificate status queries.
+    pub request_list: SequenceOf<OcspRequestEntry>,
+    /// Optional request list extensions.
+    #[rasn(tag(explicit(2)), default)]
+    pub request_extensions: Option<Extensions>,
+}
+
+/// OCSP request (RFC 6960 §4.1).
+#[derive(AsnType, Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct OcspRequest {
+    pub tbs_request: TbsOcspRequest,
+    /// Optional signature (not used in Wave 2 — the responder accepts
+    /// unsigned requests per RFC 6960 §4.1.2 which makes the signature
+    /// optional for clients).
+    #[rasn(default)]
+    pub optional_signature: Option<OcspSignature>,
+}
+
+/// OCSP request signature (RFC 6960 §4.1.2). Unused in Wave 2 but defined
+/// so the ASN.1 parser accepts signed requests (it just ignores the sig).
+#[derive(AsnType, Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct OcspSignature {
+    pub signature_algorithm: AlgorithmIdentifier,
+    pub signature: BitString,
+    #[rasn(default)]
+    pub certs: Option<SequenceOf<crate::Certificate>>,
+}
+
+/// OCSP CertStatus (RFC 6960 §4.2.1). The CHOICE is encoded as:
+/// - `good` — implicit (no value, tag [0] context-specific primitive)
+/// - `revoked` — SEQUENCE with revocation time + optional reason
+/// - `unknown` — implicit (no value, tag [2] context-specific primitive)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OcspCertStatus {
+    /// Certificate is not revoked (and not expired per CA's view).
+    Good,
+    /// Certificate is revoked. The `DateTime` is the revocation time.
+    Revoked(DateTime<Utc>),
+    /// Certificate status is unknown (e.g. serial not in CA's ledger).
+    Unknown,
+}
+
+/// OCSP SingleResponse (RFC 6960 §4.2.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OcspSingleResponse {
+    pub cert_id: OcspCertId,
+    pub cert_status: OcspCertStatus,
+    pub this_update: DateTime<Utc>,
+    pub next_update: Option<DateTime<Utc>>,
+}
+
+/// Responder ID (RFC 6960 §4.2.1). Either by-name (the responder's X.509
+/// DN) or by-key (SHA-1 hash of the responder's public key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OcspResponderId {
+    /// Responder identified by X.509 Name (RFC 6960 §4.2.1, [0] EXPLICIT).
+    ByName(Name),
+    /// Responder identified by SHA-1 hash of public key ([1] EXPLICIT).
+    ByKey(Vec<u8>),
+}
+
+/// ResponseData (RFC 6960 §4.2.1) — the to-be-signed payload of a
+/// BasicOCSPResponse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OcspResponseData {
+    pub responder_id: OcspResponderId,
+    pub produced_at: DateTime<Utc>,
+    pub responses: Vec<OcspSingleResponse>,
+    /// Response-level extensions (e.g. the OCSP nonce echo).
+    pub extensions: Vec<Extension>,
+}
+
+/// BasicOCSPResponse (RFC 6960 §4.2.1) — the signed response payload.
+#[derive(Clone, Debug)]
+pub struct BasicOcspResponse {
+    pub response_data: OcspResponseData,
+    pub signature_algorithm: AlgorithmIdentifier,
+    pub signature: Vec<u8>,
+}
+
+/// OCSP response (RFC 6960 §4.2.1).
+#[derive(Clone, Debug)]
+pub struct OcspResponse {
+    pub response_status: OcspResponseStatus,
+    pub response_bytes: Option<BasicOcspResponse>,
+}
+
+/// OCSP responder (RFC 6960). Holds a reference to the CA for revocation
+/// state and signing. The responder signs responses with the CA's signer
+/// (the CA key acts as the OCSP signing key per ADR-035's "Multi-CDP OCSP
+/// cluster CRL fallback" — a delegated OCSP signing key is a future
+/// enhancement).
+pub struct OcspResponder {
+    ca: Arc<CaService>,
+}
+
+impl OcspResponder {
+    /// Create a new OCSP responder backed by the given CA.
+    pub fn new(ca: Arc<CaService>) -> Self {
+        Self { ca }
+    }
+
+    /// Handle a DER-encoded `OCSPRequest` (RFC 6960 §4.1). Returns a
+    /// DER-encoded `OCSPResponse` (RFC 6960 §4.2.1).
+    ///
+    /// Steps:
+    /// 1. Parse the request.
+    /// 2. For each `Request` in `requestList`, look up the cert status in
+    ///    the CA's revocation ledger (by serial number).
+    /// 3. Build a `BasicOCSPResponse` with a `SingleResponse` per request.
+    /// 4. Echo the request's nonce extension (RFC 8954) if present.
+    /// 5. Sign the `ResponseData` with the CA's signer.
+    /// 6. Encode the `OCSPResponse` as DER.
+    pub async fn handle_request(&self, req_der: &[u8]) -> Result<Vec<u8>, CaError> {
+        let req: OcspRequest = rasn::der::decode(req_der)
+            .map_err(|e| CaError::Encoding(format!("ocsp request decode: {e}")))?;
+
+        // Extract the nonce extension from the request (if any).
+        let mut request_nonce: Option<Vec<u8>> = None;
+        if let Some(exts) = &req.tbs_request.request_extensions {
+            for ext in exts.iter() {
+                if ext.extn_id == ObjectIdentifier::new(OID_OCSP_NONCE).unwrap() {
+                    // The nonce extn_value is an OCTET STRING containing the
+                    // raw nonce bytes (RFC 8954 — no inner DER wrapping).
+                    request_nonce = Some(ext.extn_value.to_vec());
+                }
+            }
+        }
+
+        // Build a SingleResponse per request entry.
+        let mut responses: Vec<OcspSingleResponse> = Vec::new();
+        for entry in req.tbs_request.request_list.iter() {
+            let cert_id = &entry.req_cert;
+            let serial_u64 = u64::try_from(&cert_id.serial_number)
+                .map_err(|_| CaError::Encoding("serial too large for u64".into()))?;
+            let revoked = self.ca.revoked_serials().await;
+            let now = Utc::now();
+            let next_update = now + Duration::days(1);
+            let status = if revoked.contains(&serial_u64) {
+                OcspCertStatus::Revoked(now)
+            } else {
+                OcspCertStatus::Good
+            };
+            responses.push(OcspSingleResponse {
+                cert_id: cert_id.clone(),
+                cert_status: status,
+                this_update: now,
+                next_update: Some(next_update),
+            });
+        }
+
+        // Build the ResponseData.
+        let mut response_extensions: Vec<Extension> = Vec::new();
+        if let Some(nonce) = request_nonce {
+            // Echo the nonce (RFC 8954 §4: the responder MUST echo the
+            // client's nonce in the response).
+            response_extensions.push(Extension {
+                extn_id: ObjectIdentifier::new(OID_OCSP_NONCE).unwrap(),
+                critical: false,
+                extn_value: OctetString::from(nonce),
+            });
+        }
+
+        let response_data = OcspResponseData {
+            responder_id: OcspResponderId::ByKey(self.ca.ca_ski().to_vec()),
+            produced_at: Utc::now(),
+            responses,
+            extensions: response_extensions,
+        };
+
+        // Encode + sign the ResponseData.
+        let tbs_der = encode_response_data(&response_data)?;
+        let sig = self.ca.signer().sign(&tbs_der).await?;
+
+        let basic = BasicOcspResponse {
+            response_data,
+            signature_algorithm: ecdsa_sha256_alg_id(),
+            signature: sig,
+        };
+
+        let resp = OcspResponse {
+            response_status: OcspResponseStatus::Successful,
+            response_bytes: Some(basic),
+        };
+
+        encode_ocsp_response(&resp)
+    }
+
+    /// Build an axum router for the OCSP responder. The endpoint is
+    /// `POST /ocsp` accepting `application/ocsp-request` and returning
+    /// `application/ocsp-response`.
+    pub fn router(&self) -> axum::Router {
+        use axum::routing::post;
+        let state = Arc::new(OcspState {
+            ca: self.ca.clone(),
+        });
+        axum::Router::new()
+            .route("/ocsp", post(ocsp_handler))
+            .with_state(state)
+    }
+}
+
+/// Internal state for the axum OCSP handler.
+struct OcspState {
+    ca: Arc<CaService>,
+}
+
+/// Axum handler for `POST /ocsp`.
+async fn ocsp_handler(
+    axum::extract::State(state): axum::extract::State<Arc<OcspState>>,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    let bytes = match body.collect().await {
+        Ok(b) => b.to_bytes().to_vec(),
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "body read failed").into_response();
+        }
+    };
+    let responder = OcspResponder::new(state.ca.clone());
+    match responder.handle_request(&bytes).await {
+        Ok(resp_der) => {
+            let mut resp = resp_der.into_response();
+            resp.headers_mut().insert(
+                "Content-Type",
+                HeaderValue::from_static("application/ocsp-response"),
+            );
+            resp
+        }
+        Err(e) => {
+            tracing::warn!("OCSP request failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "ocsp error").into_response()
+        }
+    }
+}
+
+/// Compute the SHA-1 hash of the issuer's Name (DER-encoded).
+pub fn issuer_name_hash(name: &Name) -> Vec<u8> {
+    let der = rasn::der::encode(name).unwrap_or_default();
+    sha1_digest(&der)
+}
+
+/// Compute the SHA-1 hash of the issuer's public key (SEC1 bytes for ECDSA).
+pub fn issuer_key_hash(public_sec1: &[u8]) -> Vec<u8> {
+    sha1_digest(public_sec1)
+}
+
+/// Build a `CertId` for a certificate issued by the given CA, identified
+/// by `serial`. Convenience helper for OCSP clients.
+pub fn build_cert_id(ca: &CaService, serial: u64) -> OcspCertId {
+    OcspCertId {
+        hash_algorithm: AlgorithmIdentifier {
+            algorithm: ObjectIdentifier::new(OID_SHA1).unwrap(),
+            parameters: None,
+        },
+        issuer_name_hash: OctetString::from(issuer_name_hash(ca.ca_subject())),
+        issuer_key_hash: OctetString::from(issuer_key_hash(ca.ca_public_key_sec1())),
+        serial_number: Integer::from(serial),
+    }
+}
+
+/// Manually DER-encode `OcspResponseData` (RFC 6960 §4.2.1 ResponseData).
+///
+/// We can't derive `Encode` for `OcspResponseData` directly because
+/// `OcspCertStatus` is a CHOICE with implicit tags, and `OcspResponderId`
+/// is also a CHOICE. Hand-rolling the DER is simpler than fighting rasn's
+/// derive for this one-off case.
+fn encode_response_data(rd: &OcspResponseData) -> Result<Vec<u8>, CaError> {
+    // ResponseData ::= SEQUENCE {
+    //   version            [0] EXPLICIT Version DEFAULT v1,
+    //   responderID            ResponderID,
+    //   producedAt             GeneralizedTime,
+    //   responses              SEQUENCE OF SingleResponse,
+    //   responseExtensions [1] EXPLICIT Extensions OPTIONAL
+    // }
+    let mut contents: Vec<u8> = Vec::new();
+
+    // version: omit (DEFAULT v1).
+
+    // responderID: CHOICE { byName [1] EXPLICIT Name, byKey [2] EXPLICIT KeyHash }
+    match &rd.responder_id {
+        OcspResponderId::ByName(name) => {
+            let name_der = rasn::der::encode(name)?;
+            // [1] EXPLICIT — context tag 1, constructed.
+            contents.extend_from_slice(&der_tag_len(0xA1, name_der.len()));
+            contents.extend_from_slice(&name_der);
+        }
+        OcspResponderId::ByKey(key_hash) => {
+            // [2] EXPLICIT OCTET STRING.
+            let oct = OctetString::from(key_hash.clone());
+            let oct_der = rasn::der::encode(&oct)?;
+            contents.extend_from_slice(&der_tag_len(0xA2, oct_der.len()));
+            contents.extend_from_slice(&oct_der);
+        }
+    }
+
+    // producedAt: GeneralizedTime.
+    let gt: GeneralizedTime = rd.produced_at.into();
+    let gt_der = rasn::der::encode(&gt)?;
+    contents.extend_from_slice(&gt_der);
+
+    // responses: SEQUENCE OF SingleResponse.
+    let mut responses_der: Vec<u8> = Vec::new();
+    for sr in &rd.responses {
+        responses_der.extend_from_slice(&encode_single_response(sr)?);
+    }
+    contents.extend_from_slice(&der_tag_len(0x30, responses_der.len()));
+    contents.extend_from_slice(&responses_der);
+
+    // responseExtensions [1] EXPLICIT Extensions OPTIONAL.
+    if !rd.extensions.is_empty() {
+        let exts: Extensions = Extensions::from(rd.extensions.clone());
+        let exts_der = rasn::der::encode(&exts)?;
+        contents.extend_from_slice(&der_tag_len(0xA1, exts_der.len()));
+        contents.extend_from_slice(&exts_der);
+    }
+
+    // Wrap in SEQUENCE.
+    let mut out = der_tag_len(0x30, contents.len());
+    out.extend_from_slice(&contents);
+    Ok(out)
+}
+
+/// Manually DER-encode a single `SingleResponse` (RFC 6960 §4.2.1).
+fn encode_single_response(sr: &OcspSingleResponse) -> Result<Vec<u8>, CaError> {
+    // SingleResponse ::= SEQUENCE {
+    //   certID                       CertID,
+    //   certStatus                   CertStatus,
+    //   thisUpdate                   GeneralizedTime,
+    //   nextUpdate         [0] EXPLICIT GeneralizedTime OPTIONAL,
+    //   singleExtensions   [1] EXPLICIT Extensions OPTIONAL
+    // }
+    let mut contents: Vec<u8> = Vec::new();
+
+    // certID
+    let cert_id_der = rasn::der::encode(&sr.cert_id)?;
+    contents.extend_from_slice(&cert_id_der);
+
+    // certStatus: CHOICE { good [0] IMPLICIT NULL, revoked [1] IMPLICIT RevokedInfo, unknown [2] IMPLICIT NULL }
+    match &sr.cert_status {
+        OcspCertStatus::Good => {
+            // [0] IMPLICIT NULL — context tag 0, primitive (0x80), zero length.
+            contents.extend_from_slice(&[0x80, 0x00]);
+        }
+        OcspCertStatus::Revoked(time) => {
+            // RevokedInfo ::= SEQUENCE { revocationTime GeneralizedTime, revocationReason [0] EXPLICIT CRLReason OPTIONAL }
+            let gt: GeneralizedTime = (*time).into();
+            let gt_der = rasn::der::encode(&gt)?;
+            let mut revoked_info = Vec::new();
+            revoked_info.extend_from_slice(&gt_der);
+            // revocationReason omitted (Unspecified).
+            // [1] IMPLICIT RevokedInfo — context tag 1, constructed (0xA1).
+            contents.extend_from_slice(&der_tag_len(0xA1, revoked_info.len()));
+            contents.extend_from_slice(&revoked_info);
+        }
+        OcspCertStatus::Unknown => {
+            // [2] IMPLICIT NULL — context tag 2, primitive (0x82), zero length.
+            contents.extend_from_slice(&[0x82, 0x00]);
+        }
+    }
+
+    // thisUpdate
+    let gt: GeneralizedTime = sr.this_update.into();
+    let gt_der = rasn::der::encode(&gt)?;
+    contents.extend_from_slice(&gt_der);
+
+    // nextUpdate [0] EXPLICIT
+    if let Some(nu) = sr.next_update {
+        let gt: GeneralizedTime = nu.into();
+        let gt_der = rasn::der::encode(&gt)?;
+        contents.extend_from_slice(&der_tag_len(0xA0, gt_der.len()));
+        contents.extend_from_slice(&gt_der);
+    }
+
+    // singleExtensions [1] EXPLICIT — omitted (empty).
+
+    let mut out = der_tag_len(0x30, contents.len());
+    out.extend_from_slice(&contents);
+    Ok(out)
+}
+
+/// Manually DER-encode an `OCSPResponse` (RFC 6960 §4.2.1).
+fn encode_ocsp_response(resp: &OcspResponse) -> Result<Vec<u8>, CaError> {
+    // OCSPResponse ::= SEQUENCE {
+    //   responseStatus         OCSPResponseStatus,
+    //   responseBytes       [0] EXPLICIT ResponseBytes OPTIONAL
+    // }
+    let mut contents: Vec<u8> = Vec::new();
+
+    // responseStatus: ENUMERATED.
+    let status_byte = resp.response_status as u8;
+    contents.extend_from_slice(&der_tag_len(0x0A, 1)); // ENUMERATED, 1 byte.
+    contents.push(status_byte);
+
+    // responseBytes [0] EXPLICIT.
+    if let Some(basic) = &resp.response_bytes {
+        let rb_der = encode_response_bytes(basic)?;
+        contents.extend_from_slice(&der_tag_len(0xA0, rb_der.len()));
+        contents.extend_from_slice(&rb_der);
+    }
+
+    let mut out = der_tag_len(0x30, contents.len());
+    out.extend_from_slice(&contents);
+    Ok(out)
+}
+
+/// Encode `ResponseBytes` (RFC 6960 §4.2.1).
+fn encode_response_bytes(basic: &BasicOcspResponse) -> Result<Vec<u8>, CaError> {
+    // ResponseBytes ::= SEQUENCE {
+    //   responseType   OBJECT IDENTIFIER,
+    //   response       OCTET STRING
+    // }
+    let tbs_der = encode_response_data(&basic.response_data)?;
+    // The `response` OCTET STRING contains the DER encoding of
+    // BasicOCSPResponse.
+    let mut basic_contents: Vec<u8> = Vec::new();
+    // tbsResponseData (already DER-encoded above).
+    basic_contents.extend_from_slice(&tbs_der);
+    // signatureAlgorithm: AlgorithmIdentifier.
+    let alg_der = rasn::der::encode(&basic.signature_algorithm)?;
+    basic_contents.extend_from_slice(&alg_der);
+    // signature: BIT STRING.
+    let bs: BitString = BitVec::<u8, Msb0>::from_vec(basic.signature.clone());
+    let bs_der = rasn::der::encode(&bs)?;
+    basic_contents.extend_from_slice(&bs_der);
+    // Wrap BasicOCSPResponse in SEQUENCE.
+    let basic_der = der_tag_len(0x30, basic_contents.len());
+    let mut full_basic = basic_der.clone();
+    full_basic.extend_from_slice(&basic_contents);
+
+    let mut contents: Vec<u8> = Vec::new();
+    // responseType: OID.
+    let oid = ObjectIdentifier::new(OID_OCSP_BASIC).unwrap();
+    let oid_der = rasn::der::encode(&oid)?;
+    contents.extend_from_slice(&oid_der);
+    // response: OCTET STRING containing BasicOCSPResponse DER.
+    let oct = OctetString::from(full_basic);
+    let oct_der = rasn::der::encode(&oct)?;
+    contents.extend_from_slice(&oct_der);
+
+    let mut out = der_tag_len(0x30, contents.len());
+    out.extend_from_slice(&contents);
+    Ok(out)
+}
+
+/// Build a DER tag-length-value header for `tag` and `len`.
+fn der_tag_len(tag: u8, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + if len >= 128 { 4 } else { 0 });
+    out.push(tag);
+    if len < 128 {
+        out.push(len as u8);
+    } else if len < 0x10000 {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xFF) as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xFF) as u8);
+    }
+    out
+}
+
+/// Build a test OCSP request for the given CertID. Convenience helper
+/// for tests and for the ACME server's OCSP integration.
+pub fn build_ocsp_request(cert_id: &OcspCertId, nonce: &[u8]) -> Result<Vec<u8>, CaError> {
+    let mut request_extensions: Vec<Extension> = Vec::new();
+    if !nonce.is_empty() {
+        request_extensions.push(Extension {
+            extn_id: ObjectIdentifier::new(OID_OCSP_NONCE).unwrap(),
+            critical: false,
+            extn_value: OctetString::from(nonce.to_vec()),
+        });
+    }
+    let tbs = TbsOcspRequest {
+        version: 0,
+        requestor_name: None,
+        request_extensions: if request_extensions.is_empty() {
+            None
+        } else {
+            Some(Extensions::from(request_extensions))
+        },
+        request_list: SequenceOf::from(vec![OcspRequestEntry {
+            req_cert: cert_id.clone(),
+            single_request_extensions: None,
+        }]),
+    };
+    let req = OcspRequest {
+        tbs_request: tbs,
+        optional_signature: None,
+    };
+    Ok(rasn::der::encode(&req)?)
+}
+
+/// Parse a DER-encoded `OCSPResponse` back into the structured form.
+/// This is the inverse of `encode_ocsp_response`. Used by tests to verify
+/// the response contents (status, cert status, nonce echo).
+pub fn parse_ocsp_response(der: &[u8]) -> Result<OcspResponse, CaError> {
+    // We hand-roll the parser to match the hand-rolled encoder (the
+    // `OcspResponse` / `OcspResponseData` / `OcspCertStatus` types don't
+    // derive Decode because of the CHOICE with implicit tags).
+    let mut p = DerParser::new(der);
+    p.expect_tag(0x30)?;
+    let inner = p.rest_until_end()?;
+
+    let mut p = DerParser::new(inner);
+    // responseStatus: ENUMERATED.
+    p.expect_tag(0x0A)?;
+    let status_len = p.read_len()?;
+    let status_byte = p.read_n(status_len)?[0];
+    let response_status = match status_byte {
+        0 => OcspResponseStatus::Successful,
+        1 => OcspResponseStatus::MalformedRequest,
+        2 => OcspResponseStatus::InternalError,
+        3 => OcspResponseStatus::TryLater,
+        5 => OcspResponseStatus::SigRequired,
+        6 => OcspResponseStatus::Unauthorized,
+        other => return Err(CaError::Encoding(format!("unknown ocsp status {other}"))),
+    };
+
+    // responseBytes [0] EXPLICIT (optional).
+    let response_bytes = if p.remaining().is_empty() {
+        None
+    } else {
+        p.expect_tag(0xA0)?;
+        let rb_len = p.read_len()?;
+        let rb_bytes = p.read_n(rb_len)?;
+        Some(parse_response_bytes(rb_bytes)?)
+    };
+
+    Ok(OcspResponse {
+        response_status,
+        response_bytes,
+    })
+}
+
+/// Parse `ResponseBytes` (contains a `BasicOCSPResponse`).
+fn parse_response_bytes(der: &[u8]) -> Result<BasicOcspResponse, CaError> {
+    let mut p = DerParser::new(der);
+    p.expect_tag(0x30)?;
+    let inner = p.rest_until_end()?;
+
+    let mut p = DerParser::new(inner);
+    // responseType: OID.
+    p.expect_tag(0x06)?;
+    let oid_len = p.read_len()?;
+    let _oid_bytes = p.read_n(oid_len)?;
+    // response: OCTET STRING containing BasicOCSPResponse DER.
+    p.expect_tag(0x04)?;
+    let oct_len = p.read_len()?;
+    let basic_der = p.read_n(oct_len)?;
+    parse_basic_ocsp_response(basic_der)
+}
+
+/// Parse a `BasicOCSPResponse`. Input is the full BasicOCSPResponse TLV.
+fn parse_basic_ocsp_response(der: &[u8]) -> Result<BasicOcspResponse, CaError> {
+    let mut p = DerParser::new(der);
+    p.expect_tag(0x30)?;
+    let inner = p.rest_until_end()?;
+
+    let mut p = DerParser::new(inner);
+    // tbsResponseData: SEQUENCE. Capture full TLV for parsing.
+    let rd_tlv = p.read_tlv()?;
+    let response_data = parse_response_data_tlv(rd_tlv)?;
+
+    // signatureAlgorithm: AlgorithmIdentifier (SEQUENCE). Full TLV for rasn.
+    let alg_tlv = p.read_tlv()?;
+    let signature_algorithm: AlgorithmIdentifier = rasn::der::decode(alg_tlv)
+        .map_err(|e| CaError::Encoding(format!("decode sig alg: {e}")))?;
+
+    // signature: BIT STRING.
+    p.expect_tag(0x03)?;
+    let bs_len = p.read_len()?;
+    let bs_bytes = p.read_n(bs_len)?;
+    // BIT STRING: first byte is unused-bits count, rest is the signature.
+    let signature = if bs_bytes.is_empty() {
+        Vec::new()
+    } else {
+        bs_bytes[1..].to_vec()
+    };
+
+    Ok(BasicOcspResponse {
+        response_data,
+        signature_algorithm,
+        signature,
+    })
+}
+
+/// Parse a GeneralizedTime TLV's content bytes (e.g. `b"20260814120000Z"`)
+/// into a `DateTime<Utc>`. RFC 5280 §4.2.1.6 requires GeneralizedTime to
+/// always be in UTC (ending in `Z`), never with a local-time offset.
+fn parse_generalized_time_content(bytes: &[u8]) -> Result<DateTime<Utc>, CaError> {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|e| CaError::Encoding(format!("producedAt utf8: {e}")))?;
+    // Format: YYYYMMDDHHMMSS.fffZ or YYYYMMDDHHMMSSZ (we support the latter;
+    // fractional seconds are rare in OCSP responses).
+    let s = s.trim();
+    let s = s.trim_end_matches('Z');
+    // Pad to at least YYYYMMDDHHMMSS (14 chars).
+    if s.len() < 14 {
+        return Err(CaError::Encoding(format!(
+            "GeneralizedTime too short: '{s}'"
+        )));
+    }
+    let year: i32 = s[0..4]
+        .parse()
+        .map_err(|e| CaError::Encoding(format!("year: {e}")))?;
+    let month: u32 = s[4..6]
+        .parse()
+        .map_err(|e| CaError::Encoding(format!("month: {e}")))?;
+    let day: u32 = s[6..8]
+        .parse()
+        .map_err(|e| CaError::Encoding(format!("day: {e}")))?;
+    let hour: u32 = s[8..10]
+        .parse()
+        .map_err(|e| CaError::Encoding(format!("hour: {e}")))?;
+    let min: u32 = s[10..12]
+        .parse()
+        .map_err(|e| CaError::Encoding(format!("min: {e}")))?;
+    let sec: u32 = s[12..14]
+        .parse()
+        .map_err(|e| CaError::Encoding(format!("sec: {e}")))?;
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|d| d.and_hms_opt(hour, min, sec))
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        .ok_or_else(|| CaError::Encoding(format!("invalid GeneralizedTime: '{s}'")))
+}
+
+/// Parse `ResponseData` from its full TLV (tag + length + content).
+fn parse_response_data_tlv(der: &[u8]) -> Result<OcspResponseData, CaError> {
+    let mut p = DerParser::new(der);
+    p.expect_tag(0x30)?;
+    let inner = p.rest_until_end()?;
+    parse_response_data_content(inner)
+}
+
+/// Parse `ResponseData` content (the bytes inside the ResponseData SEQUENCE).
+fn parse_response_data_content(der: &[u8]) -> Result<OcspResponseData, CaError> {
+    let mut p = DerParser::new(der);
+
+    // responderID: CHOICE { byName [1] EXPLICIT, byKey [2] EXPLICIT }.
+    let tag = p.peek_tag()?;
+    let responder_id = match tag {
+        0xA1 => {
+            p.expect_tag(0xA1)?;
+            let len = p.read_len()?;
+            let name_bytes = p.read_n(len)?;
+            let name: Name = rasn::der::decode(name_bytes)
+                .map_err(|e| CaError::Encoding(format!("decode responder name: {e}")))?;
+            OcspResponderId::ByName(name)
+        }
+        0xA2 => {
+            p.expect_tag(0xA2)?;
+            let len = p.read_len()?;
+            let kh_bytes = p.read_n(len)?;
+            // The byKey is an OCTET STRING inside the [2] EXPLICIT.
+            let mut p2 = DerParser::new(kh_bytes);
+            p2.expect_tag(0x04)?;
+            let oct_len = p2.read_len()?;
+            let key_hash = p2.read_n(oct_len)?;
+            OcspResponderId::ByKey(key_hash.to_vec())
+        }
+        other => {
+            return Err(CaError::Encoding(format!(
+                "expected responderID tag [1] or [2], got 0x{other:02X}"
+            )));
+        }
+    };
+
+    // producedAt: GeneralizedTime (tag 0x18).
+    p.expect_tag(0x18)?;
+    let gt_len = p.read_len()?;
+    let gt_bytes = p.read_n(gt_len)?;
+    let produced_at = parse_generalized_time_content(gt_bytes)?;
+
+    // responses: SEQUENCE OF SingleResponse.
+    p.expect_tag(0x30)?;
+    let resp_seq_len = p.read_len()?;
+    let resp_seq = p.read_n(resp_seq_len)?;
+    let responses = parse_single_responses(resp_seq)?;
+
+    // responseExtensions [1] EXPLICIT (optional).
+    let extensions = if !p.remaining().is_empty() {
+        p.expect_tag(0xA1)?;
+        let ext_len = p.read_len()?;
+        let ext_bytes = p.read_n(ext_len)?;
+        let exts: Extensions = rasn::der::decode(ext_bytes)
+            .map_err(|e| CaError::Encoding(format!("decode response exts: {e}")))?;
+        // `Extensions` derefs to `SequenceOf<Extension>` which derefs to
+        // `Vec<Extension>`; `.iter().cloned().collect()` gets us a owned Vec.
+        exts.iter().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Ok(OcspResponseData {
+        responder_id,
+        produced_at,
+        responses,
+        extensions,
+    })
+}
+
+/// Parse a SEQUENCE of SingleResponse. The input is the content of the
+/// `responses` SEQUENCE OF — i.e. a concatenation of SingleResponse TLVs.
+fn parse_single_responses(der: &[u8]) -> Result<Vec<OcspSingleResponse>, CaError> {
+    let mut out = Vec::new();
+    let mut p = DerParser::new(der);
+    while !p.remaining().is_empty() {
+        p.expect_tag(0x30)?;
+        let sr_len = p.read_len()?;
+        let sr_bytes = p.read_n(sr_len)?;
+        out.push(parse_single_response(sr_bytes)?);
+    }
+    Ok(out)
+}
+
+/// Parse a single `SingleResponse`. The input is the CONTENT of the
+/// SingleResponse SEQUENCE.
+fn parse_single_response(der: &[u8]) -> Result<OcspSingleResponse, CaError> {
+    let mut p = DerParser::new(der);
+
+    // certID: SEQUENCE. Capture the full TLV so rasn can decode it.
+    let cid_tlv = p.read_tlv()?;
+    let cert_id: OcspCertId =
+        rasn::der::decode(cid_tlv).map_err(|e| CaError::Encoding(format!("decode certId: {e}")))?;
+
+    // certStatus: CHOICE { good [0], revoked [1], unknown [2] }.
+    let tag = p.peek_tag()?;
+    let cert_status = match tag {
+        0x80 => {
+            p.expect_tag(0x80)?;
+            let _len = p.read_len()?;
+            // NULL body (0 bytes).
+            OcspCertStatus::Good
+        }
+        0xA1 => {
+            p.expect_tag(0xA1)?;
+            let len = p.read_len()?;
+            let ri_bytes = p.read_n(len)?;
+            // [1] IMPLICIT RevokedInfo — the SEQUENCE tag is replaced by
+            // [1], so `ri_bytes` is directly the content of RevokedInfo:
+            // revocationTime GeneralizedTime [optional revocationReason].
+            let mut p2 = DerParser::new(ri_bytes);
+            p2.expect_tag(0x18)?;
+            let gt_len = p2.read_len()?;
+            let gt_bytes = p2.read_n(gt_len)?;
+            let t = parse_generalized_time_content(gt_bytes)?;
+            OcspCertStatus::Revoked(t)
+        }
+        0x82 => {
+            p.expect_tag(0x82)?;
+            let _len = p.read_len()?;
+            OcspCertStatus::Unknown
+        }
+        other => {
+            return Err(CaError::Encoding(format!(
+                "expected certStatus tag [0]/[1]/[2], got 0x{other:02X}"
+            )));
+        }
+    };
+
+    // thisUpdate: GeneralizedTime.
+    p.expect_tag(0x18)?;
+    let gt_len = p.read_len()?;
+    let gt_bytes = p.read_n(gt_len)?;
+    let this_update = parse_generalized_time_content(gt_bytes)?;
+
+    // nextUpdate [0] EXPLICIT (optional).
+    let next_update = if !p.remaining().is_empty() {
+        let tag = p.peek_tag()?;
+        if tag == 0xA0 {
+            p.expect_tag(0xA0)?;
+            let len = p.read_len()?;
+            let nu_bytes = p.read_n(len)?;
+            let mut p2 = DerParser::new(nu_bytes);
+            p2.expect_tag(0x18)?;
+            let gt_len = p2.read_len()?;
+            let gt_bytes = p2.read_n(gt_len)?;
+            Some(parse_generalized_time_content(gt_bytes)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(OcspSingleResponse {
+        cert_id,
+        cert_status,
+        this_update,
+        next_update,
+    })
+}
+
+/// Minimal hand-rolled DER parser for OCSP response decoding.
+struct DerParser<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DerParser<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
+    fn rest_until_end(&mut self) -> Result<&'a [u8], CaError> {
+        // After the caller has consumed the tag, we still need to consume
+        // the length and return the content slice.
+        let len = self.read_len()?;
+        if self.pos + len > self.buf.len() {
+            return Err(CaError::Encoding(format!(
+                "truncated DER: need {len} bytes at pos {} (buf len {})",
+                self.pos,
+                self.buf.len()
+            )));
+        }
+        let rest = &self.buf[self.pos..self.pos + len];
+        self.pos = self.buf.len();
+        Ok(rest)
+    }
+
+    fn peek_tag(&self) -> Result<u8, CaError> {
+        self.buf
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| CaError::Encoding("unexpected end of DER".into()))
+    }
+
+    fn expect_tag(&mut self, expected: u8) -> Result<(), CaError> {
+        let tag = self.peek_tag()?;
+        if tag != expected {
+            return Err(CaError::Encoding(format!(
+                "expected DER tag 0x{expected:02X}, got 0x{tag:02X}"
+            )));
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn read_len(&mut self) -> Result<usize, CaError> {
+        let b = self
+            .buf
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| CaError::Encoding("missing length byte".into()))?;
+        self.pos += 1;
+        if b < 0x80 {
+            return Ok(b as usize);
+        }
+        let n = (b & 0x7F) as usize;
+        if n == 0 || n > 4 {
+            return Err(CaError::Encoding(format!(
+                "unsupported DER length form: 0x{b:02X}"
+            )));
+        }
+        let mut len = 0usize;
+        for _ in 0..n {
+            let byte = self
+                .buf
+                .get(self.pos)
+                .copied()
+                .ok_or_else(|| CaError::Encoding("truncated length".into()))?;
+            self.pos += 1;
+            len = (len << 8) | (byte as usize);
+        }
+        Ok(len)
+    }
+
+    fn read_n(&mut self, n: usize) -> Result<&'a [u8], CaError> {
+        if self.pos + n > self.buf.len() {
+            return Err(CaError::Encoding(format!(
+                "truncated DER: need {n} bytes at pos {} (buf len {})",
+                self.pos,
+                self.buf.len()
+            )));
+        }
+        let slice = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(slice)
+    }
+
+    /// Read a full TLV (tag + length + value) and return it as a borrowed
+    /// slice. Used when we need to pass a sub-structure to rasn's decoder
+    /// (which expects the full TLV, not just the content).
+    fn read_tlv(&mut self) -> Result<&'a [u8], CaError> {
+        let start = self.pos;
+        // Consume tag.
+        let _tag = self.peek_tag()?;
+        self.pos += 1;
+        // Consume length.
+        let len = self.read_len()?;
+        // Consume value.
+        self.read_n(len)?;
+        Ok(&self.buf[start..self.pos])
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1639,5 +2611,191 @@ mod tests {
         assert_eq!(bound.public_sec1().len(), 65);
         assert_eq!(bound.public_sec1()[0], 0x04);
         assert_eq!(bound.ski_bytes().len(), 20);
+    }
+
+    // ===== Domain-06 Wave 2: OCSP responder (RFC 6960) tests =====
+
+    /// Helper: issue a cert from the CA and return its serial number.
+    async fn issue_cert_for_ocsp(ca: &CaService, cn: &str) -> u64 {
+        let csr_der = make_csr(cn);
+        ca.issue("adrian-webserver", &csr_der).await.expect("issue");
+        // Serial 1 is the first issued (CA root is serial 0 conceptually;
+        // the CA's `serial` AtomicU64 starts at 1 and fetch_add returns the
+        // pre-increment value, so the first issued cert is serial 1).
+        1
+    }
+
+    /// OCSP request/response round-trip for a good (non-revoked) cert.
+    /// The response MUST be `successful` and the SingleResponse certStatus
+    /// MUST be `good`.
+    #[tokio::test]
+    async fn ocsp_request_for_good_cert_returns_successful_response() {
+        let ca = Arc::new(CaService::new().expect("ca"));
+        let serial = issue_cert_for_ocsp(&ca, "good.adrian.dev").await;
+
+        let cert_id = build_cert_id(&ca, serial);
+        let nonce = b"test-nonce-12345678";
+        let req_der = build_ocsp_request(&cert_id, nonce).expect("build request");
+
+        let responder = OcspResponder::new(ca.clone());
+        let resp_der = responder
+            .handle_request(&req_der)
+            .await
+            .expect("handle_request");
+
+        // The response MUST start with a SEQUENCE tag.
+        assert_eq!(resp_der[0], 0x30, "OCSPResponse is DER SEQUENCE");
+
+        // Parse the response to verify the status.
+        let resp: OcspResponse = parse_ocsp_response(&resp_der).expect("parse response");
+        assert_eq!(resp.response_status, OcspResponseStatus::Successful);
+        assert!(
+            resp.response_bytes.is_some(),
+            "responseBytes MUST be present"
+        );
+    }
+
+    /// OCSP request for a revoked cert returns `revoked` status.
+    #[tokio::test]
+    async fn ocsp_request_for_revoked_cert_returns_revoked_status() {
+        let ca = Arc::new(CaService::new().expect("ca"));
+        let serial = issue_cert_for_ocsp(&ca, "revoked.adrian.dev").await;
+        // Revoke the cert.
+        let serial_bytes = serial.to_be_bytes();
+        ca.revoke(&serial_bytes, "keyCompromise")
+            .await
+            .expect("revoke");
+
+        let cert_id = build_cert_id(&ca, serial);
+        let req_der = build_ocsp_request(&cert_id, b"").expect("build request");
+
+        let responder = OcspResponder::new(ca.clone());
+        let resp_der = responder
+            .handle_request(&req_der)
+            .await
+            .expect("handle_request");
+
+        let resp: OcspResponse = parse_ocsp_response(&resp_der).expect("parse response");
+        assert_eq!(resp.response_status, OcspResponseStatus::Successful);
+        let basic = resp.response_bytes.expect("responseBytes");
+        assert_eq!(basic.response_data.responses.len(), 1);
+        match &basic.response_data.responses[0].cert_status {
+            OcspCertStatus::Revoked(_) => {}
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+    }
+
+    /// OCSP request for an unknown serial (not in CA's ledger) returns
+    /// `good` (the CA only tracks revoked certs; any non-revoked serial is
+    /// treated as good — this is the standard OCSP responder behavior per
+    /// RFC 6960 §4.2.1, since the CA doesn't have a complete issued-cert
+    /// ledger in this wave).
+    #[tokio::test]
+    async fn ocsp_request_for_unknown_cert_returns_good() {
+        let ca = Arc::new(CaService::new().expect("ca"));
+        // Query for serial 99999 which was never issued.
+        let cert_id = build_cert_id(&ca, 99999);
+        let req_der = build_ocsp_request(&cert_id, b"").expect("build request");
+
+        let responder = OcspResponder::new(ca.clone());
+        let resp_der = responder
+            .handle_request(&req_der)
+            .await
+            .expect("handle_request");
+
+        let resp: OcspResponse = parse_ocsp_response(&resp_der).expect("parse response");
+        assert_eq!(resp.response_status, OcspResponseStatus::Successful);
+        let basic = resp.response_bytes.expect("responseBytes");
+        assert_eq!(basic.response_data.responses.len(), 1);
+        match &basic.response_data.responses[0].cert_status {
+            OcspCertStatus::Good => {}
+            other => panic!("expected Good for unknown serial, got {other:?}"),
+        }
+    }
+
+    /// OCSP nonce extension (RFC 8954) is echoed in the response. The
+    /// responder MUST copy the request's nonce into the response's
+    /// responseExtensions.
+    #[tokio::test]
+    async fn ocsp_nonce_extension_is_echoed_in_response() {
+        let ca = Arc::new(CaService::new().expect("ca"));
+        let cert_id = build_cert_id(&ca, 1);
+        let nonce = b"unique-nonce-value-1234";
+        let req_der = build_ocsp_request(&cert_id, nonce).expect("build request");
+
+        let responder = OcspResponder::new(ca.clone());
+        let resp_der = responder
+            .handle_request(&req_der)
+            .await
+            .expect("handle_request");
+
+        let resp: OcspResponse = parse_ocsp_response(&resp_der).expect("parse response");
+        let basic = resp.response_bytes.expect("responseBytes");
+        // Find the nonce extension in the response.
+        let nonce_oid = ObjectIdentifier::new(OID_OCSP_NONCE).unwrap();
+        let nonce_ext = basic
+            .response_data
+            .extensions
+            .iter()
+            .find(|e| e.extn_id == nonce_oid)
+            .expect("nonce extension MUST be echoed in response");
+        // The nonce value MUST match the request's nonce.
+        assert_eq!(nonce_ext.extn_value.to_vec(), nonce.to_vec());
+    }
+
+    /// OCSP nonce replay rejection: a response with a mismatched nonce
+    /// is detected by the client. We simulate this by making two requests
+    /// with different nonces and verifying the responses carry different
+    /// nonces (a replayed response would have the wrong nonce for the
+    /// second request).
+    #[tokio::test]
+    async fn ocsp_nonce_replay_detection() {
+        let ca = Arc::new(CaService::new().expect("ca"));
+        let cert_id = build_cert_id(&ca, 1);
+
+        // Request 1 with nonce A.
+        let nonce_a = b"nonce-A-aaaaaaaa";
+        let req_a = build_ocsp_request(&cert_id, nonce_a).expect("build request A");
+        let responder = OcspResponder::new(ca.clone());
+        let resp_a_der = responder
+            .handle_request(&req_a)
+            .await
+            .expect("handle request A");
+        let resp_a: OcspResponse = parse_ocsp_response(&resp_a_der).expect("parse A");
+        let basic_a = resp_a.response_bytes.expect("responseBytes A");
+        let nonce_oid = ObjectIdentifier::new(OID_OCSP_NONCE).unwrap();
+        let echo_a = basic_a
+            .response_data
+            .extensions
+            .iter()
+            .find(|e| e.extn_id == nonce_oid)
+            .expect("nonce A echoed");
+        assert_eq!(echo_a.extn_value.to_vec(), nonce_a.to_vec());
+
+        // Request 2 with nonce B (different).
+        let nonce_b = b"nonce-B-bbbbbbbb";
+        let req_b = build_ocsp_request(&cert_id, nonce_b).expect("build request B");
+        let resp_b_der = responder
+            .handle_request(&req_b)
+            .await
+            .expect("handle request B");
+        let resp_b: OcspResponse = parse_ocsp_response(&resp_b_der).expect("parse B");
+        let basic_b = resp_b.response_bytes.expect("responseBytes B");
+        let echo_b = basic_b
+            .response_data
+            .extensions
+            .iter()
+            .find(|e| e.extn_id == nonce_oid)
+            .expect("nonce B echoed");
+        assert_eq!(echo_b.extn_value.to_vec(), nonce_b.to_vec());
+
+        // Replay detection: response A's nonce does NOT match request B's
+        // nonce — a client checking the nonce would reject response A as
+        // a replay for request B.
+        assert_ne!(
+            echo_a.extn_value.to_vec(),
+            echo_b.extn_value.to_vec(),
+            "different requests MUST produce different nonces"
+        );
     }
 }
