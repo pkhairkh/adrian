@@ -84,9 +84,25 @@ pub fn derive_aes128_key(password: &[u8], salt: &[u8]) -> Aes128Key {
 
 /// Derive a 32-byte AES-256 long-term key from a password and salt via
 /// PBKDF2-HMAC-SHA1 with 4096 iterations (RFC 3962 §3).
+///
+/// Note: this returns the raw PBKDF2 output (the "tkey"). The full Kerberos
+/// string-to-key applies `DK(tkey, "kerberos")` on top — see
+/// [`crate::key_derivation::string_to_key_aes256`].
 pub fn derive_aes256_key(password: &[u8], salt: &[u8]) -> Aes256Key {
+    derive_aes256_key_with_iterations(password, salt, PBKDF2_ITERATIONS)
+}
+
+/// Derive a 32-byte AES-256 key from a password and salt via PBKDF2-HMAC-SHA1
+/// with a caller-specified iteration count. Used by
+/// [`crate::key_derivation::string_to_key_aes256`] and for RFC 3962 test
+/// vectors (which use 1 iteration for fast verification).
+pub fn derive_aes256_key_with_iterations(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> Aes256Key {
     let mut out = [0u8; AES256_KEY_LEN];
-    pbkdf2_hmac::<Sha1>(password, salt, PBKDF2_ITERATIONS, &mut out);
+    pbkdf2_hmac::<Sha1>(password, salt, iterations, &mut out);
     out
 }
 

@@ -237,8 +237,12 @@ fn aes256_encrypt_block(_key: &Aes256Key, _block: &[u8; AES_BLOCK_LEN]) -> [u8; 
 }
 
 /// Encrypt `data` (a multiple of one AES block) with `key` in AES-CBC mode
-/// with an all-zero IV. Used by the DR step to derive AES-256 keys (which
-/// require 2 AES blocks of output).
+/// with an all-zero IV.
+///
+/// **Note**: this function was used by the v0.7.0 (incorrect) DR implementation.
+/// The v0.8.0 DR fix replaced it with iterative ECB feedback. This function is
+/// kept for the test that verifies the AES-CBC primitive.
+#[allow(dead_code)]
 fn aes256_cbc_encrypt_zero_iv(key: &Aes256Key, data: &[u8]) -> Vec<u8> {
     assert!(
         data.len().is_multiple_of(AES_BLOCK_LEN),
@@ -269,44 +273,73 @@ fn derivation_constant(key_usage: u32, tag: u8) -> [u8; 5] {
     [be[0], be[1], be[2], be[3], tag]
 }
 
-/// DR (Derivation Random) per RFC 3961 §5.1: `DR(K, X) = k-truncate(E(K, X, 0))`.
+/// DR (Derivation Random) per RFC 3961 §5.1.
 ///
-/// For AES-256 (32-byte derived key):
-/// 1. `nfold` the constant to one AES block (16 bytes).
-/// 2. Repeat the n-folded block to fill the desired key length (2 copies = 32 bytes).
-/// 3. AES-CBC-encrypt with zero IV.
-/// 4. The 32-byte ciphertext is the derived key.
+/// The correct algorithm is **iterative single-block ECB feedback**:
+/// ```text
+/// K1 = E(Key, n-fold(Constant))       // IV = 0
+/// K2 = E(Key, K1)                     // feed ciphertext back as next plaintext
+/// K3 = E(Key, K2)
+/// DR(Key, Constant) = k-truncate(K1 || K2 || K3 || ...)
+/// ```
 ///
-/// `key_usage` is the RFC 4120 §7.5.1 key usage number (1 for AS-REP
-/// encrypted part, 2 for AS-REP TGS-encrypted part, etc.).
-fn dr_derive(base_key: &Aes256Key, constant: &[u8; 5]) -> Aes256Key {
-    // Step 1: n-fold the 5-byte constant to one AES block (128 bits = 16 bytes).
+/// For AES-256 (32-byte key), we need 2 blocks: K1 || K2 (32 bytes).
+///
+/// **v0.8.0 fix**: the v0.7.0 implementation used "repeat the n-folded
+/// constant to 32 bytes and CBC-encrypt" — this is WRONG. It produces the
+/// correct K1 (because CBC with IV=0 on the first block = ECB) but the wrong
+/// K2 (CBC chains C1 ⊕ nfold, while DR requires E(K1) with no XOR). The
+/// correct algorithm feeds the ciphertext back as the next plaintext with no
+/// XOR chaining. Verified against RFC 3962 Appendix B string-to-key vectors.
+fn dr_derive(base_key: &Aes256Key, constant: &[u8]) -> Aes256Key {
+    // Step 1: n-fold the constant to one AES block (128 bits = 16 bytes).
     let folded = nfold(constant, AES_BLOCK_LEN * 8);
+    debug_assert_eq!(folded.len(), AES_BLOCK_LEN);
 
-    // Step 2: for AES-256 (32-byte key), repeat the folded constant to fill 32 bytes.
-    // (For AES-128 only one copy would be needed; this module only derives AES-256.)
-    let mut indata = Vec::with_capacity(AES256_KEY_LEN);
-    while indata.len() < AES256_KEY_LEN {
-        indata.extend_from_slice(&folded);
+    // Step 2: iterative ECB feedback.
+    let cipher = Aes256::new(GenericArray::from_slice(base_key));
+    let mut out = Vec::with_capacity(AES256_KEY_LEN);
+    let mut block: GenericArray<u8, aes::cipher::consts::U16> =
+        GenericArray::clone_from_slice(&folded);
+    while out.len() < AES256_KEY_LEN {
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
     }
-    indata.truncate(AES256_KEY_LEN);
 
-    // Step 3: AES-CBC-encrypt with zero IV.
-    let derived = aes256_cbc_encrypt_zero_iv(base_key, &indata);
+    // Step 3: k-truncate to the desired key length (32 bytes for AES-256).
+    let mut result = [0u8; AES256_KEY_LEN];
+    result.copy_from_slice(&out[..AES256_KEY_LEN]);
+    result
+}
 
-    // Step 4: copy into the fixed-size return array (k-truncate is a no-op
-    // here because the desired key length is exactly 32 bytes).
-    let mut out = [0u8; AES256_KEY_LEN];
-    out.copy_from_slice(&derived[..AES256_KEY_LEN]);
-    out
+/// DK (Derive Key) per RFC 3961 §5.1: `DK(Key, Constant) = random-to-key(DR(Key, Constant))`.
+///
+/// For AES, `random-to-key` is the identity function (any bit string of the
+/// correct length is a valid AES key), so `DK = DR`.
+fn dk_derive(base_key: &Aes256Key, constant: &[u8]) -> Aes256Key {
+    dr_derive(base_key, constant)
+}
+
+/// Full Kerberos string-to-key for AES-256 (RFC 3962 §4).
+///
+/// This is the REAL string-to-key function that a Kerberos client/KDC uses:
+/// 1. `tkey = PBKDF2-HMAC-SHA1(password, salt, iterations, 32)`
+/// 2. `base_key = DK(tkey, "kerberos")`
+///
+/// Note: [`crate::crypto::derive_aes256_key`] returns only the PBKDF2 output
+/// (step 1). This function applies the full chain (steps 1 + 2) to produce the
+/// actual Kerberos base key. Verified against RFC 3962 Appendix B.
+pub fn string_to_key_aes256(password: &[u8], salt: &[u8], iterations: u32) -> Aes256Key {
+    let tkey = crate::crypto::derive_aes256_key_with_iterations(password, salt, iterations);
+    dk_derive(&tkey, b"kerberos")
 }
 
 /// Derive the encryption key (Ke) for the given key usage number.
 ///
 /// Per RFC 3961 §5.1 + RFC 3962 §6: the constant is the 4-byte big-endian key
 /// usage number followed by `0xAA`. The constant is n-folded to one AES block
-/// (16 bytes), repeated to 32 bytes, and AES-CBC-encrypted with the base key
-/// (zero IV) to produce a 32-byte Ke.
+/// (16 bytes), then DR applies iterative ECB feedback (K1=E(key,nfold),
+/// K2=E(key,K1), ...) to produce a 32-byte Ke.
 ///
 /// Common key usage numbers (per RFC 4120 §7.5.1):
 ///
@@ -332,8 +365,7 @@ pub fn derive_encryption_key(base_key: &Aes256Key, key_usage: u32) -> Aes256Key 
 ///
 /// Per RFC 3961 §5.1 + RFC 3962 §6: the constant is the 4-byte big-endian key
 /// usage number followed by `0x55`. The constant is n-folded to one AES block
-/// (16 bytes), repeated to 32 bytes, and AES-CBC-encrypted with the base key
-/// (zero IV) to produce a 32-byte Ki.
+/// (16 bytes), then DR applies iterative ECB feedback to produce a 32-byte Ki.
 pub fn derive_integrity_key(base_key: &Aes256Key, key_usage: u32) -> Aes256Key {
     let constant = derivation_constant(key_usage, KI_TAG);
     dr_derive(base_key, &constant)
@@ -847,5 +879,160 @@ mod tests {
         assert_eq!(out.len(), 16);
         // Determinism
         assert_eq!(nfold(b"Q", 128), out);
+    }
+
+    // ==================================================================
+    // v0.8.0 Wave 4: RFC 3962 Appendix B AES-DK key derivation test vectors
+    // ==================================================================
+
+    /// RFC 3962 Appendix B string-to-key test vectors.
+    /// Verifies the full chain: PBKDF2 → DK(tkey, "kerberos") → base key.
+    #[test]
+    fn rfc3962_string_to_key_dk_kerberos_vectors() {
+        // Vector 1: password="password", salt="ATHENA.MIT.EDUraeburn", iter=1, AES-256
+        // PBKDF2 output (tkey) = cdedb528...0837
+        // DK(tkey, "kerberos") = fe697b52...0161 (the real Kerberos base key)
+        let base_key = string_to_key_aes256(b"password", b"ATHENA.MIT.EDUraeburn", 1);
+        assert_eq!(
+            bytes_to_hex(&base_key),
+            "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161",
+            "RFC 3962 Appendix B: string-to-key(password, ATHENA.MIT.EDUraeburn, 1)"
+        );
+
+        // Vector 2: iter=2
+        let base_key2 = string_to_key_aes256(b"password", b"ATHENA.MIT.EDUraeburn", 2);
+        assert_eq!(
+            bytes_to_hex(&base_key2),
+            "a2e16d16b36069c135d5e9d2e25f896102685618b95914b467c67622225824ff",
+            "RFC 3962 Appendix B: string-to-key(password, ATHENA.MIT.EDUraeburn, 2)"
+        );
+
+        // Vector 3: iter=1200
+        let base_key3 = string_to_key_aes256(b"password", b"ATHENA.MIT.EDUraeburn", 1200);
+        assert_eq!(
+            bytes_to_hex(&base_key3),
+            "55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a",
+            "RFC 3962 Appendix B: string-to-key(password, ATHENA.MIT.EDUraeburn, 1200)"
+        );
+
+        // Also verify the DK step directly: DK(tkey, "kerberos") = base_key
+        let tkey: Aes256Key =
+            hex_to_bytes("cdedb5281bb2f801565a1122b25635150ad1f7a04bb9f3a333ecc0e2e1f70837")
+                .try_into()
+                .unwrap();
+        let dk_result = dk_derive(&tkey, b"kerberos");
+        assert_eq!(
+            bytes_to_hex(&dk_result),
+            "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161",
+            "DK(tkey, \"kerberos\") must match RFC 3962 Appendix B"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usage 1 (AS-REQ PA-ENC-TIMESTAMP).
+    /// Base key = fe697b52... (the real Kerberos AES-256 base key from string-to-key).
+    #[test]
+    fn rfc3962_derive_ke_ki_usage_1() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        let ke = derive_encryption_key(&base_key, 1);
+        assert_eq!(
+            bytes_to_hex(&ke),
+            "d0e3f5c9ca1c9b7accaf979cb9c9633ecb0dadb0905c857c9875b5967c13b6c9",
+            "Ke for usage 1 (AS-REQ PA-ENC-TIMESTAMP)"
+        );
+
+        let ki = derive_integrity_key(&base_key, 1);
+        assert_eq!(
+            bytes_to_hex(&ki),
+            "4c559abaa7970eb32071dd43f8b832cc04cc255d97c19ab609ab65987a699b24",
+            "Ki for usage 1"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usage 2 (AS-REP ticket).
+    #[test]
+    fn rfc3962_derive_ke_ki_usage_2() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        let ke = derive_encryption_key(&base_key, 2);
+        assert_eq!(
+            bytes_to_hex(&ke),
+            "c7cfd9cd75fe793a586a542d87e0d1396f1134a104bb1a9190b8c90ada3ddf37",
+            "Ke for usage 2 (AS-REP ticket)"
+        );
+
+        let ki = derive_integrity_key(&base_key, 2);
+        assert_eq!(
+            bytes_to_hex(&ki),
+            "97151b4c76945063e2eb0529dc067d97d7bba90776d8126d91f34f3101aea8ba",
+            "Ki for usage 2"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usage 3 (TGS-REP encpart).
+    #[test]
+    fn rfc3962_derive_ke_ki_usage_3() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        let ke = derive_encryption_key(&base_key, 3);
+        assert_eq!(
+            bytes_to_hex(&ke),
+            "82c229a75b71be9611413bce88fc44e441f4f71340659329a2e4a2a8a35960ac",
+            "Ke for usage 3 (TGS-REP encpart)"
+        );
+
+        let ki = derive_integrity_key(&base_key, 3);
+        assert_eq!(
+            bytes_to_hex(&ki),
+            "2acc7e801cfac7f511cf8729f5569481e97730c3041e2271829bf40a2e4d03a6",
+            "Ki for usage 3"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usages 7 and 8
+    /// (TGS-REQ AP-REQ authenticator cksum and authenticator encrypted).
+    #[test]
+    fn rfc3962_derive_ke_ki_usages_7_8() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        // Usage 7: TGS-REQ AP-REQ authenticator cksum
+        let ke7 = derive_encryption_key(&base_key, 7);
+        assert_eq!(
+            bytes_to_hex(&ke7),
+            "998c98377c7c12856f97b45c74441078bff849fb86bf0cb0ad227827af5ad3b1",
+            "Ke for usage 7"
+        );
+        let ki7 = derive_integrity_key(&base_key, 7);
+        assert_eq!(
+            bytes_to_hex(&ki7),
+            "ef169527345dfb2890e132a9865ab42bb4ede6aab4b20a61f834c6d27ce17e62",
+            "Ki for usage 7"
+        );
+
+        // Usage 8: TGS-REQ AP-REQ authenticator (encrypted)
+        let ke8 = derive_encryption_key(&base_key, 8);
+        assert_eq!(
+            bytes_to_hex(&ke8),
+            "a57e67685d5b4e056b9197ff7ea8d249a67a796ddbcfdcb7ea2321a8e934d646",
+            "Ke for usage 8"
+        );
+        let ki8 = derive_integrity_key(&base_key, 8);
+        assert_eq!(
+            bytes_to_hex(&ki8),
+            "1a16b7ec775f3368f4220d0bfb41e5d9fb06784848790ddd188bf2ed6e191fe3",
+            "Ki for usage 8"
+        );
     }
 }
