@@ -97,9 +97,22 @@ impl NdrWriter {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Write a `u16` little-endian WITHOUT alignment (for packed struct
+    /// fields like RPC_UNICODE_STRING headers where the caller manages
+    /// alignment).
+    pub fn write_uint16_raw(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
     /// Write a `u32` little-endian, after aligning to 4 bytes.
     pub fn write_uint32(&mut self, v: u32) {
         self.align(4);
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write a `u32` little-endian WITHOUT alignment (for packed struct
+    /// fields where the caller manages alignment).
+    pub fn write_uint32_raw(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
@@ -238,11 +251,25 @@ impl<'a> NdrReader<'a> {
         Ok(v)
     }
 
+    /// Read a little-endian `u16` WITHOUT alignment (for packed struct
+    /// fields where the caller manages alignment).
+    pub fn read_uint16_raw(&mut self) -> Result<u16, DceRpcError> {
+        let arr = self.read_array::<2>()?;
+        Ok(u16::from_le_bytes(arr))
+    }
+
     /// Read a little-endian `u16` after aligning to 2 bytes.
     pub fn read_uint16(&mut self) -> Result<u16, DceRpcError> {
         self.align(2)?;
         let arr = self.read_array::<2>()?;
         Ok(u16::from_le_bytes(arr))
+    }
+
+    /// Read a little-endian `u32` WITHOUT alignment (for packed struct
+    /// fields where the caller manages alignment).
+    pub fn read_uint32_raw(&mut self) -> Result<u32, DceRpcError> {
+        let arr = self.read_array::<4>()?;
+        Ok(u32::from_le_bytes(arr))
     }
 
     /// Read a little-endian `u32` after aligning to 4 bytes.
