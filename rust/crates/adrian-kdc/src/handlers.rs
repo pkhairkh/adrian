@@ -2051,6 +2051,122 @@ pub async fn handle_tgs_req_s4u2proxy(
 }
 
 // ---------------------------------------------------------------------------
+// Pre-auth plugin framework (Wave 5)
+// ---------------------------------------------------------------------------
+
+/// Pre-authentication plugin trait (Wave 5). Each plugin handles a specific
+/// PA-DATA type (e.g. PA-ENC-TIMESTAMP = 2). The KDC's AS-REQ handler looks
+/// up the plugin for each PA-DATA type in the request and calls
+/// `verify_pa_data()` to verify the pre-authenticator.
+///
+/// This trait makes the pre-auth framework extensible: future plugins
+/// (PA-PK-AS-REQ for PKINIT, PA-OTP, PA-ECDH, etc.) can be registered
+/// without modifying the core AS-REQ handler.
+#[async_trait::async_trait]
+pub trait PreAuthPlugin: Send + Sync {
+    /// The PA-DATA type this plugin handles (e.g. 2 for PA-ENC-TIMESTAMP).
+    fn padata_type(&self) -> u8;
+
+    /// Verify the padata against the client's long-term state. Returns
+    /// `Ok(())` if the pre-authenticator is valid, `Err(KdcError)` otherwise.
+    async fn verify_pa_data(&self, padata: &[u8], client: &PrincipalRecord)
+        -> Result<(), KdcError>;
+}
+
+/// PA-ENC-TIMESTAMP plugin (RFC 4120 §5.2.7.2). Wraps the existing
+/// [`verify_pa_enc_timestamp`] logic in the plugin interface. This is the
+/// default pre-auth method for password-based Kerberos.
+pub struct PaEncTimestampPlugin;
+
+impl PaEncTimestampPlugin {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for PaEncTimestampPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl PreAuthPlugin for PaEncTimestampPlugin {
+    fn padata_type(&self) -> u8 {
+        PA_ENC_TIMESTAMP_TYPE
+    }
+
+    async fn verify_pa_data(
+        &self,
+        padata: &[u8],
+        client: &PrincipalRecord,
+    ) -> Result<(), KdcError> {
+        verify_pa_enc_timestamp(client, padata)
+    }
+}
+
+/// Registry of pre-auth plugins. Maps PA-DATA types to plugin instances.
+/// The AS-REQ handler queries the registry to find a plugin for each
+/// PA-DATA entry in the request.
+#[derive(Default)]
+pub struct PreAuthPluginRegistry {
+    plugins: std::collections::HashMap<u8, Box<dyn PreAuthPlugin>>,
+}
+
+impl PreAuthPluginRegistry {
+    /// Construct an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a registry pre-loaded with the default PA-ENC-TIMESTAMP
+    /// plugin (the only built-in pre-auth method).
+    pub fn with_defaults() -> Self {
+        let mut reg = Self::new();
+        reg.register(Box::new(PaEncTimestampPlugin::new()));
+        reg
+    }
+
+    /// Register a plugin. Replaces any existing plugin for the same PA-DATA type.
+    pub fn register(&mut self, plugin: Box<dyn PreAuthPlugin>) {
+        self.plugins.insert(plugin.padata_type(), plugin);
+    }
+
+    /// Look up the plugin for a PA-DATA type.
+    pub fn get(&self, padata_type: u8) -> Option<&dyn PreAuthPlugin> {
+        self.plugins.get(&padata_type).map(|p| p.as_ref())
+    }
+
+    /// Verify a list of PA-DATA entries against the client. Iterates the
+    /// padata list; for each entry with a registered plugin, calls
+    /// `verify_pa_data()`. Returns `Ok(())` on the first successful
+    /// verification, `Err(KdcError::PreauthRequired)` if no padata entry
+    /// has a registered plugin, or `Err` with the first verification error.
+    pub async fn verify(
+        &self,
+        padata: &[PaData],
+        client: &PrincipalRecord,
+    ) -> Result<(), KdcError> {
+        for p in padata {
+            if let Some(plugin) = self.plugins.get(&p.padata_type) {
+                return plugin.verify_pa_data(&p.padata_value, client).await;
+            }
+        }
+        // No padata entry matched a registered plugin.
+        Err(KdcError::PreauthRequired)
+    }
+
+    /// Number of registered plugins.
+    pub fn len(&self) -> usize {
+        self.plugins.len()
+    }
+
+    /// True iff no plugins are registered.
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4081,6 +4197,119 @@ mod tests {
             }
             other => panic!("expected Policy error, got {other:?}"),
         }
+    }
+
+    // ---- Wave 5: Pre-auth plugin framework tests ----
+
+    /// DoD test 3: plugin registration. Register a PaEncTimestampPlugin and
+    /// verify it's retrievable via `get()` and that `with_defaults()` pre-
+    /// loads it.
+    #[tokio::test]
+    async fn plugin_registration_works() {
+        // Empty registry.
+        let reg = PreAuthPluginRegistry::new();
+        assert!(reg.is_empty());
+        assert!(reg.get(PA_ENC_TIMESTAMP_TYPE).is_none());
+
+        // Register the PA-ENC-TIMESTAMP plugin.
+        let mut reg = reg;
+        reg.register(Box::new(PaEncTimestampPlugin::new()));
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+        let plugin = reg
+            .get(PA_ENC_TIMESTAMP_TYPE)
+            .expect("plugin must be registered");
+        assert_eq!(plugin.padata_type(), PA_ENC_TIMESTAMP_TYPE);
+
+        // with_defaults() pre-loads the plugin.
+        let reg2 = PreAuthPluginRegistry::with_defaults();
+        assert_eq!(reg2.len(), 1);
+        assert!(reg2.get(PA_ENC_TIMESTAMP_TYPE).is_some());
+    }
+
+    /// DoD test 4: unknown padata type rejected. When the padata list
+    /// contains only unknown types (no registered plugin), `verify()`
+    /// returns `KdcError::PreauthRequired`.
+    #[tokio::test]
+    async fn unknown_padata_type_rejected() {
+        let reg = PreAuthPluginRegistry::with_defaults();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+
+        // Padata with an unknown type (type 99 — not registered).
+        let padata = vec![PaData {
+            padata_type: 99,
+            padata_value: vec![0xAB, 0xCD],
+        }];
+        let err = reg
+            .verify(&padata, &alice)
+            .await
+            .expect_err("unknown padata must be rejected");
+        assert!(
+            matches!(err, KdcError::PreauthRequired),
+            "unknown padata type must return PreauthRequired, got {err:?}"
+        );
+
+        // Empty padata list also returns PreauthRequired.
+        let err2 = reg
+            .verify(&[], &alice)
+            .await
+            .expect_err("empty padata must be rejected");
+        assert!(matches!(err2, KdcError::PreauthRequired));
+    }
+
+    /// Plugin verify succeeds with valid PA-ENC-TIMESTAMP. The registry's
+    /// `verify()` method dispatches to the registered plugin, which calls
+    /// `verify_pa_enc_timestamp()` under the hood.
+    #[tokio::test]
+    async fn plugin_verify_succeeds_with_valid_padata() {
+        let reg = PreAuthPluginRegistry::with_defaults();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+
+        // Build a valid PA-ENC-TIMESTAMP.
+        let now = now_secs();
+        let pa_ts = PaEncTsEnc {
+            patimestamp: now,
+            pausec: 0,
+        };
+        let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
+        let blob = encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+            .expect("encrypt");
+
+        let padata = vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP_TYPE,
+            padata_value: blob,
+        }];
+        reg.verify(&padata, &alice)
+            .await
+            .expect("valid PA-ENC-TIMESTAMP must verify");
+    }
+
+    /// Plugin verify fails with tampered PA-ENC-TIMESTAMP (HMAC mismatch).
+    #[tokio::test]
+    async fn plugin_verify_fails_with_tampered_padata() {
+        let reg = PreAuthPluginRegistry::with_defaults();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+
+        let now = now_secs();
+        let pa_ts = PaEncTsEnc {
+            patimestamp: now,
+            pausec: 0,
+        };
+        let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
+        let mut blob =
+            encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+                .expect("encrypt");
+        blob[0] ^= 0xFF; // Tamper.
+
+        let padata = vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP_TYPE,
+            padata_value: blob,
+        }];
+        let err = reg
+            .verify(&padata, &alice)
+            .await
+            .expect_err("tampered padata must fail");
+        assert!(matches!(err, KdcError::PreauthFailed(_)));
     }
 
     /// Backward-compat path: `handle_as_req` (no metrics arg) must NOT
