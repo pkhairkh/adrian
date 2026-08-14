@@ -22,6 +22,8 @@
 //! - [`EchoRequest`] / [`EchoResponse`] — command 0x000d (§2.2.28/29)
 //! - [`PreauthHash`] — SHA-512 pre-auth integrity hash (§3.2.5.1)
 //! - [`TransformHeader`] — SMB 3.1.1 transform header for encrypted PDUs (§2.2.41)
+//! - [`SmbEncryptionKey`] — AES-256-GCM session encryption key (§3.2.5.2)
+//! - [`encrypt_pdu`] / [`decrypt_pdu`] — AEAD encrypt/decrypt of SMB2 PDUs (§3.2.4.3)
 //!
 //! ## ADRs
 //!
@@ -30,6 +32,7 @@
 //! - ADR-106: SMB client with persistent handles (SDK FileModule)
 
 use thiserror::Error;
+use zeroize::Zeroize;
 
 // ============================================================================
 // Errors
@@ -1114,15 +1117,17 @@ pub struct NegotiateResponse {
 impl NegotiateResponse {
     /// Build a default SMB 3.1.1 negotiate response with SHA-512 preauth
     /// integrity and AES-256-GCM encryption (the framework default per
-    /// ADR-105 §3-4). Plaintext sessions are still allowed — the server
-    /// does not set `SMB2_GLOBAL_CAP_ENCRYPTION` (encryption is opt-in
-    /// per-session, not mandated).
+    /// ADR-105 §3-4). The server advertises the
+    /// `SMB2_GLOBAL_CAP_ENCRYPTION` capability (T-105) so that clients
+    /// know to encrypt PDUs on this session. Plaintext sessions are
+    /// still tolerated when the client does not request encryption —
+    /// the flag is an advertisement, not a mandate.
     #[must_use]
     pub fn new_311(server_guid: uuid::Uuid, server_salt: &[u8]) -> Self {
         Self {
             security_mode: security_mode::SIGNING_ENABLED,
             dialect_revision: dialect_code::SMB311,
-            capabilities: capabilities::LARGE_MTU,
+            capabilities: capabilities::LARGE_MTU | capabilities::ENCRYPTION,
             server_guid,
             max_transact_size: MAX_SMB2_MESSAGE_SIZE,
             max_read_size: MAX_SMB2_MESSAGE_SIZE,
@@ -2581,6 +2586,270 @@ impl PreauthHash {
 }
 
 // ============================================================================
+// SmbEncryptionKey — AES-256-GCM session encryption key (§3.2.5.2)
+// ============================================================================
+
+/// AES-256-GCM session encryption key (32 bytes) for SMB 3.1.1 encrypted
+/// PDUs. Derived from the SessionKey via HKDF-SHA-512 labeled
+/// `"SMBSessionKey"` with the preauth-integrity hash as context, per
+/// MS-SMB2 §3.2.5.2.1.
+///
+/// In SMB 3.1.1 the client and server each derive two keys
+/// (ServerIn / ServerOut) by appending the direction label; for the
+/// symmetric AES-256-GCM cipher used by this framework the same 32-byte
+/// key serves both directions in tests (a real deployment would derive
+/// two separate keys per §3.2.5.2.1).
+#[derive(Clone, Zeroize)]
+pub struct SmbEncryptionKey([u8; 32]);
+
+impl SmbEncryptionKey {
+    /// Wrap an existing 32-byte key.
+    #[must_use]
+    pub fn from_bytes(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    /// Build a deterministic test key from a fixed seed. NOT for
+    /// production use — production code must call
+    /// [`SmbEncryptionKey::derive_from_session_key`].
+    #[must_use]
+    pub fn for_test(seed: u8) -> Self {
+        Self([seed; 32])
+    }
+
+    /// Derive an AES-256-GCM encryption key from the session key and
+    /// preauth-integrity hash per MS-SMB2 §3.2.5.2.1.
+    ///
+    /// The KDF is HKDF-SHA-512 with:
+    ///   - IKM = `session_key`
+    ///   - salt = `preauth_hash` (64 bytes for SHA-512)
+    ///   - info = `b"SMBSessionKey" || preauth_hash`
+    ///   - L   = 32 bytes (AES-256 key length)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmbError::Encryption`] if `session_key` is empty (the
+    /// KDF requires a non-zero IKM length).
+    pub fn derive_from_session_key(
+        session_key: &[u8],
+        preauth_hash: &[u8; 64],
+    ) -> Result<Self, SmbError> {
+        if session_key.is_empty() {
+            return Err(SmbError::Encryption(
+                "session key is empty (KDF requires non-zero IKM)".into(),
+            ));
+        }
+        // HKDF-SHA-512 (RFC 5869) — extract then expand.
+        let prk = hkdf_extract_sha512(preauth_hash, session_key);
+        // info = "SMBSessionKey" || preauth_hash (per MS-SMB2 §3.2.5.2.1).
+        let mut info = Vec::with_capacity(14 + preauth_hash.len());
+        info.extend_from_slice(b"SMBSessionKey");
+        info.extend_from_slice(preauth_hash);
+        let okm = hkdf_expand_sha512(&prk, &info, 32);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&okm);
+        Ok(Self(key))
+    }
+
+    /// Borrow the raw key bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SmbEncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid leaking key material in debug output.
+        f.debug_struct("SmbEncryptionKey")
+            .field("len", &32)
+            .finish_non_exhaustive()
+    }
+}
+
+/// HKDF-Extract step (RFC 5869 §2.2) using HMAC-SHA-512.
+fn hkdf_extract_sha512(salt: &[u8], ikm: &[u8]) -> [u8; 64] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(salt).expect("HMAC accepts any salt length");
+    mac.update(ikm);
+    let out = mac.finalize().into_bytes();
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// HKDF-Expand step (RFC 5869 §2.3) using HMAC-SHA-512. Returns `L` bytes.
+fn hkdf_expand_sha512(prk: &[u8; 64], info: &[u8], length: usize) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let hash_len = 64usize;
+    let n = length.div_ceil(hash_len);
+    let mut t_prev: Vec<u8> = Vec::new();
+    let mut okm = Vec::with_capacity(length);
+    for counter in 1..=n {
+        let mut mac = HmacSha512::new_from_slice(prk).expect("HMAC accepts any PRK length");
+        mac.update(&t_prev);
+        mac.update(info);
+        mac.update(&[counter as u8]);
+        let block = mac.finalize().into_bytes();
+        okm.extend_from_slice(&block);
+        t_prev = block.to_vec();
+    }
+    okm.truncate(length);
+    okm
+}
+
+// ============================================================================
+// AES-256-GCM PDU encrypt / decrypt (§3.2.4.3 / §3.1.4.3)
+// ============================================================================
+
+/// AES-256-GCM nonce length (12 bytes per MS-SMB2 §3.2.5.2.1).
+pub const AES_256_GCM_NONCE_LEN: usize = 12;
+
+/// AES-256-GCM authentication tag length (16 bytes per MS-SMB2 §3.2.5.2.1).
+pub const AES_256_GCM_TAG_LEN: usize = 16;
+
+/// Encrypt an SMB2 PDU using AES-256-GCM and return the framed
+/// `SMB2_TRANSFORM_HEADER || ciphertext` byte stream (ready for
+/// NetBIOS framing).
+///
+/// Per MS-SMB2 §3.2.4.3:
+///   1. Allocate a 12-byte random nonce; place it in the low 12 bytes
+///      of the transform header's 16-byte Nonce field (the high 4
+///      bytes are reserved and set to zero).
+///   2. Build the 52-byte transform header with `Signature = 0`,
+///      `OriginalMessageSize = plaintext.len()`, `Flags = 0x0001`
+///      (Encrypted), `SessionId = session_id`.
+///   3. Compute AES-256-GCM over `plaintext` with the nonce and AAD =
+///      the 52-byte transform header (Signature already zeroed).
+///   4. The 16-byte GCM tag goes into the transform header's
+///      `Signature` field; the ciphertext (no tag appended) follows
+///      the header on the wire.
+///
+/// # Errors
+///
+/// Returns [`SmbError::Encryption`] if AES-GCM fails (only possible on
+/// nonce length mismatch, which is statically guaranteed not to happen
+/// here).
+pub fn encrypt_pdu(
+    key: &SmbEncryptionKey,
+    plaintext: &[u8],
+    session_id: u64,
+    nonce_seed: [u8; AES_256_GCM_NONCE_LEN],
+) -> Result<Vec<u8>, SmbError> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Key};
+
+    // 1) Pack the 12-byte nonce into the low 12 bytes of the 16-byte
+    //    Nonce field (high 4 bytes reserved = 0).
+    let mut nonce_field = [0u8; 16];
+    nonce_field[..AES_256_GCM_NONCE_LEN].copy_from_slice(&nonce_seed);
+
+    // 2) Build the transform header (Signature = 0).
+    let transform = TransformHeader {
+        signature: [0u8; 16],
+        nonce: nonce_field,
+        original_message_size: plaintext.len() as u32,
+        flags: 0x0001,
+        session_id,
+    };
+    let mut header_bytes = Vec::with_capacity(SMB2_TRANSFORM_HEADER_SIZE);
+    let mut w = Writer::new();
+    transform.encode(&mut w);
+    header_bytes.extend_from_slice(w.as_bytes());
+    debug_assert_eq!(header_bytes.len(), SMB2_TRANSFORM_HEADER_SIZE);
+
+    // 3) AES-256-GCM encrypt with AAD = the 52-byte header (Signature
+    //    is already zero).
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_bytes()));
+    let nonce_obj = aes_gcm::Nonce::from_slice(&nonce_seed);
+    let ciphertext_with_tag = cipher
+        .encrypt(
+            nonce_obj,
+            Payload {
+                msg: plaintext,
+                aad: &header_bytes,
+            },
+        )
+        .map_err(|e| SmbError::Encryption(format!("aes-256-gcm encrypt: {e}")))?;
+    // aes-gcm appends the 16-byte tag to the ciphertext. Split it off.
+    let ct_len = ciphertext_with_tag.len();
+    if ct_len < AES_256_GCM_TAG_LEN {
+        return Err(SmbError::Encryption(
+            "aes-256-gcm produced ciphertext shorter than tag".into(),
+        ));
+    }
+    let (ciphertext, tag) = ciphertext_with_tag.split_at(ct_len - AES_256_GCM_TAG_LEN);
+
+    // 4) Place the 16-byte tag into the Signature field.
+    let mut out = header_bytes;
+    debug_assert_eq!(out[4..20].len(), 16);
+    out[4..20].copy_from_slice(tag);
+    out.extend_from_slice(ciphertext);
+    Ok(out)
+}
+
+/// Decrypt an SMB2 PDU previously encrypted with [`encrypt_pdu`].
+///
+/// `frame` MUST be the complete `SMB2_TRANSFORM_HEADER || ciphertext`
+/// (no NetBIOS framing). The function:
+///   1. Decodes the 52-byte transform header.
+///   2. Verifies the Flags have bit 0x0001 set (Encrypted).
+///   3. Reconstructs the AAD = the 52-byte header with the Signature
+///      field zeroed (it currently holds the GCM tag).
+///   4. Recombines `ciphertext || tag` and calls AES-256-GCM decrypt.
+///
+/// # Errors
+///
+/// Returns [`SmbError::Malformed`] if the frame is too short or the
+/// transform magic is wrong. Returns [`SmbError::Encryption`] if the
+/// GCM tag verification fails (tampering, wrong key, etc).
+pub fn decrypt_pdu(key: &SmbEncryptionKey, frame: &[u8]) -> Result<Vec<u8>, SmbError> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Key};
+
+    if frame.len() < SMB2_TRANSFORM_HEADER_SIZE {
+        return Err(SmbError::Malformed(format!(
+            "encrypted frame too short: {} < {SMB2_TRANSFORM_HEADER_SIZE}",
+            frame.len()
+        )));
+    }
+    let header = TransformHeader::decode(frame)?;
+    if header.flags & 0x0001 == 0 {
+        return Err(SmbError::Encryption(
+            "transform header Flags bit 0x0001 (Encrypted) not set".into(),
+        ));
+    }
+    let ciphertext_body = &frame[SMB2_TRANSFORM_HEADER_SIZE..];
+    // AAD = header with Signature (bytes 4..20) zeroed.
+    let mut aad = frame[..SMB2_TRANSFORM_HEADER_SIZE].to_vec();
+    for b in &mut aad[4..20] {
+        *b = 0;
+    }
+    // Recombine ciphertext || tag for AES-GCM decrypt.
+    let mut cipher_with_tag = Vec::with_capacity(ciphertext_body.len() + AES_256_GCM_TAG_LEN);
+    cipher_with_tag.extend_from_slice(ciphertext_body);
+    cipher_with_tag.extend_from_slice(&header.signature);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_bytes()));
+    let nonce = &header.nonce[..AES_256_GCM_NONCE_LEN];
+    let nonce_obj = aes_gcm::Nonce::from_slice(nonce);
+    let plaintext = cipher
+        .decrypt(
+            nonce_obj,
+            Payload {
+                msg: &cipher_with_tag,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| SmbError::Encryption(format!("aes-256-gcm decrypt: {e}")))?;
+    Ok(plaintext)
+}
+
+// ============================================================================
 // NetBIOS Session Service framing — used by the transport
 // ============================================================================
 
@@ -2946,6 +3215,108 @@ mod tests {
         assert_eq!(out.position(), 52);
         let decoded = TransformHeader::decode(out.as_bytes()).expect("decode");
         assert_eq!(decoded, hdr);
+    }
+
+    // ---- Wave 1: AES-256-GCM encryption ----
+
+    /// Helper: build a deterministic 12-byte nonce for tests (production
+    /// code MUST use a CSPRNG; this is a test-only fixture so the
+    /// round-trip is reproducible).
+    fn test_nonce(counter: u8) -> [u8; AES_256_GCM_NONCE_LEN] {
+        [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, counter,
+        ]
+    }
+
+    #[test]
+    fn wave1_encrypt_decrypt_pdu_round_trips() {
+        // T-102 / T-103: encrypt_pdu followed by decrypt_pdu returns the
+        // original plaintext byte-for-byte.
+        let key = SmbEncryptionKey::for_test(0xA5);
+        let plaintext = b"hello, encrypted SMB world!\n";
+        let session_id = 0xCAFE_BABE_1234_5678u64;
+        let frame = encrypt_pdu(&key, plaintext, session_id, test_nonce(1)).expect("encrypt ok");
+        // Frame = 52-byte transform header + ciphertext (== plaintext len
+        // for AES-GCM since the tag is stored in the Signature field).
+        assert_eq!(frame.len(), SMB2_TRANSFORM_HEADER_SIZE + plaintext.len());
+        let decoded = decrypt_pdu(&key, &frame).expect("decrypt ok");
+        assert_eq!(decoded, plaintext);
+    }
+
+    #[test]
+    fn wave1_tampered_ciphertext_is_rejected() {
+        // T-106 negative path: flipping a single ciphertext byte MUST
+        // surface a decrypt error (GCM tag verification failure).
+        let key = SmbEncryptionKey::for_test(0x3C);
+        let plaintext = b"sensitive payload";
+        let mut frame = encrypt_pdu(&key, plaintext, 0x100, test_nonce(2)).expect("encrypt ok");
+        // Flip the first ciphertext byte (just after the 52-byte header).
+        frame[SMB2_TRANSFORM_HEADER_SIZE] ^= 0xFF;
+        let err = decrypt_pdu(&key, &frame).expect_err("must reject tampered ciphertext");
+        assert!(
+            matches!(err, SmbError::Encryption(ref msg) if msg.contains("decrypt")),
+            "expected Encryption error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wave1_wrong_key_is_rejected() {
+        // T-106 negative path: decrypting with a different key MUST fail
+        // (the GCM tag was computed under the original key).
+        let key_a = SmbEncryptionKey::for_test(0x01);
+        let key_b = SmbEncryptionKey::for_test(0x02);
+        let plaintext = b"confidential";
+        let frame = encrypt_pdu(&key_a, plaintext, 0x200, test_nonce(3)).expect("encrypt ok");
+        let err = decrypt_pdu(&key_b, &frame).expect_err("must reject wrong key");
+        assert!(
+            matches!(err, SmbError::Encryption(ref msg) if msg.contains("decrypt")),
+            "expected Encryption error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wave1_transform_header_round_trips_through_encrypt_decrypt() {
+        // T-104: the TransformHeader emitted by encrypt_pdu round-trips
+        // through TransformHeader::decode, carrying the right session id,
+        // OriginalMessageSize, Flags, and nonce.
+        let key = SmbEncryptionKey::for_test(0x77);
+        let plaintext = b"round-trip through codec";
+        let session_id = 0x1234_AAAA_BBBB_CCCCu64;
+        let nonce = test_nonce(4);
+        let frame = encrypt_pdu(&key, plaintext, session_id, nonce).expect("encrypt ok");
+        let header = TransformHeader::decode(&frame).expect("decode header");
+        // OriginalMessageSize matches the plaintext length.
+        assert_eq!(header.original_message_size, plaintext.len() as u32);
+        // Flags has bit 0x0001 (Encrypted) set.
+        assert_ne!(header.flags & 0x0001, 0);
+        // SessionId is carried through.
+        assert_eq!(header.session_id, session_id);
+        // Nonce: the low 12 bytes match the input nonce; the high 4
+        // bytes are reserved and must be zero.
+        assert_eq!(&header.nonce[..AES_256_GCM_NONCE_LEN], &nonce);
+        assert_eq!(&header.nonce[AES_256_GCM_NONCE_LEN..], &[0u8; 4]);
+        // Signature is non-zero (it holds the 16-byte GCM tag).
+        assert!(header.signature.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn wave1_negotiate_response_advertises_encryption_capability() {
+        // T-105: NegotiateResponse::new_311 must set the
+        // SMB2_GLOBAL_CAP_ENCRYPTION capability bit so that clients know
+        // to encrypt PDUs on this session.
+        let server_guid = uuid::Uuid::from_u128(0xAAAA_0000_0000_0000_0000_0000_0000_0001);
+        let salt = [0xABu8; 16];
+        let resp = NegotiateResponse::new_311(server_guid, &salt);
+        assert_ne!(
+            resp.capabilities & capabilities::ENCRYPTION,
+            0,
+            "NegotiateResponse must advertise SMB2_GLOBAL_CAP_ENCRYPTION"
+        );
+        // Round-trip through encode/decode to ensure the flag survives the wire.
+        let req_hdr = Smb2Header::new_request(command::NEGOTIATE, 1);
+        let bytes = resp.encode(&req_hdr);
+        let decoded = NegotiateResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode");
+        assert_ne!(decoded.capabilities & capabilities::ENCRYPTION, 0);
     }
 
     // ---- SMB1 refused ----
