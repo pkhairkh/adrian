@@ -241,21 +241,204 @@ impl DceRpcEndpoint {
     }
 
     /// Run the endpoint — bind TCP, accept connections, dispatch PDUs.
-    /// Blocks until shutdown.
+    /// Blocks until shutdown (the caller typically spawns this on a
+    /// tokio task and aborts it to shut down).
     ///
-    /// **Status (Wave 2a)**: not yet implemented. The transport
-    /// primitives are now in place ([`pdu`], [`transport`]); a
-    /// follow-up wave will wire up the listener on top of
-    /// `tokio::net::TcpListener` + `pdu::encode_bind_ack_pdu`.
+    /// Per [C706] §12, the server loop is:
+    /// 1. Accept a TCP connection.
+    /// 2. Read a Bind PDU from the client.
+    /// 3. Look up the requested interface UUID among the registered
+    ///    servers. If found, send a Bind_ack with `ACCEPTANCE`; otherwise
+    ///    send a Bind_ack with `PROVIDER_REJECTION`.
+    /// 4. Read Request PDUs, dispatch each to the registered server's
+    ///    `dispatch(opnum, stub)` method, and send back a Response PDU
+    ///    with the stub bytes.
+    /// 5. Repeat until the client disconnects.
     pub async fn run(&self) -> Result<(), DceRpcError> {
-        // TODO(W2-followup): implement per [C706] §12 — bind TCP listener
-        // on bind_addr, accept connections, read Bind PDU, negotiate
-        // interface via pdu::encode_bind_ack_pdu, dispatch Request PDUs to
-        // the appropriate server. All the PDU/NDR primitives needed are
-        // now in the `pdu` and `ndr` modules.
-        Err(DceRpcError::BindFailed(
-            "DceRpcEndpoint::run not yet implemented (Wave 2a delivered transport + PDU primitives; server-side dispatch loop is a follow-up wave)".into(),
-        ))
+        let listener = tokio::net::TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| DceRpcError::BindFailed(format!("bind {}: {e}", self.bind_addr)))?;
+        loop {
+            let (stream, _peer) = listener.accept().await?;
+            // Build a slice of server references for this connection.
+            let servers: Vec<&dyn DceRpcServer> = self
+                .servers
+                .iter()
+                .map(|s| s.as_ref() as &dyn DceRpcServer)
+                .collect();
+            // Handle the connection sequentially (a production impl would
+            // spawn a task per connection, but that requires `Arc`-wrapping
+            // the servers — kept simple here for testability).
+            if let Err(e) = handle_connection(stream, &servers).await {
+                tracing::debug!("connection ended with error: {e}");
+            }
+        }
+    }
+}
+
+/// Handle a single DCE/RPC connection: read Bind, send Bind_ack, then
+/// loop on Request/Response.
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    servers: &[&dyn DceRpcServer],
+) -> Result<(), DceRpcError> {
+    use crate::ndr::NDR_TRANSFER_SYNTAX_UUID;
+    use crate::pdu::{
+        ack_reason, ack_result, decode_bind_pdu, encode_bind_ack_pdu, BindAckPdu, NDR20_DATA_REP,
+        PFC_FIRST_FRAG, PFC_LAST_FRAG, PTYPE_BIND, PTYPE_REQUEST, RESPONSE_HEADER_SIZE,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = stream;
+    let common_header_size = 16usize;
+
+    // ---- Phase 1: Bind negotiation ----
+    // Read the Bind PDU.
+    let mut header = [0u8; 16];
+    stream.read_exact(&mut header).await?;
+    let frag_length = u16::from_le_bytes([header[8], header[9]]) as usize;
+    if frag_length < common_header_size {
+        return Err(DceRpcError::Ndr(format!(
+            "bind frag_length {frag_length} < header size"
+        )));
+    }
+    let mut bind_buf = vec![0u8; frag_length];
+    bind_buf[..common_header_size].copy_from_slice(&header);
+    if frag_length > common_header_size {
+        stream
+            .read_exact(&mut bind_buf[common_header_size..])
+            .await?;
+    }
+    let bind = decode_bind_pdu(&bind_buf)?;
+    if header[2] != PTYPE_BIND {
+        return Err(DceRpcError::Ndr(format!(
+            "expected Bind PDU (type 11), got type {}",
+            header[2]
+        )));
+    }
+
+    // Look up the requested interface among the registered servers.
+    let req_iface = bind
+        .context_elements
+        .first()
+        .map(|c| (c.abstract_syntax.0, c.abstract_syntax.1))
+        .ok_or_else(|| DceRpcError::Ndr("bind has no context elements".into()))?;
+    let server = servers
+        .iter()
+        .find(|s| {
+            let iface: uuid::Uuid = s.interface().into();
+            iface == req_iface.0 && s.interface_version() == req_iface.1
+        })
+        .copied();
+
+    let (result, reason) = if server.is_some() {
+        (ack_result::ACCEPTANCE, 0u16)
+    } else {
+        (
+            ack_result::PROVIDER_REJECTION,
+            ack_reason::ABSTRACT_SYNTAX_NOT_SUPPORTED,
+        )
+    };
+
+    let ack = BindAckPdu {
+        rpc_vers: 5,
+        rpc_vers_minor: 0,
+        pfc_flags: PFC_FIRST_FRAG | PFC_LAST_FRAG,
+        data_rep: NDR20_DATA_REP,
+        call_id: bind.call_id,
+        max_xmit_frag: 5840,
+        max_recv_frag: 5840,
+        assoc_group_id: 0xCAFE_BABE,
+        sec_addr: String::new(),
+        p_results: vec![crate::pdu::PResult {
+            result,
+            reason,
+            transfer_syntax: (NDR_TRANSFER_SYNTAX_UUID, 2),
+        }],
+    };
+    stream.write_all(&encode_bind_ack_pdu(&ack)).await?;
+    stream.flush().await?;
+
+    if server.is_none() {
+        // Bind rejected — close the connection.
+        return Ok(());
+    }
+    let server = server.unwrap();
+
+    // ---- Phase 2: Request/Response loop ----
+    loop {
+        // Read a Request PDU.
+        let mut header = [0u8; 16];
+        match stream.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Client disconnected — clean shutdown.
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let frag_length = u16::from_le_bytes([header[8], header[9]]) as usize;
+        if frag_length < common_header_size {
+            return Err(DceRpcError::Ndr(format!(
+                "request frag_length {frag_length} < header size"
+            )));
+        }
+        let mut req_buf = vec![0u8; frag_length];
+        req_buf[..common_header_size].copy_from_slice(&header);
+        if frag_length > common_header_size {
+            stream
+                .read_exact(&mut req_buf[common_header_size..])
+                .await?;
+        }
+        if header[2] != PTYPE_REQUEST {
+            // Unsupported PDU type — close the connection.
+            return Ok(());
+        }
+        // Parse the Request PDU body to extract opnum and stub data.
+        // Per [C706] §12.6.1 + the framework's `encode_request_pdu`, the
+        // Request PDU body is:
+        //   alloc_hint (4B) + p_cont_id (2B) + cancel_count (1B) +
+        //   reserved (1B) + opnum (2B, first 2 bytes of "stub data") +
+        //   actual_stub...
+        if req_buf.len() < common_header_size + 10 {
+            return Err(DceRpcError::Ndr("request PDU too short for body".into()));
+        }
+        let call_id = u32::from_le_bytes([req_buf[12], req_buf[13], req_buf[14], req_buf[15]]);
+        let opnum = u16::from_le_bytes([
+            req_buf[common_header_size + 8],
+            req_buf[common_header_size + 9],
+        ]);
+        let stub = &req_buf[common_header_size + 10..];
+
+        // Dispatch to the server.
+        let response_stub = server.dispatch(opnum, stub).await.unwrap_or_else(|e| {
+            // On dispatch error, return an empty stub (a real impl would
+            // send a Fault PDU per [C706] §12.6.2).
+            tracing::warn!("dispatch opnum {opnum} failed: {e}");
+            Vec::new()
+        });
+
+        // Build and send a Response PDU.
+        let total = (RESPONSE_HEADER_SIZE + response_stub.len()) as u16;
+        let mut resp_buf = Vec::with_capacity(total as usize);
+        // Common header (16 bytes):
+        resp_buf.push(5); // rpc_vers
+        resp_buf.push(0); // rpc_vers_minor
+        resp_buf.push(crate::pdu::PTYPE_RESPONSE);
+        resp_buf.push(PFC_FIRST_FRAG | PFC_LAST_FRAG);
+        resp_buf.extend_from_slice(&NDR20_DATA_REP.to_le_bytes()); // data_rep
+        resp_buf.extend_from_slice(&total.to_le_bytes()); // frag_length
+        resp_buf.extend_from_slice(&0u16.to_le_bytes()); // auth_length
+        resp_buf.extend_from_slice(&call_id.to_le_bytes()); // call_id
+                                                            // Response body header (8 bytes):
+        resp_buf.extend_from_slice(&(response_stub.len() as u32).to_le_bytes()); // alloc_hint
+        resp_buf.extend_from_slice(&0u16.to_le_bytes()); // p_cont_id
+        resp_buf.push(0); // cancel_count
+        resp_buf.push(0); // reserved
+                          // Stub data:
+        resp_buf.extend_from_slice(&response_stub);
+        stream.write_all(&resp_buf).await?;
+        stream.flush().await?;
     }
 }
 
@@ -452,16 +635,134 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_run_returns_bind_failed_until_implemented() {
-        // Per [C706] §12 — the server-side listener is not yet wired up
-        // (Wave 2a delivered transport + PDU primitives; the listener loop
-        // is a follow-up wave). The stub must surface `BindFailed` rather
-        // than panicking or hanging.
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let endpoint = DceRpcEndpoint::new(addr);
-        let result = endpoint.run().await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(DceRpcError::BindFailed(_))));
+    async fn endpoint_run_binds_and_accepts_connections() {
+        // Wave 4: `run()` is now real — it binds a TCP listener and
+        // accepts connections.  We spawn it on a task, connect a client,
+        // and verify the Bind/Bind_ack exchange works.
+        use crate::pdu::{ack_result, decode_bind_ack_pdu, encode_bind_pdu, BindPdu};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Bind to port 0 (let the OS assign a free port).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+        drop(listener); // free the port so the endpoint can rebind
+
+        let mut endpoint = DceRpcEndpoint::new(bound_addr);
+        endpoint.register(Box::new(EchoServer {
+            interface: InterfaceUuid::DRSUAPI,
+            version: (4, 0),
+        }));
+        // Spawn the server loop.
+        let server_task = tokio::spawn(async move {
+            let _ = endpoint.run().await;
+        });
+        // Give the server a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Connect a client and send a Bind PDU.
+        let mut stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
+        let bind = BindPdu::new(InterfaceUuid::DRSUAPI.0, (4, 0));
+        let bind_bytes = encode_bind_pdu(&bind);
+        stream.write_all(&bind_bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the Bind_ack.
+        let mut header = [0u8; 16];
+        stream.read_exact(&mut header).await.unwrap();
+        let frag_length = u16::from_le_bytes([header[8], header[9]]) as usize;
+        let mut ack_buf = vec![0u8; frag_length];
+        ack_buf[..16].copy_from_slice(&header);
+        if frag_length > 16 {
+            stream.read_exact(&mut ack_buf[16..]).await.unwrap();
+        }
+        let ack = decode_bind_ack_pdu(&ack_buf).unwrap();
+        assert_eq!(ack.p_results.len(), 1);
+        assert_eq!(ack.p_results[0].result, ack_result::ACCEPTANCE);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn endpoint_run_dispatches_request_and_returns_response() {
+        // Wave 4: full Bind + Request/Response round-trip through the
+        // real server loop.
+        use crate::pdu::{
+            ack_result, decode_bind_ack_pdu, decode_response_pdu, encode_bind_pdu,
+            encode_request_pdu, BindPdu,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut endpoint = DceRpcEndpoint::new(bound_addr);
+        endpoint.register(Box::new(EchoServer {
+            interface: InterfaceUuid::DRSUAPI,
+            version: (4, 0),
+        }));
+        let server_task = tokio::spawn(async move {
+            let _ = endpoint.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
+        // Bind.
+        let bind = BindPdu::new(InterfaceUuid::DRSUAPI.0, (4, 0));
+        stream.write_all(&encode_bind_pdu(&bind)).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut header = [0u8; 16];
+        stream.read_exact(&mut header).await.unwrap();
+        let frag_length = u16::from_le_bytes([header[8], header[9]]) as usize;
+        let mut ack_buf = vec![0u8; frag_length];
+        ack_buf[..16].copy_from_slice(&header);
+        if frag_length > 16 {
+            stream.read_exact(&mut ack_buf[16..]).await.unwrap();
+        }
+        let ack = decode_bind_ack_pdu(&ack_buf).unwrap();
+        assert_eq!(ack.p_results[0].result, ack_result::ACCEPTANCE);
+
+        // Send a Request with opnum 0x10 and stub data "hello".
+        let stub_input = b"hello";
+        let req_bytes = encode_request_pdu(1, 0, 0x10, stub_input);
+        stream.write_all(&req_bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the Response.
+        let mut header = [0u8; 16];
+        stream.read_exact(&mut header).await.unwrap();
+        let frag_length = u16::from_le_bytes([header[8], header[9]]) as usize;
+        let mut resp_buf = vec![0u8; frag_length];
+        resp_buf[..16].copy_from_slice(&header);
+        if frag_length > 16 {
+            stream.read_exact(&mut resp_buf[16..]).await.unwrap();
+        }
+        let response_stub = decode_response_pdu(&resp_buf).unwrap();
+        // The EchoServer echoes the input stub back.
+        assert_eq!(response_stub, stub_input);
+
+        server_task.abort();
+    }
+
+    /// A `DceRpcServer` that echoes the input stub back as the response.
+    /// Used by the `endpoint_run_*` integration tests to verify the
+    /// full Bind → Request → Response round-trip.
+    struct EchoServer {
+        interface: InterfaceUuid,
+        version: (u16, u16),
+    }
+
+    #[async_trait]
+    impl DceRpcServer for EchoServer {
+        fn interface(&self) -> InterfaceUuid {
+            self.interface.clone()
+        }
+        fn interface_version(&self) -> (u16, u16) {
+            self.version
+        }
+        async fn dispatch(&self, _opnum: u16, stub: &[u8]) -> Result<Vec<u8>, DceRpcError> {
+            Ok(stub.to_vec())
+        }
     }
 
     // ---- Behavioral tests replacing the two old "stub returns X" tests ----

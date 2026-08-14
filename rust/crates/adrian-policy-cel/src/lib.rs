@@ -333,6 +333,16 @@ enum Expr {
         method: String,
         args: Vec<Expr>,
     },
+    /// A higher-order macro: `receiver.macro_name(var, predicate)`.
+    /// Supported macros: `exists` (true if any element matches),
+    /// `all` (true if all elements match), `filter` (array of matching
+    /// elements), `map` (array of predicate results).
+    Macro {
+        receiver: Box<Expr>,
+        name: String,
+        var: String,
+        predicate: Box<Expr>,
+    },
     /// Member access: receiver.field
     Member {
         receiver: Box<Expr>,
@@ -512,12 +522,39 @@ impl<'a> Parser<'a> {
                     if matches!(self.peek(), Token::LParen) {
                         // Method call
                         self.advance(); // consume (
+                                        // Special-case the `exists(var, predicate)` macro
+                                        // (and `all(var, predicate)`, `filter(var, predicate)`)
+                                        // — the first argument is a variable binding (identifier),
+                                        // not a sub-expression.  We capture it as a string and
+                                        // store the predicate as the second arg.
+                        let is_macro = matches!(name.as_str(), "exists" | "all" | "filter" | "map");
                         let mut args = Vec::new();
+                        let mut macro_var: Option<String> = None;
                         if !matches!(self.peek(), Token::RParen) {
-                            args.push(self.parse_expr()?);
-                            while matches!(self.peek(), Token::Comma) {
+                            if is_macro {
+                                // First arg: identifier (variable name).
+                                if let Token::Ident(var_name) = self.advance() {
+                                    macro_var = Some(var_name);
+                                } else {
+                                    return Err(CelError::Compile(format!(
+                                        "{name}() macro: first arg must be an identifier (variable name)"
+                                    )));
+                                }
+                                // Expect ','
+                                if !matches!(self.peek(), Token::Comma) {
+                                    return Err(CelError::Compile(format!(
+                                        "{name}() macro: expected ',' after variable name"
+                                    )));
+                                }
                                 self.advance();
+                                // Second arg: predicate expression.
                                 args.push(self.parse_expr()?);
+                            } else {
+                                args.push(self.parse_expr()?);
+                                while matches!(self.peek(), Token::Comma) {
+                                    self.advance();
+                                    args.push(self.parse_expr()?);
+                                }
                             }
                         }
                         if !matches!(self.peek(), Token::RParen) {
@@ -527,11 +564,22 @@ impl<'a> Parser<'a> {
                             )));
                         }
                         self.advance(); // consume )
-                        expr = Expr::MethodCall {
-                            receiver: Box::new(expr),
-                            method: name,
-                            args,
-                        };
+                        if is_macro {
+                            expr = Expr::Macro {
+                                receiver: Box::new(expr),
+                                name,
+                                var: macro_var.unwrap_or_default(),
+                                predicate: Box::new(
+                                    args.into_iter().next().unwrap_or(Expr::BoolLit(true)),
+                                ),
+                            };
+                        } else {
+                            expr = Expr::MethodCall {
+                                receiver: Box::new(expr),
+                                method: name,
+                                args,
+                            };
+                        }
                     } else {
                         // Field access
                         expr = Expr::Member {
@@ -591,11 +639,35 @@ impl<'a> Parser<'a> {
 
 struct EvalContext<'a> {
     root: &'a serde_json::Value,
+    /// Lexical variable bindings for macro predicates (e.g. the `c` in
+    /// `claims.exists(c, c.type == 'group')`).  The binding is looked up
+    /// here before falling back to the root context.
+    bindings: Vec<(String, serde_json::Value)>,
 }
 
 impl<'a> EvalContext<'a> {
     fn from_root(root: &'a serde_json::Value) -> Self {
-        Self { root }
+        Self {
+            root,
+            bindings: Vec::new(),
+        }
+    }
+
+    fn with_binding(&self, name: String, value: serde_json::Value) -> Self {
+        let mut new = Self {
+            root: self.root,
+            bindings: self.bindings.clone(),
+        };
+        new.bindings.push((name, value));
+        new
+    }
+
+    fn lookup_binding(&self, name: &str) -> Option<&serde_json::Value> {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
     }
 }
 
@@ -609,7 +681,11 @@ impl Expr {
                 if name == "null" {
                     return Ok(serde_json::Value::Null);
                 }
-                // Look up the identifier in the root context.
+                // Check macro bindings first (innermost scope).
+                if let Some(v) = ctx.lookup_binding(name) {
+                    return Ok(v.clone());
+                }
+                // Then the root context.
                 if let serde_json::Value::Object(map) = ctx.root {
                     if let Some(v) = map.get(name) {
                         return Ok(v.clone());
@@ -663,6 +739,12 @@ impl Expr {
                 method,
                 args,
             } => eval_method_call(receiver, method, args, ctx),
+            Expr::Macro {
+                receiver,
+                name,
+                var,
+                predicate,
+            } => eval_macro(receiver, name, var, predicate, ctx),
             Expr::Binary { op, lhs, rhs } => {
                 let l = lhs.eval(ctx)?;
                 let r = rhs.eval(ctx)?;
@@ -740,6 +822,65 @@ fn eval_method_call(
             "no method '{method}' on {}",
             type_name(&recv)
         ))),
+    }
+}
+
+/// Evaluate a higher-order macro (`exists`, `all`, `filter`, `map`).
+fn eval_macro(
+    receiver: &Expr,
+    name: &str,
+    var: &str,
+    predicate: &Expr,
+    ctx: &EvalContext,
+) -> Result<serde_json::Value, CelError> {
+    let recv = receiver.eval(ctx)?;
+    let arr = match &recv {
+        serde_json::Value::Array(a) => a,
+        _ => {
+            return Err(CelError::Eval(format!(
+                "{name}() requires an array, got {}",
+                type_name(&recv)
+            )));
+        }
+    };
+    match name {
+        "exists" => {
+            for elem in arr {
+                let sub_ctx = ctx.with_binding(var.to_string(), elem.clone());
+                if as_bool(&predicate.eval(&sub_ctx)?)? {
+                    return Ok(serde_json::Value::Bool(true));
+                }
+            }
+            Ok(serde_json::Value::Bool(false))
+        }
+        "all" => {
+            for elem in arr {
+                let sub_ctx = ctx.with_binding(var.to_string(), elem.clone());
+                if !as_bool(&predicate.eval(&sub_ctx)?)? {
+                    return Ok(serde_json::Value::Bool(false));
+                }
+            }
+            Ok(serde_json::Value::Bool(true))
+        }
+        "filter" => {
+            let mut out = Vec::new();
+            for elem in arr {
+                let sub_ctx = ctx.with_binding(var.to_string(), elem.clone());
+                if as_bool(&predicate.eval(&sub_ctx)?)? {
+                    out.push(elem.clone());
+                }
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        "map" => {
+            let mut out = Vec::new();
+            for elem in arr {
+                let sub_ctx = ctx.with_binding(var.to_string(), elem.clone());
+                out.push(predicate.eval(&sub_ctx)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        _ => Err(CelError::Eval(format!("unknown macro: {name}"))),
     }
 }
 
