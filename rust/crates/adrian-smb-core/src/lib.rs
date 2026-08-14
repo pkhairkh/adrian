@@ -95,6 +95,12 @@ pub mod ntstatus {
     pub const STATUS_BAD_NETWORK_NAME: u32 = 0xC000_00CC;
     /// `0xC0000128` — `STATUS_FILE_CLOSED` (file handle unknown).
     pub const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
+    /// `0x00000103` — `STATUS_PENDING` (async command in progress, e.g. CHANGE_NOTIFY).
+    pub const STATUS_PENDING: u32 = 0x0000_0103;
+    /// `0xC0000023` — `STATUS_FILE_LOCK_CONFLICT` (oplock break conflict).
+    pub const STATUS_FILE_LOCK_CONFLICT: u32 = 0xC000_0023;
+    /// `0xC00000A2` — `STATUS_NOTIFY_ENUM_DIR` (change-notify buffer overflow).
+    pub const STATUS_NOTIFY_ENUM_DIR: u32 = 0xC000_00A2;
 }
 
 // ============================================================================
@@ -141,6 +147,10 @@ pub mod command {
     pub const WRITE: u16 = 0x0009;
     /// `0x000D` — ECHO.
     pub const ECHO: u16 = 0x000D;
+    /// `0x000F` — CHANGE_NOTIFY (MS-SMB2 §2.2.35).
+    pub const CHANGE_NOTIFY: u16 = 0x000F;
+    /// `0x0012` — OPLOCK_BREAK (MS-SMB2 §2.2.23 / §2.2.24).
+    pub const OPLOCK_BREAK: u16 = 0x0012;
     /// `0x00F2` — TRANSFORM (encrypted PDU).
     pub const TRANSFORM: u16 = 0x00F2;
 }
@@ -319,6 +329,10 @@ pub enum Command {
     Write = 0x0009,
     /// `0x000D` — ECHO.
     Echo = 0x000d,
+    /// `0x000F` — CHANGE_NOTIFY.
+    ChangeNotify = 0x000F,
+    /// `0x0012` — OPLOCK_BREAK.
+    OplockBreak = 0x0012,
     /// `0x00F2` — TRANSFORM (encrypted PDU).
     Transform = 0x00F2,
 }
@@ -344,6 +358,8 @@ impl Command {
             0x0008 => Some(Command::Read),
             0x0009 => Some(Command::Write),
             0x000D => Some(Command::Echo),
+            0x000F => Some(Command::ChangeNotify),
+            0x0012 => Some(Command::OplockBreak),
             0x00F2 => Some(Command::Transform),
             _ => None,
         }
@@ -523,6 +539,13 @@ impl Writer {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Mutably borrow the bytes written so far (used for in-place patching
+    /// of length / offset fields by create-context and change-notify encoders).
+    #[must_use]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
 
     /// Current write position (= length).
@@ -1729,6 +1752,34 @@ impl CreateRequest {
             name,
         })
     }
+
+    /// Parse the create contexts from the wire buffer (Wave 3). The
+    /// base [`CreateRequest::decode`] only consumes the fixed fields
+    /// and the name; this helper re-reads the CreateContextsOffset /
+    /// CreateContextsLength fields and decodes the contexts. Returns
+    /// an empty vec when no contexts are present (the common case).
+    pub fn parse_create_contexts(
+        buf: &[u8],
+        header_size: usize,
+    ) -> Result<Vec<CreateContext>, SmbError> {
+        if buf.len() < header_size + 56 {
+            return Ok(Vec::new());
+        }
+        let ctx_offset = u32::from_le_bytes(
+            buf[header_size + 48..header_size + 52]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize;
+        let ctx_length = u32::from_le_bytes(
+            buf[header_size + 52..header_size + 56]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize;
+        if ctx_length == 0 || ctx_offset == 0 {
+            return Ok(Vec::new());
+        }
+        CreateContext::decode_all(buf, ctx_offset, ctx_length)
+    }
 }
 
 /// SMB2 CREATE response (command 0x0005). MS-SMB2 §2.2.14.
@@ -2429,6 +2480,632 @@ impl EchoResponse {
             )));
         }
         Ok(Self)
+    }
+}
+
+// ============================================================================
+// Wave 3: Create contexts, durable handles, change notify, oplock break
+// (MS-SMB2 §2.2.13 / §2.2.14 / §2.2.23 / §2.2.24 / §2.2.31 / §2.2.35)
+// ============================================================================
+
+/// Oplock level values per MS-SMB2 §2.2.13.1.
+pub mod oplock_level {
+    /// `0x00` — no oplock granted.
+    pub const NONE: u8 = 0x00;
+    /// `0x01` — Level II oplock (shared read, no caching).
+    pub const LEVEL_2: u8 = 0x01;
+    /// `0x08` — Batch oplock (exclusive, full caching).
+    pub const BATCH: u8 = 0x08;
+    /// `0x09` — Level II + Batch combined (used by some clients).
+    pub const LEVEL_2_OR_BATCH: u8 = 0x09;
+}
+
+/// Change-notify filter bits per MS-SMB2 §2.2.35 (FILE_NOTIFY_CHANGE_*).
+pub mod notify_filter {
+    /// `0x00000001` — file name changed.
+    pub const FILE_NAME: u32 = 0x0000_0001;
+    /// `0x00000002` — directory name changed.
+    pub const DIR_NAME: u32 = 0x0000_0002;
+    /// `0x00000004` — file attributes changed.
+    pub const ATTRIBUTES: u32 = 0x0000_0004;
+    /// `0x00000008` — file size changed.
+    pub const SIZE: u32 = 0x0000_0008;
+    /// `0x00000010` — last-write time changed.
+    pub const LAST_WRITE: u32 = 0x0000_0010;
+    /// `0x00000020` — last-access time changed.
+    pub const LAST_ACCESS: u32 = 0x0000_0020;
+    /// `0x00000040` — creation time changed.
+    pub const CREATION: u32 = 0x0000_0040;
+    /// `0x00000080` — security descriptor changed.
+    pub const SECURITY: u32 = 0x0000_0080;
+}
+
+/// File-notify action codes per MS-SMB2 §2.2.35 (FILE_ACTION_*).
+pub mod file_action {
+    /// `0x00000001` — file added.
+    pub const ADDED: u32 = 0x0000_0001;
+    /// `0x00000002` — file removed.
+    pub const REMOVED: u32 = 0x0000_0002;
+    /// `0x00000003` — file modified.
+    pub const MODIFIED: u32 = 0x0000_0003;
+    /// `0x00000004` — file renamed (old name).
+    pub const RENAMED_OLD_NAME: u32 = 0x0000_0004;
+    /// `0x00000005` — file renamed (new name).
+    pub const RENAMED_NEW_NAME: u32 = 0x0000_0005;
+}
+
+/// A single SMB2 create-context entry (MS-SMB2 §2.2.13.2 / §2.2.14.2).
+///
+/// The wire layout is:
+///   - `NextContextOffset: u32` (0 = last)
+///   - `NameOffset: u16` (typically 16)
+///   - `NameLength: u16` (typically 4 — "DHQ2", "DHC2", "DHN2", etc.)
+///   - `Reserved: u32`
+///   - `DataOffset: u16` (0 if no data)
+///   - `DataLength: u32`
+///   - `Buffer: [Name (4 bytes) | Data]`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateContext {
+    /// The 4-byte create-context name (e.g. `b"DHQ2"`).
+    pub name: [u8; 4],
+    /// The create-context data payload (interpretation depends on the name).
+    pub data: Vec<u8>,
+}
+
+impl CreateContext {
+    /// Durable-handle request V2 name: `b"DHQ2"` (MS-SMB2 §2.2.31.2).
+    pub const NAME_DURABLE_HANDLE_REQUEST_V2: [u8; 4] = *b"DHQ2";
+    /// Durable-handle response V2 name: `b"DHC2"` (MS-SMB2 §2.2.31.4).
+    pub const NAME_DURABLE_HANDLE_RESPONSE_V2: [u8; 4] = *b"DHC2";
+    /// Durable-handle reconnect V2 name: `b"DHN2"` (MS-SMB2 §2.2.31.6).
+    pub const NAME_DURABLE_HANDLE_RECONNECT_V2: [u8; 4] = *b"DHN2";
+
+    /// Build a DURABLE_HANDLE_REQUEST_V2 create context. The data
+    /// layout per §2.2.31.2 is `DurableFlags(u32) || Reserved(u32) ||
+    /// CreateGuid(16 bytes) || Flags(u32)` = 28 bytes.
+    #[must_use]
+    pub fn durable_handle_request_v2(
+        durable_flags: u32,
+        create_guid: uuid::Uuid,
+        flags: u32,
+    ) -> Self {
+        let mut data = Vec::with_capacity(28);
+        data.extend_from_slice(&durable_flags.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        data.extend_from_slice(create_guid.as_bytes());
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self {
+            name: Self::NAME_DURABLE_HANDLE_REQUEST_V2,
+            data,
+        }
+    }
+
+    /// Build a DURABLE_HANDLE_RESPONSE_V2 create context. The data
+    /// layout per §2.2.31.4 is `Flags(u32)` = 4 bytes.
+    #[must_use]
+    pub fn durable_handle_response_v2(flags: u32) -> Self {
+        let mut data = Vec::with_capacity(4);
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self {
+            name: Self::NAME_DURABLE_HANDLE_RESPONSE_V2,
+            data,
+        }
+    }
+
+    /// Build a DURABLE_HANDLE_RECONNECT_V2 create context. The data
+    /// layout per §2.2.31.6 is `FileId(16 bytes) || CreateGuid(16 bytes)
+    /// || Flags(u32)` = 36 bytes. The 16-byte FileId here is the
+    /// PersistentFileId widened with the VolatileFileId (passed as a
+    /// full [`FileId`] so the server can match both halves on reclaim).
+    #[must_use]
+    pub fn durable_handle_reconnect_v2(
+        file_id: FileId,
+        create_guid: uuid::Uuid,
+        flags: u32,
+    ) -> Self {
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&file_id.persistent.to_le_bytes());
+        data.extend_from_slice(&file_id.volatile_.to_le_bytes());
+        data.extend_from_slice(create_guid.as_bytes());
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self {
+            name: Self::NAME_DURABLE_HANDLE_RECONNECT_V2,
+            data,
+        }
+    }
+
+    /// Parse the data of a DURABLE_HANDLE_REQUEST_V2 context into
+    /// `(durable_flags, create_guid, flags)`. Returns `None` on
+    /// malformed data.
+    #[must_use]
+    pub fn parse_durable_handle_request_v2(&self) -> Option<(u32, uuid::Uuid, u32)> {
+        if self.name != Self::NAME_DURABLE_HANDLE_REQUEST_V2 || self.data.len() < 28 {
+            return None;
+        }
+        let durable_flags = u32::from_le_bytes(self.data[0..4].try_into().ok()?);
+        // Reserved at [4..8]
+        let guid_bytes: [u8; 16] = self.data[8..24].try_into().ok()?;
+        let create_guid = uuid::Uuid::from_bytes(guid_bytes);
+        let flags = u32::from_le_bytes(self.data[24..28].try_into().ok()?);
+        Some((durable_flags, create_guid, flags))
+    }
+
+    /// Parse the data of a DURABLE_HANDLE_RESPONSE_V2 context into
+    /// `flags`. Returns `None` on malformed data.
+    #[must_use]
+    pub fn parse_durable_handle_response_v2(&self) -> Option<u32> {
+        if self.name != Self::NAME_DURABLE_HANDLE_RESPONSE_V2 || self.data.len() < 4 {
+            return None;
+        }
+        Some(u32::from_le_bytes(self.data[0..4].try_into().ok()?))
+    }
+
+    /// Parse the data of a DURABLE_HANDLE_RECONNECT_V2 context into
+    /// `(file_id, create_guid, flags)`. Returns `None` on malformed data.
+    #[must_use]
+    pub fn parse_durable_handle_reconnect_v2(&self) -> Option<(FileId, uuid::Uuid, u32)> {
+        if self.name != Self::NAME_DURABLE_HANDLE_RECONNECT_V2 || self.data.len() < 36 {
+            return None;
+        }
+        let persistent = u64::from_le_bytes(self.data[0..8].try_into().ok()?);
+        let volatile_ = u64::from_le_bytes(self.data[8..16].try_into().ok()?);
+        let guid_bytes: [u8; 16] = self.data[16..32].try_into().ok()?;
+        let create_guid = uuid::Uuid::from_bytes(guid_bytes);
+        let flags = u32::from_le_bytes(self.data[32..36].try_into().ok()?);
+        Some((FileId::new(persistent, volatile_), create_guid, flags))
+    }
+
+    /// Encode a sequence of create contexts into `out`. The fixed
+    /// header is 18 bytes per context (4+2+2+4+2+4); the name is 4
+    /// bytes; the data follows. Each context is 8-byte aligned.
+    pub fn encode_all(ctxs: &[CreateContext], out: &mut Writer) -> (u32, u32) {
+        if ctxs.is_empty() {
+            return (0, 0);
+        }
+        let start = out.position();
+        for (i, ctx) in ctxs.iter().enumerate() {
+            let ctx_start = out.position();
+            // NextContextOffset: filled in after we know the next context's start.
+            // For now, write 0; we'll patch if there's a next context.
+            out.write_u32(0);
+            out.write_u16(18); // NameOffset (immediately after the 18-byte fixed header)
+            out.write_u16(4); // NameLength
+            out.write_u32(0); // Reserved
+                              // DataOffset: 18 + 4 (name) = 22, but 8-byte aligned = 24.
+            let data_offset = if ctx.data.is_empty() { 0u16 } else { 24u16 };
+            out.write_u16(data_offset);
+            out.write_u32(ctx.data.len() as u32);
+            // Name (4 bytes).
+            out.write_bytes(&ctx.name);
+            // Pad to 8-byte alignment before data.
+            out.align(8);
+            // Data.
+            out.write_bytes(&ctx.data);
+            // Pad to 8-byte alignment for the next context.
+            out.align(8);
+            // Patch NextContextOffset if there's a next context.
+            if i + 1 < ctxs.len() {
+                let next_offset = (out.position() - ctx_start) as u32;
+                let next_ctx_pos = out.position();
+                // Write the NextContextOffset field (bytes 0..4 of this context).
+                let patch_pos = ctx_start;
+                out.as_bytes_mut()[patch_pos..patch_pos + 4]
+                    .copy_from_slice(&next_offset.to_le_bytes());
+                let _ = next_ctx_pos; // suppress unused warning
+            }
+        }
+        let end = out.position();
+        let total_len = (end - start) as u32;
+        (start as u32, total_len)
+    }
+
+    /// Decode a sequence of create contexts from `buf` starting at
+    /// `offset` for `length` bytes.
+    pub fn decode_all(
+        buf: &[u8],
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<CreateContext>, SmbError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if offset + length > buf.len() {
+            return Err(SmbError::Malformed(format!(
+                "create contexts truncated: offset={offset} length={length} buf_len={}",
+                buf.len()
+            )));
+        }
+        let mut out = Vec::new();
+        let mut pos = offset;
+        let end = offset + length;
+        while pos + 16 <= end {
+            let next_offset =
+                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+            let name_offset =
+                u16::from_le_bytes(buf[pos + 4..pos + 6].try_into().unwrap_or([0; 2])) as usize;
+            let name_length =
+                u16::from_le_bytes(buf[pos + 6..pos + 8].try_into().unwrap_or([0; 2])) as usize;
+            let _reserved = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap_or([0; 4]));
+            let data_offset =
+                u16::from_le_bytes(buf[pos + 12..pos + 14].try_into().unwrap_or([0; 2])) as usize;
+            let data_length =
+                u32::from_le_bytes(buf[pos + 14..pos + 18].try_into().unwrap_or([0; 4])) as usize;
+            // Read name (4 bytes — we only support the 4-byte variant).
+            if name_length != 4 {
+                return Err(SmbError::Malformed(format!(
+                    "unsupported create-context NameLength: {name_length} (only 4 supported)"
+                )));
+            }
+            let name_pos = pos + name_offset;
+            if name_pos + 4 > buf.len() {
+                return Err(SmbError::Malformed("create-context name truncated".into()));
+            }
+            let mut name = [0u8; 4];
+            name.copy_from_slice(&buf[name_pos..name_pos + 4]);
+            // Read data (if any).
+            let data = if data_length == 0 {
+                Vec::new()
+            } else {
+                let data_pos = pos + data_offset;
+                if data_pos + data_length > buf.len() {
+                    return Err(SmbError::Malformed("create-context data truncated".into()));
+                }
+                buf[data_pos..data_pos + data_length].to_vec()
+            };
+            out.push(CreateContext { name, data });
+            // Advance to next context.
+            if next_offset == 0 {
+                break;
+            }
+            pos += next_offset;
+        }
+        Ok(out)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// SMB2 CHANGE_NOTIFY request / response — §2.2.35
+// ----------------------------------------------------------------------------
+
+/// SMB2 CHANGE_NOTIFY request (command 0x000F). MS-SMB2 §2.2.35.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeNotifyRequest {
+    /// FileId of the directory to watch.
+    pub file_id: FileId,
+    /// Filter (combination of [`notify_filter`] bits).
+    pub filter: u32,
+    /// WatchTree (true = recursively watch all subdirectories).
+    pub watch_tree: bool,
+}
+
+impl ChangeNotifyRequest {
+    /// Build a CHANGE_NOTIFY request for `file_id` with the given filter.
+    #[must_use]
+    pub fn new(file_id: FileId, filter: u32, watch_tree: bool) -> Self {
+        Self {
+            file_id,
+            filter,
+            watch_tree,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(32); // StructureSize
+        out.write_u16(0); // Flags (bit 0 = WatchTree)
+        out.write_u32(self.filter);
+        out.write_file_id(&self.file_id);
+        // ChangesBufferOffset (always 0 for a request).
+        out.write_u32(0);
+        // ChangesBufferLength (always 0 for a request).
+        out.write_u32(0);
+    }
+
+    /// Encode the full SMB2 CHANGE_NOTIFY request.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 32);
+        let mut hdr = Smb2Header::new_request(command::CHANGE_NOTIFY, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 24 {
+            return Err(SmbError::Malformed(
+                "change notify request too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 32 {
+            return Err(SmbError::Malformed(format!(
+                "change notify request StructureSize {structure_size} != 32"
+            )));
+        }
+        let flags = r.read_u16()?;
+        let filter = r.read_u32()?;
+        let file_id = r.read_file_id()?;
+        let _buf_offset = r.read_u32()?;
+        let _buf_length = r.read_u32()?;
+        Ok(Self {
+            file_id,
+            filter,
+            watch_tree: flags & 0x0001 != 0,
+        })
+    }
+}
+
+/// A single FILE_NOTIFY_INFORMATION entry inside a CHANGE_NOTIFY response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileNotifyInformation {
+    /// NextEntryOffset (0 = last entry).
+    pub next_entry_offset: u32,
+    /// Action (one of [`file_action`] constants).
+    pub action: u32,
+    /// File name (UTF-16LE; relative to the watched directory).
+    pub file_name: String,
+}
+
+/// SMB2 CHANGE_NOTIFY response (command 0x000F). MS-SMB2 §2.2.35.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ChangeNotifyResponse {
+    /// The change events.
+    pub changes: Vec<FileNotifyInformation>,
+}
+
+impl ChangeNotifyResponse {
+    /// Build an empty CHANGE_NOTIFY response (no changes).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a CHANGE_NOTIFY response with one change event.
+    #[must_use]
+    pub fn with_change(action: u32, file_name: impl Into<String>) -> Self {
+        Self {
+            changes: vec![FileNotifyInformation {
+                next_entry_offset: 0,
+                action,
+                file_name: file_name.into(),
+            }],
+        }
+    }
+
+    /// Encode the body. Returns the buffer-offset of the changes.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(9); // StructureSize
+        out.write_u16(0); // Reserved
+                          // ChangesBufferOffset: header + 8 (fixed structure) — but must be 8-byte aligned.
+        let buf_offset = (header_size + 8) as u32;
+        out.write_u32(buf_offset);
+        // Pre-encode the changes to compute the length.
+        let mut changes_buf = Writer::new();
+        let n = self.changes.len();
+        for (i, change) in self.changes.iter().enumerate() {
+            let entry_start = changes_buf.position();
+            // NextEntryOffset — patch later if there's a next entry.
+            changes_buf.write_u32(0);
+            changes_buf.write_u32(change.action);
+            let name_utf16 = encode_utf16le(&change.file_name);
+            changes_buf.write_u32(name_utf16.len() as u32);
+            changes_buf.write_bytes(&name_utf16);
+            // Align to 4 bytes (per FILE_NOTIFY_INFORMATION layout).
+            changes_buf.align(4);
+            if i + 1 < n {
+                let next_offset = (changes_buf.position() - entry_start) as u32;
+                let patch_pos = entry_start;
+                changes_buf.as_bytes_mut()[patch_pos..patch_pos + 4]
+                    .copy_from_slice(&next_offset.to_le_bytes());
+            }
+        }
+        let changes_len = changes_buf.as_bytes().len() as u32;
+        out.write_u32(changes_len);
+        out.write_bytes(changes_buf.as_bytes());
+        buf_offset
+    }
+
+    /// Encode the full SMB2 CHANGE_NOTIFY response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 64);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 8 {
+            return Err(SmbError::Malformed(
+                "change notify response too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 9 {
+            return Err(SmbError::Malformed(format!(
+                "change notify response StructureSize {structure_size} != 9"
+            )));
+        }
+        let _reserved = r.read_u16()?;
+        let buf_offset = r.read_u32()? as usize;
+        let buf_length = r.read_u32()? as usize;
+        if buf_length == 0 {
+            return Ok(Self::default());
+        }
+        if buf_offset + buf_length > buf.len() {
+            return Err(SmbError::Malformed(
+                "change notify response buffer truncated".into(),
+            ));
+        }
+        let changes_buf = &buf[buf_offset..buf_offset + buf_length];
+        let mut changes = Vec::new();
+        let mut pos = 0usize;
+        while pos + 12 <= changes_buf.len() {
+            let next_offset =
+                u32::from_le_bytes(changes_buf[pos..pos + 4].try_into().unwrap_or([0; 4]));
+            let action =
+                u32::from_le_bytes(changes_buf[pos + 4..pos + 8].try_into().unwrap_or([0; 4]));
+            let name_len =
+                u32::from_le_bytes(changes_buf[pos + 8..pos + 12].try_into().unwrap_or([0; 4]))
+                    as usize;
+            if pos + 12 + name_len > changes_buf.len() {
+                return Err(SmbError::Malformed(
+                    "change notify entry name truncated".into(),
+                ));
+            }
+            let file_name = decode_utf16le(&changes_buf[pos + 12..pos + 12 + name_len]);
+            changes.push(FileNotifyInformation {
+                next_entry_offset: next_offset,
+                action,
+                file_name,
+            });
+            if next_offset == 0 {
+                break;
+            }
+            pos += next_offset as usize;
+        }
+        Ok(Self { changes })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// SMB2 OPLOCK_BREAK notification + acknowledgment — §2.2.23 / §2.2.24
+// ----------------------------------------------------------------------------
+
+/// SMB2 OPLOCK_BREAK notification (server → client). MS-SMB2 §2.2.23.1.
+///
+/// The server sends this when a conflicting open forces a downgrade
+/// of an existing oplock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OplockBreakNotification {
+    /// OplockLevel currently held (before the break).
+    pub oplock_level: u8,
+    /// Reserved (0).
+    pub reserved: u8,
+    /// FileId of the file whose oplock is breaking.
+    pub file_id: FileId,
+}
+
+impl OplockBreakNotification {
+    /// Build a new OPLOCK_BREAK notification.
+    #[must_use]
+    pub fn new(oplock_level: u8, file_id: FileId) -> Self {
+        Self {
+            oplock_level,
+            reserved: 0,
+            file_id,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(24); // StructureSize
+        out.write_u8(self.oplock_level);
+        out.write_u8(self.reserved);
+        out.write_file_id(&self.file_id);
+    }
+
+    /// Encode the full SMB2 OPLOCK_BREAK notification (server → client).
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 24);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.command = command::OPLOCK_BREAK;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed(
+                "oplock break notification too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 24 {
+            return Err(SmbError::Malformed(format!(
+                "oplock break StructureSize {structure_size} != 24"
+            )));
+        }
+        let oplock_level = r.read_u8()?;
+        let reserved = r.read_u8()?;
+        let file_id = r.read_file_id()?;
+        Ok(Self {
+            oplock_level,
+            reserved,
+            file_id,
+        })
+    }
+}
+
+/// SMB2 OPLOCK_BREAK acknowledgment (client → server). MS-SMB2 §2.2.24.1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OplockBreakAcknowledgment {
+    /// OplockLevel the client is downgrading to.
+    pub oplock_level: u8,
+    /// Reserved (0).
+    pub reserved: u8,
+    /// FileId of the file whose oplock is being acknowledged.
+    pub file_id: FileId,
+}
+
+impl OplockBreakAcknowledgment {
+    /// Build a new OPLOCK_BREAK acknowledgment.
+    #[must_use]
+    pub fn new(oplock_level: u8, file_id: FileId) -> Self {
+        Self {
+            oplock_level,
+            reserved: 0,
+            file_id,
+        }
+    }
+
+    /// Encode the full SMB2 OPLOCK_BREAK acknowledgment.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 24);
+        let mut hdr = Smb2Header::new_request(command::OPLOCK_BREAK, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        out.write_u16(24); // StructureSize
+        out.write_u8(self.oplock_level);
+        out.write_u8(self.reserved);
+        out.write_file_id(&self.file_id);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed(
+                "oplock break acknowledgment too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 24 {
+            return Err(SmbError::Malformed(format!(
+                "oplock break ack StructureSize {structure_size} != 24"
+            )));
+        }
+        let oplock_level = r.read_u8()?;
+        let reserved = r.read_u8()?;
+        let file_id = r.read_file_id()?;
+        Ok(Self {
+            oplock_level,
+            reserved,
+            file_id,
+        })
     }
 }
 
