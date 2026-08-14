@@ -472,6 +472,339 @@ fn validate_syntax(
     Ok(())
 }
 
+/// Compile a [`SchemaProjection`] from a directory of LDIF (LDAP Data
+/// Interchange Format) files per ADR-119 §Decision (schema-as-code with
+/// GitOps).
+///
+/// The function reads every `*.ldif` file in `path`, parses each entry,
+/// and builds a projection from the `attributeSchema` and `classSchema`
+/// objects found.  Unknown object classes are tolerated (the framework
+/// may have extensions not yet in the baseline schema).
+///
+/// # LDIF format
+///
+/// Each LDIF entry is a sequence of `key: value` lines, separated by
+/// blank lines.  The `dn:` line identifies the entry; the `objectClass:`
+/// lines identify its structural/auxiliary classes.  For `attributeSchema`
+/// entries, the following attributes are parsed:
+/// - `attributeID:` — the numeric OID (mapped to a framework-internal u32)
+/// - `ldapDisplayName:` — the LDAP attribute name
+/// - `attributeSyntax:` + `oMSyntax:` — the syntax (mapped to
+///   [`AttributeSyntax`])
+/// - `isSingleValued:` — `TRUE`/`FALSE`
+///
+/// For `classSchema` entries:
+/// - `governsID:` — the numeric OID (mapped to a framework-internal u32)
+/// - `ldapDisplayName:` — the LDAP class name
+/// - `systemPossSuperiors:` / `possSuperiors:` — superior class names
+/// - `mustContain:` — mandatory attribute names
+/// - `mayContain:` — optional attribute names
+/// - `objectClassCategory:` — 1=structural, 2=auxiliary, 3=abstract
+///
+/// # Errors
+/// Returns [`SchemaError::ProjectionCompile`] if the directory cannot be
+/// read or an LDIF entry is malformed.
+pub fn compile_from_directory_path(
+    path: &std::path::Path,
+) -> Result<SchemaProjection, SchemaError> {
+    let mut projection = SchemaProjection::empty();
+    projection.generation = 1;
+    // Walk the directory for *.ldif files.
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| SchemaError::ProjectionCompile(format!("read_dir {}: {e}", path.display())))?;
+    let mut ldif_files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| SchemaError::ProjectionCompile(format!("dir entry: {e}")))?;
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("ldif") {
+            ldif_files.push(p);
+        }
+    }
+    ldif_files.sort();
+    // Two-pass compile: first parse all attributeSchema entries (so class
+    // entries can reference them by name), then parse classSchema entries.
+    let mut attr_name_to_id: HashMap<String, AttributeId> = HashMap::new();
+    let mut class_name_to_id: HashMap<String, ClassId> = HashMap::new();
+    let mut pending_classes: Vec<LdifEntry> = Vec::new();
+    // Pass 1: attributeSchema entries.
+    for f in &ldif_files {
+        let content = std::fs::read_to_string(f)
+            .map_err(|e| SchemaError::ProjectionCompile(format!("read {}: {e}", f.display())))?;
+        for entry in parse_ldif(&content) {
+            if entry.object_classes.iter().any(|c| c == "attributeSchema") {
+                let (id, attr) = parse_attribute_schema(&entry)?;
+                projection.attributes.insert(id, attr.clone());
+                attr_name_to_id.insert(attr.ldap_name.to_ascii_lowercase(), id);
+            } else if entry.object_classes.iter().any(|c| c == "classSchema") {
+                pending_classes.push(entry);
+            }
+        }
+    }
+    // Pass 2: classSchema entries (now that all attributes are known).
+    for entry in &pending_classes {
+        let (id, class) = parse_class_schema(entry, &attr_name_to_id, &class_name_to_id)?;
+        projection.classes.insert(id, class.clone());
+        class_name_to_id.insert(class.ldap_name.to_ascii_lowercase(), id);
+    }
+    projection.attribute_name_to_id = attr_name_to_id;
+    projection.class_name_to_id = class_name_to_id;
+    Ok(projection)
+}
+
+/// A parsed LDIF entry — a DN + a map of attribute name → values.
+struct LdifEntry {
+    #[allow(dead_code)]
+    dn: String,
+    object_classes: Vec<String>,
+    attributes: HashMap<String, Vec<String>>,
+}
+
+/// Parse LDIF text into a list of entries.  Each entry is separated by a
+/// blank line.  Lines starting with `#` are comments.  Long lines can be
+/// folded with a leading space on the continuation line (per RFC 2849).
+fn parse_ldif(content: &str) -> Vec<LdifEntry> {
+    let mut entries = Vec::new();
+    let mut current_dn = String::new();
+    let mut current_classes: Vec<String> = Vec::new();
+    let mut current_attrs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut current_lines: Vec<String> = Vec::new();
+    for line in content.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.is_empty() {
+            // End of entry.
+            if !current_lines.is_empty() {
+                // Process folded lines.
+                let folded = fold_lines(&current_lines);
+                for fl in &folded {
+                    if let Some((key, value)) = fl.split_once(':') {
+                        let key = key.trim();
+                        let value = value.trim_start_matches(' ');
+                        if key == "dn" {
+                            current_dn = value.to_string();
+                        } else if key == "objectClass" {
+                            current_classes.push(value.to_string());
+                        } else {
+                            current_attrs
+                                .entry(key.to_string())
+                                .or_default()
+                                .push(value.to_string());
+                        }
+                    }
+                }
+                entries.push(LdifEntry {
+                    dn: current_dn.clone(),
+                    object_classes: current_classes.clone(),
+                    attributes: current_attrs.clone(),
+                });
+                current_dn.clear();
+                current_classes.clear();
+                current_attrs.clear();
+                current_lines.clear();
+            }
+        } else {
+            current_lines.push(line.to_string());
+        }
+    }
+    // Flush the last entry (if the file doesn't end with a blank line).
+    if !current_lines.is_empty() {
+        let folded = fold_lines(&current_lines);
+        for fl in &folded {
+            if let Some((key, value)) = fl.split_once(':') {
+                let key = key.trim();
+                let value = value.trim_start_matches(' ');
+                if key == "dn" {
+                    current_dn = value.to_string();
+                } else if key == "objectClass" {
+                    current_classes.push(value.to_string());
+                } else {
+                    current_attrs
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(value.to_string());
+                }
+            }
+        }
+        entries.push(LdifEntry {
+            dn: current_dn,
+            object_classes: current_classes,
+            attributes: current_attrs,
+        });
+    }
+    entries
+}
+
+/// Fold continuation lines (lines starting with a space) into their
+/// preceding line, per RFC 2849 §4.
+fn fold_lines(lines: &[String]) -> Vec<String> {
+    let mut folded: Vec<String> = Vec::new();
+    for line in lines {
+        if let Some(stripped) = line.strip_prefix(' ') {
+            if let Some(last) = folded.last_mut() {
+                last.push_str(stripped);
+            }
+        } else {
+            folded.push(line.clone());
+        }
+    }
+    folded
+}
+
+/// Parse an `attributeSchema` LDIF entry into an [`AttributeSchema`].
+fn parse_attribute_schema(
+    entry: &LdifEntry,
+) -> Result<(AttributeId, AttributeSchema), SchemaError> {
+    let oid_str = entry
+        .attributes
+        .get("attributeID")
+        .and_then(|v| v.first())
+        .ok_or_else(|| {
+            SchemaError::ProjectionCompile("attributeSchema missing attributeID".into())
+        })?;
+    let id = oid_to_u32(oid_str)?;
+    let ldap_name = entry
+        .attributes
+        .get("ldapDisplayName")
+        .and_then(|v| v.first())
+        .ok_or_else(|| {
+            SchemaError::ProjectionCompile("attributeSchema missing ldapDisplayName".into())
+        })?
+        .clone();
+    let syntax_str = entry
+        .attributes
+        .get("attributeSyntax")
+        .and_then(|v| v.first())
+        .map(|s| s.as_str())
+        .unwrap_or("2.5.5.12"); // default: DirectoryString
+    let syntax = parse_attribute_syntax(syntax_str);
+    let is_single_valued = entry
+        .attributes
+        .get("isSingleValued")
+        .and_then(|v| v.first())
+        .map(|s| s.eq_ignore_ascii_case("TRUE"))
+        .unwrap_or(false);
+    Ok((
+        id,
+        AttributeSchema {
+            id,
+            ldap_name,
+            syntax,
+            range_lower: None,
+            range_upper: None,
+            is_single_valued,
+            search_flags: 0,
+            is_linked: false,
+            link_id: None,
+        },
+    ))
+}
+
+/// Parse a `classSchema` LDIF entry into a [`ClassSchema`].
+fn parse_class_schema(
+    entry: &LdifEntry,
+    attr_name_to_id: &HashMap<String, AttributeId>,
+    class_name_to_id: &HashMap<String, ClassId>,
+) -> Result<(ClassId, ClassSchema), SchemaError> {
+    let oid_str = entry
+        .attributes
+        .get("governsID")
+        .and_then(|v| v.first())
+        .ok_or_else(|| SchemaError::ProjectionCompile("classSchema missing governsID".into()))?;
+    let id = oid_to_u32(oid_str)?;
+    let ldap_name = entry
+        .attributes
+        .get("ldapDisplayName")
+        .and_then(|v| v.first())
+        .ok_or_else(|| {
+            SchemaError::ProjectionCompile("classSchema missing ldapDisplayName".into())
+        })?
+        .clone();
+    let superiors: Vec<ClassId> = entry
+        .attributes
+        .get("systemPossSuperiors")
+        .or_else(|| entry.attributes.get("possSuperiors"))
+        .map(|v| {
+            v.iter()
+                .filter_map(|name| class_name_to_id.get(&name.to_ascii_lowercase()).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    let must_contain: Vec<AttributeId> = entry
+        .attributes
+        .get("mustContain")
+        .map(|v| {
+            v.iter()
+                .filter_map(|name| attr_name_to_id.get(&name.to_ascii_lowercase()).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    let may_contain: Vec<AttributeId> = entry
+        .attributes
+        .get("mayContain")
+        .map(|v| {
+            v.iter()
+                .filter_map(|name| attr_name_to_id.get(&name.to_ascii_lowercase()).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    let category = entry
+        .attributes
+        .get("objectClassCategory")
+        .and_then(|v| v.first())
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(1);
+    Ok((
+        id,
+        ClassSchema {
+            id,
+            ldap_name,
+            superiors,
+            must_contain,
+            may_contain,
+            system_flags: 0,
+            category,
+        },
+    ))
+}
+
+/// Map an OID string to a framework-internal u32.  The mapping is
+/// deterministic: the last arc of the OID is used as the u32 value
+/// (e.g. `2.5.4.3` → 3).  This is sufficient for in-process schema
+/// lookups (the framework never serialises the numeric ID over the wire —
+/// LDAP clients always use the `ldapDisplayName` string).
+fn oid_to_u32(oid: &str) -> Result<u32, SchemaError> {
+    let last_arc = oid
+        .rsplit('.')
+        .next()
+        .ok_or_else(|| SchemaError::ProjectionCompile(format!("invalid OID: {oid}")))?;
+    last_arc
+        .parse::<u32>()
+        .map_err(|_| SchemaError::ProjectionCompile(format!("OID last arc not a u32: {oid}")))
+}
+
+/// Map an AD `attributeSyntax` OID to an [`AttributeSyntax`].
+fn parse_attribute_syntax(s: &str) -> AttributeSyntax {
+    match s {
+        "2.5.5.2" => AttributeSyntax::Oid,
+        "2.5.5.3" => AttributeSyntax::CaseExactString,
+        "2.5.5.4" => AttributeSyntax::Ia5String,
+        "2.5.5.5" => AttributeSyntax::Ia5String, // PrintCaseString → Ia5String
+        "2.5.5.6" => AttributeSyntax::DirectoryString,
+        "2.5.5.7" => AttributeSyntax::DirectoryString,
+        "2.5.5.8" => AttributeSyntax::Boolean,
+        "2.5.5.9" => AttributeSyntax::Integer,
+        "2.5.5.10" => AttributeSyntax::OctetString,
+        "2.5.5.12" => AttributeSyntax::DirectoryString,
+        "2.5.5.13" => AttributeSyntax::DirectoryString,
+        "2.5.5.14" => AttributeSyntax::DirectoryString,
+        "2.5.5.15" => AttributeSyntax::SecurityDescriptor,
+        "2.5.5.16" => AttributeSyntax::LargeInteger,
+        "2.5.5.17" => AttributeSyntax::Sid,
+        _ => AttributeSyntax::DirectoryString,
+    }
+}
+
 /// The framework's built-in baseline schema (per ADR-078 §Decision Layer 1
 /// — the framework ships a baseline schema mirroring the AD base schema so
 /// a fresh directory can be created without first importing an LDIF).
@@ -1279,5 +1612,132 @@ mod tests {
     async fn integration_compile_walks_schema_nc() {
         // Placeholder — will be implemented in `adrian-test-harness` once
         // the FDB integration testkit is added in Wave 4b.
+    }
+
+    // ---- Wave 5: compile_from_directory_path (LDIF) ---------------------
+
+    /// Write a sample LDIF schema to a temp directory and return the path.
+    fn write_sample_ldif_dir() -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "adrian-schema-test-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // attributeSchema entries (core AD attributes).
+        let ldif = r#"# Sample AD schema LDIF for Wave 5 tests
+
+dn: CN=cn,CN=Schema,CN=Configuration
+objectClass: top
+objectClass: attributeSchema
+attributeID: 2.5.4.3
+ldapDisplayName: cn
+attributeSyntax: 2.5.5.12
+isSingleValued: FALSE
+
+dn: CN=sAMAccountName,CN=Schema,CN=Configuration
+objectClass: top
+objectClass: attributeSchema
+attributeID: 1.2.840.113556.1.4.221
+ldapDisplayName: sAMAccountName
+attributeSyntax: 2.5.5.12
+isSingleValued: TRUE
+
+dn: CN=objectSid,CN=Schema,CN=Configuration
+objectClass: top
+objectClass: attributeSchema
+attributeID: 1.2.840.113556.1.4.222
+ldapDisplayName: objectSid
+attributeSyntax: 2.5.5.17
+isSingleValued: TRUE
+
+dn: CN=user,CN=Schema,CN=Configuration
+objectClass: top
+objectClass: classSchema
+governsID: 1.2.840.113556.1.3.4
+ldapDisplayName: user
+objectClassCategory: 1
+mustContain: cn
+mustContain: sAMAccountName
+mayContain: objectSid
+
+dn: CN=group,CN=Schema,CN=Configuration
+objectClass: top
+objectClass: classSchema
+governsID: 1.2.840.113556.1.3.5
+ldapDisplayName: group
+objectClassCategory: 1
+mustContain: cn
+mayContain: sAMAccountName
+"#;
+        std::fs::write(tmp.join("schema.ldif"), ldif).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn compile_from_directory_path_reads_ldif_files() {
+        let dir = write_sample_ldif_dir();
+        let projection = compile_from_directory_path(&dir).expect("compile from LDIF directory");
+        assert!(projection.generation >= 1);
+        // 3 attributeSchema entries: cn, sAMAccountName, objectSid.
+        assert_eq!(projection.attributes.len(), 3, "expected 3 attributes");
+        // 2 classSchema entries: user, group.
+        assert_eq!(projection.classes.len(), 2, "expected 2 classes");
+        // Verify cn attribute (OID 2.5.4.3 → u32 = 3).
+        let cn_id = projection
+            .attribute_name_to_id
+            .get("cn")
+            .copied()
+            .expect("cn attribute present");
+        assert_eq!(cn_id, 3);
+        let cn = &projection.attributes[&cn_id];
+        assert_eq!(cn.ldap_name, "cn");
+        assert_eq!(cn.syntax, AttributeSyntax::DirectoryString);
+        assert!(!cn.is_single_valued);
+        // Verify objectSid (OID ...222 → u32 = 222).
+        let sid_id = *projection
+            .attribute_name_to_id
+            .get("objectsid")
+            .expect("objectSid attribute present");
+        let sid = &projection.attributes[&sid_id];
+        assert_eq!(sid.syntax, AttributeSyntax::Sid);
+        assert!(sid.is_single_valued);
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_from_directory_path_resolves_class_attribute_references() {
+        let dir = write_sample_ldif_dir();
+        let projection = compile_from_directory_path(&dir).expect("compile from LDIF directory");
+        // user class (OID ...4 → u32 = 4).
+        let user_id = projection
+            .class_name_to_id
+            .get("user")
+            .copied()
+            .expect("user class present");
+        assert_eq!(user_id, 4);
+        let user = &projection.classes[&user_id];
+        // user must contain cn + sAMAccountName.
+        assert_eq!(user.must_contain.len(), 2);
+        assert!(user.must_contain.contains(&3), "must contain cn (id=3)");
+        assert!(
+            user.must_contain.contains(&221),
+            "must contain sAMAccountName (id=221)"
+        );
+        // user may contain objectSid.
+        assert_eq!(user.may_contain.len(), 1);
+        assert!(
+            user.may_contain.contains(&222),
+            "may contain objectSid (id=222)"
+        );
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_from_directory_path_returns_error_for_missing_dir() {
+        let err =
+            compile_from_directory_path(std::path::Path::new("/nonexistent/path/xyz")).unwrap_err();
+        assert!(matches!(err, SchemaError::ProjectionCompile(_)));
     }
 }
