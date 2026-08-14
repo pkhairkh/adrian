@@ -1676,6 +1676,381 @@ pub async fn handle_tgs_req_with_referral(
 }
 
 // ---------------------------------------------------------------------------
+// S4U2Self + S4U2Proxy (ADR-087 / MS-SFU)
+// ---------------------------------------------------------------------------
+
+/// PA-FOR-USER padata type (RFC 4120 §2.6 extension / MS-SFU §3.1).
+/// Carries the user's identity in an S4U2Self TGS-REQ.
+pub const PA_FOR_USER_TYPE: u8 = 129;
+
+/// PA-FOR-USER (RFC 4120 §2.6 extension) — carries the user's identity
+/// in an S4U2Self TGS-REQ. The KDC issues a ticket for the requesting
+/// service with this user's identity in the `cname` field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaForUser {
+    /// The user's principal name components (e.g. `["alice"]`).
+    pub user_name: Vec<String>,
+    /// The user's realm (e.g. `EXAMPLE.COM`).
+    pub user_realm: String,
+}
+
+/// Encode a `PaForUser` as length-prefixed bytes (self-consistent binary
+/// format — NOT RFC 4120 ASN.1/DER; the S4U ASN.1 codec is a future task).
+pub fn encode_pa_for_user(p: &PaForUser) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(p.user_name.len() as u32).to_be_bytes());
+    for c in &p.user_name {
+        out.extend_from_slice(&(c.len() as u32).to_be_bytes());
+        out.extend_from_slice(c.as_bytes());
+    }
+    out.extend_from_slice(&(p.user_realm.len() as u32).to_be_bytes());
+    out.extend_from_slice(p.user_realm.as_bytes());
+    out
+}
+
+/// Decode a `PaForUser` from length-prefixed bytes.
+pub fn decode_pa_for_user(bytes: &[u8]) -> Result<PaForUser, DecodeError> {
+    let mut r = ByteReader::new(bytes);
+    let name_count = r.read_u32()? as usize;
+    let mut user_name = Vec::with_capacity(name_count);
+    for _ in 0..name_count {
+        let clen = r.read_u32()? as usize;
+        let cbytes = r.read_bytes(clen)?;
+        let s = std::str::from_utf8(cbytes).map_err(|_| DecodeError::InvalidUtf8)?;
+        user_name.push(s.to_string());
+    }
+    let rlen = r.read_u32()? as usize;
+    let rbytes = r.read_bytes(rlen)?;
+    let user_realm = std::str::from_utf8(rbytes)
+        .map_err(|_| DecodeError::InvalidUtf8)?
+        .to_string();
+    Ok(PaForUser {
+        user_name,
+        user_realm,
+    })
+}
+
+/// Format a principal name as `realm/components` for ACL matching.
+fn format_spn(realm: &str, components: &[String]) -> String {
+    let mut s = String::from(realm);
+    s.push('/');
+    s.push_str(&components.join("/"));
+    s
+}
+
+/// S4U2Self handler (ADR-087 / MS-SFU §3.1). A service with
+/// `TRUSTED_TO_AUTH_FOR_DELEGATION` UAC bit requests a ticket to itself
+/// on behalf of a user. The KDC:
+///
+/// 1. Parses the TGS-REQ and decrypts the requesting service's TGT.
+/// 2. Verifies the authenticator (proves the service's identity).
+/// 3. Looks up the requesting service in the store.
+/// 4. Validates `trusted_to_auth_for_delegation == true` on the service.
+/// 5. Looks up the user specified in `pa_for_user`.
+/// 6. Issues a ticket for the requesting service itself (`sname` = the
+///    service's SPN), with the **user's** identity in `cname`.
+/// 7. Sets the `forwardable` flag iff the service has a non-empty
+///    `allowed_to_delegate_to` list (Bronze Bit mitigation per CVE-2020-17049:
+///    a non-forwardable S4U2Self ticket cannot be used for S4U2Proxy).
+pub async fn handle_tgs_req_s4u2self(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    pa_for_user: &PaForUser,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_tgs_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // Verify the requesting service's TGT.
+    let tgt_enc_part_plaintext =
+        decrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &req.tgt.enc_part)?;
+    let enc_ticket_part = decode_enc_ticket_part(&tgt_enc_part_plaintext)?;
+
+    // Verify the authenticator.
+    let auth_plaintext = decrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REQ_AUTHENTICATOR,
+        &req.authenticator_enc,
+    )?;
+    let authenticator = decode_authenticator(&auth_plaintext)?;
+    if !principal_names_eq(&authenticator.cname, &enc_ticket_part.cname) {
+        return Err(KdcError::PreauthFailed(
+            "S4U2Self: authenticator cname does not match TGT cname".into(),
+        ));
+    }
+
+    // Look up the requesting service.
+    let service = store
+        .lookup(&enc_ticket_part.crealm, &enc_ticket_part.cname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Self: service lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Self: service {}/{}",
+                enc_ticket_part.crealm,
+                enc_ticket_part.cname.join("/")
+            ))
+        })?;
+
+    // Validate TRUSTED_TO_AUTH_FOR_DELEGATION (ADR-087 §Decision).
+    if !service.trusted_to_auth_for_delegation {
+        return Err(KdcError::Policy(
+            "S4U2Self: service lacks TRUSTED_TO_AUTH_FOR_DELEGATION (ADR-087)".into(),
+        ));
+    }
+
+    // Look up the user specified in PA-FOR-USER.
+    let user = store
+        .lookup(&pa_for_user.user_realm, &pa_for_user.user_name)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Self: user lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Self: user {}/{}",
+                pa_for_user.user_realm,
+                pa_for_user.user_name.join("/")
+            ))
+        })?;
+
+    // Build the S4U2Self ticket: sname = the requesting service, cname = the user.
+    // The forwardable flag is set iff the service has allowed_to_delegate_to
+    // (Bronze Bit mitigation per CVE-2020-17049).
+    let now = now_secs();
+    let session_key = random_session_key()?;
+    let mut flags = TICKET_FLAG_RENEWABLE;
+    if !service.allowed_to_delegate_to.is_empty() {
+        flags |= TICKET_FLAG_FORWARDABLE;
+    }
+    let s4u_enc_ticket_part = EncTicketPart {
+        flags,
+        crealm: user.realm.clone(),
+        cname: user.components.clone(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        client_uuid: user.uuid,
+    };
+    let s4u_enc_ticket_part_bytes = encode_enc_ticket_part(&s4u_enc_ticket_part);
+    let s4u_ticket_enc = encrypt_for_usage(
+        &service.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &s4u_enc_ticket_part_bytes,
+    )?;
+    let s4u_ticket = Ticket {
+        tkt_vno: PVNO,
+        realm: service.realm.clone(),
+        sname: service.components.clone(),
+        kvno: service.kvno,
+        etype: chosen_etype,
+        enc_part: s4u_ticket_enc,
+    };
+
+    // Build the TGS-REP enc-part (encrypted with the TGT session key).
+    let enc_rep_part = EncKdcRepPart {
+        session_key,
+        last_req: now,
+        nonce: req.nonce,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        crealm: user.realm.clone(),
+        cname: user.components.clone(),
+    };
+    let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+    let enc_part = encrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REP_ENC_PART,
+        &enc_rep_part_bytes,
+    )?;
+
+    let rep = TgsRep {
+        pvno: PVNO,
+        msg_type: MSG_TYPE_TGS_REP,
+        crealm: user.realm.clone(),
+        cname: user.components.clone(),
+        ticket: s4u_ticket,
+        enc_part_etype: chosen_etype,
+        enc_part_kvno: req.tgt.kvno,
+        enc_part,
+    };
+    tracing::info!(
+        service = %format_spn(&service.realm, &service.components),
+        user = %format_spn(&user.realm, &user.components),
+        forwardable = !service.allowed_to_delegate_to.is_empty(),
+        "S4U2Self: issued ticket"
+    );
+    Ok(encode_tgs_rep(&rep))
+}
+
+/// S4U2Proxy handler (ADR-087 / MS-SFU §3.2). A service exchanges an
+/// S4U2Self evidence ticket for a TGS to a backend service, constrained by
+/// `msDS-AllowedToDelegateTo`. The KDC:
+///
+/// 1. Parses the TGS-REQ and decrypts the requesting service's TGT.
+/// 2. Verifies the authenticator.
+/// 3. Decrypts the evidence ticket (S4U2Self ticket) with the requesting
+///    service's key to recover the user's identity.
+/// 4. **Bronze Bit mitigation (CVE-2020-17049)**: validates the evidence
+///    ticket's `forwardable` flag. If not forwardable, rejects with
+///    `KdcError::Policy`.
+/// 5. Looks up the requesting service in the store.
+/// 6. Validates the requested SPN against `allowed_to_delegate_to` on the
+///    service (classic constrained delegation ACL per ADR-087).
+/// 7. Issues a TGS for the backend service with the **user's** identity
+///    in `cname`.
+pub async fn handle_tgs_req_s4u2proxy(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    evidence_ticket: &Ticket,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_tgs_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // Verify the requesting service's TGT.
+    let tgt_enc_part_plaintext =
+        decrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &req.tgt.enc_part)?;
+    let enc_ticket_part = decode_enc_ticket_part(&tgt_enc_part_plaintext)?;
+
+    // Verify the authenticator.
+    let auth_plaintext = decrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REQ_AUTHENTICATOR,
+        &req.authenticator_enc,
+    )?;
+    let authenticator = decode_authenticator(&auth_plaintext)?;
+    if !principal_names_eq(&authenticator.cname, &enc_ticket_part.cname) {
+        return Err(KdcError::PreauthFailed(
+            "S4U2Proxy: authenticator cname does not match TGT cname".into(),
+        ));
+    }
+
+    // Look up the requesting service.
+    let service = store
+        .lookup(&enc_ticket_part.crealm, &enc_ticket_part.cname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Proxy: service lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Proxy: service {}/{}",
+                enc_ticket_part.crealm,
+                enc_ticket_part.cname.join("/")
+            ))
+        })?;
+
+    // Decrypt the evidence ticket with the service's key (the evidence
+    // ticket was issued for this service in the S4U2Self step).
+    let evidence_pt = decrypt_for_usage(
+        &service.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &evidence_ticket.enc_part,
+    )?;
+    let evidence_etp = decode_enc_ticket_part(&evidence_pt)?;
+
+    // Bronze Bit mitigation (CVE-2020-17049): the evidence ticket MUST be
+    // forwardable. A non-forwardable S4U2Self ticket cannot be used for
+    // S4U2Proxy.
+    if evidence_etp.flags & TICKET_FLAG_FORWARDABLE == 0 {
+        return Err(KdcError::Policy(
+            "S4U2Proxy: evidence ticket lacks forwardable flag (Bronze Bit mitigation CVE-2020-17049)"
+                .into(),
+        ));
+    }
+
+    // ACL check: validate the requested SPN against allowed_to_delegate_to.
+    let target_spn = format_spn(&req.realm, &req.sname);
+    if !service.can_delegate_to(&target_spn) {
+        return Err(KdcError::Policy(format!(
+            "S4U2Proxy: service {}/{} is not allowed to delegate to {target_spn} (msDS-AllowedToDelegateTo per ADR-087)",
+            service.realm,
+            service.components.join("/")
+        )));
+    }
+
+    // Look up the backend service.
+    let backend = store
+        .lookup(&req.realm, &req.sname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Proxy: backend lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Proxy: backend {}/{}",
+                req.realm,
+                req.sname.join("/")
+            ))
+        })?;
+
+    // Issue the TGS for the backend service with the USER's identity (from
+    // the evidence ticket) in cname.
+    let now = now_secs();
+    let session_key = random_session_key()?;
+    let proxy_enc_ticket_part = EncTicketPart {
+        flags: evidence_etp.flags,
+        crealm: evidence_etp.crealm.clone(),
+        cname: evidence_etp.cname.clone(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        client_uuid: evidence_etp.client_uuid,
+    };
+    let proxy_enc_ticket_part_bytes = encode_enc_ticket_part(&proxy_enc_ticket_part);
+    let proxy_ticket_enc = encrypt_for_usage(
+        &backend.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &proxy_enc_ticket_part_bytes,
+    )?;
+    let proxy_ticket = Ticket {
+        tkt_vno: PVNO,
+        realm: backend.realm.clone(),
+        sname: backend.components.clone(),
+        kvno: backend.kvno,
+        etype: chosen_etype,
+        enc_part: proxy_ticket_enc,
+    };
+
+    let enc_rep_part = EncKdcRepPart {
+        session_key,
+        last_req: now,
+        nonce: req.nonce,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        crealm: evidence_etp.crealm.clone(),
+        cname: evidence_etp.cname.clone(),
+    };
+    let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+    let enc_part = encrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REP_ENC_PART,
+        &enc_rep_part_bytes,
+    )?;
+
+    let rep = TgsRep {
+        pvno: PVNO,
+        msg_type: MSG_TYPE_TGS_REP,
+        crealm: evidence_etp.crealm.clone(),
+        cname: evidence_etp.cname.clone(),
+        ticket: proxy_ticket,
+        enc_part_etype: chosen_etype,
+        enc_part_kvno: req.tgt.kvno,
+        enc_part,
+    };
+    tracing::info!(
+        service = %format_spn(&service.realm, &service.components),
+        backend = %format_spn(&backend.realm, &backend.components),
+        user = %format_spn(&evidence_etp.crealm, &evidence_etp.cname),
+        "S4U2Proxy: issued delegated ticket"
+    );
+    Ok(encode_tgs_rep(&rep))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3225,6 +3600,486 @@ mod tests {
         match err {
             KdcError::PrincipalNotFound(msg) => assert!(msg.contains("FOREIGN.COM"), "{msg}"),
             other => panic!("expected PrincipalNotFound, got {other:?}"),
+        }
+    }
+
+    // ---- Wave 4: S4U2Self + S4U2Proxy (ADR-087 / MS-SFU) ----
+
+    /// Build a service principal with `TRUSTED_TO_AUTH_FOR_DELEGATION` and
+    /// a configured `msDS-AllowedToDelegateTo` list.
+    fn make_delegating_service(
+        realm: &str,
+        sname: &str,
+        password: &str,
+        allowed_targets: Vec<String>,
+    ) -> PrincipalRecord {
+        let mut salt = Vec::new();
+        salt.extend_from_slice(realm.as_bytes());
+        salt.extend_from_slice(b"host");
+        salt.extend_from_slice(sname.as_bytes());
+        let key = crypto::derive_aes256_key(password.as_bytes(), &salt);
+        PrincipalRecord::new(
+            Uuid::nil(),
+            realm,
+            vec!["host".to_string(), sname.to_string()],
+            key,
+        )
+        .with_trusted_to_auth_for_delegation(true)
+        .with_allowed_to_delegate_to(allowed_targets)
+    }
+
+    /// DoD test 1: S4U2Self succeeds. A service with
+    /// `TRUSTED_TO_AUTH_FOR_DELEGATION` requests a ticket to itself on
+    /// behalf of a user. The KDC issues a ticket with the service's SPN
+    /// and the USER's identity in cname.
+    #[tokio::test]
+    async fn s4u2self_succeeds() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // The service presents ITS OWN TGT.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1001,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let rep_bytes = handle_tgs_req_s4u2self(&store, &krbtgt_key, &req_bytes, &pa_for_user)
+            .await
+            .expect("S4U2Self must succeed");
+        let rep = decode_tgs_rep(&rep_bytes).expect("decode TGS-REP");
+
+        // The ticket is for the requesting service (sname = web).
+        assert_eq!(rep.ticket.sname, web.components);
+        // The cname is the USER (alice), not the service.
+        assert_eq!(rep.cname, alice.components);
+        assert_eq!(rep.crealm, alice.realm);
+
+        // Decrypt the S4U2Self ticket with the service's key.
+        let svc_pt = decrypt_for_usage(&web.key, KEY_USAGE_TGS_REP_TICKET, &rep.ticket.enc_part)
+            .expect("decrypt S4U2Self ticket");
+        let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode EncTicketPart");
+        assert_eq!(svc_etp.cname, alice.components);
+        assert_eq!(svc_etp.crealm, alice.realm);
+        // The ticket is forwardable (service has allowed_to_delegate_to).
+        assert!(svc_etp.flags & TICKET_FLAG_FORWARDABLE != 0);
+    }
+
+    /// DoD test 2: S4U2Proxy succeeds. The service exchanges the S4U2Self
+    /// evidence ticket for a TGS to a backend service. The resulting ticket
+    /// carries the USER's identity (not the service's).
+    #[tokio::test]
+    async fn s4u2proxy_succeeds() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        let backend = make_svc_principal("EXAMPLE.COM", "backend.example.com", "backend-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(backend.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self — get an evidence ticket.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 2001,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep_bytes = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self must succeed");
+        let s4u_self_rep = decode_tgs_rep(&s4u_self_rep_bytes).expect("decode S4U2Self REP");
+        let evidence_ticket = s4u_self_rep.ticket.clone();
+
+        // Step 2: S4U2Proxy — exchange the evidence ticket for a TGS to the backend.
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: backend.realm.clone(),
+            sname: backend.components.clone(),
+            nonce: 2002,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let proxy_rep_bytes = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect("S4U2Proxy must succeed");
+        let proxy_rep = decode_tgs_rep(&proxy_rep_bytes).expect("decode S4U2Proxy REP");
+
+        // The ticket is for the backend service.
+        assert_eq!(proxy_rep.ticket.sname, backend.components);
+        // The cname is the USER (alice), not the service (web).
+        assert_eq!(proxy_rep.cname, alice.components);
+        assert_eq!(proxy_rep.crealm, alice.realm);
+
+        // Decrypt the proxy ticket with the backend's key.
+        let backend_pt = decrypt_for_usage(
+            &backend.key,
+            KEY_USAGE_TGS_REP_TICKET,
+            &proxy_rep.ticket.enc_part,
+        )
+        .expect("decrypt proxy ticket");
+        let backend_etp = decode_enc_ticket_part(&backend_pt).expect("decode EncTicketPart");
+        assert_eq!(backend_etp.cname, alice.components);
+        assert_eq!(backend_etp.crealm, alice.realm);
+    }
+
+    /// DoD test 3: delegation not allowed. The service requests S4U2Proxy
+    /// to a backend SPN that is NOT in `msDS-AllowedToDelegateTo`. The KDC
+    /// rejects with `KdcError::Policy`.
+    #[tokio::test]
+    async fn s4u2proxy_delegation_not_allowed() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        let rogue = make_svc_principal("EXAMPLE.COM", "rogue.example.com", "rogue-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(rogue.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self to get evidence ticket.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self");
+        let evidence_ticket = decode_tgs_rep(&s4u_self_rep).expect("decode").ticket;
+
+        // Step 2: S4U2Proxy to rogue.example.com (NOT in allowed_to_delegate_to).
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: rogue.realm.clone(),
+            sname: rogue.components.clone(),
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let err = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect_err("S4U2Proxy to rogue SPN must be rejected");
+        match err {
+            KdcError::Policy(msg) => assert!(msg.contains("rogue.example.com"), "{msg}"),
+            other => panic!("expected Policy error, got {other:?}"),
+        }
+    }
+
+    /// DoD test 4: evidence ticket tampered. The service presents a tampered
+    /// evidence ticket (HMAC verification fails). The KDC rejects.
+    #[tokio::test]
+    async fn s4u2proxy_evidence_ticket_tampered() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        let backend = make_svc_principal("EXAMPLE.COM", "backend.example.com", "backend-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(backend.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self to get evidence ticket.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self");
+        let mut evidence_ticket = decode_tgs_rep(&s4u_self_rep).expect("decode").ticket;
+        // Tamper with the evidence ticket's enc_part.
+        evidence_ticket.enc_part[0] ^= 0xFF;
+
+        // Step 2: S4U2Proxy with tampered evidence ticket.
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: backend.realm.clone(),
+            sname: backend.components.clone(),
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let err = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect_err("tampered evidence ticket must be rejected");
+        assert!(matches!(err, KdcError::PreauthFailed(_)));
+    }
+
+    /// DoD test 5: cross-protocol attack rejected (Bronze Bit mitigation,
+    /// CVE-2020-17049). A non-forwardable S4U2Self ticket cannot be used
+    /// for S4U2Proxy. The service has an empty `allowed_to_delegate_to`,
+    /// so the S4U2Self ticket is non-forwardable; S4U2Proxy must reject it.
+    #[tokio::test]
+    async fn s4u2proxy_bronze_bit_non_forwardable_rejected() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        // Service with TRUSTED_TO_AUTH_FOR_DELEGATION but EMPTY
+        // allowed_to_delegate_to — S4U2Self succeeds but the ticket is
+        // non-forwardable.
+        let web = make_delegating_service("EXAMPLE.COM", "web.example.com", "svc-pass", vec![]);
+        let backend = make_svc_principal("EXAMPLE.COM", "backend.example.com", "backend-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(backend.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self — ticket is non-forwardable (empty allowed_to_delegate_to).
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep_bytes = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self");
+        let s4u_self_rep = decode_tgs_rep(&s4u_self_rep_bytes).expect("decode");
+        let evidence_ticket = s4u_self_rep.ticket.clone();
+
+        // Verify the evidence ticket is non-forwardable.
+        let svc_pt = decrypt_for_usage(
+            &web.key,
+            KEY_USAGE_TGS_REP_TICKET,
+            &evidence_ticket.enc_part,
+        )
+        .expect("decrypt");
+        let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode");
+        assert!(
+            svc_etp.flags & TICKET_FLAG_FORWARDABLE == 0,
+            "evidence ticket MUST be non-forwardable when allowed_to_delegate_to is empty"
+        );
+
+        // Step 2: S4U2Proxy — must reject (Bronze Bit mitigation).
+        // We temporarily add the backend to the service's allowed list by
+        // re-inserting the service with the backend SPN. This isolates the
+        // test to the Bronze Bit check (not the ACL check).
+        let web_with_acl = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        store.insert(web_with_acl);
+
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: backend.realm.clone(),
+            sname: backend.components.clone(),
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let err = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect_err("non-forwardable evidence ticket must be rejected (Bronze Bit)");
+        match err {
+            KdcError::Policy(msg) => assert!(msg.contains("forwardable"), "{msg}"),
+            other => panic!("expected Policy(forwardable), got {other:?}"),
+        }
+    }
+
+    /// PA-FOR-USER encode/decode round-trip.
+    #[test]
+    fn pa_for_user_encode_decode_round_trip() {
+        let p = PaForUser {
+            user_name: vec!["alice".to_string()],
+            user_realm: "EXAMPLE.COM".into(),
+        };
+        let bytes = encode_pa_for_user(&p);
+        let decoded = decode_pa_for_user(&bytes).expect("decode");
+        assert_eq!(decoded, p);
+
+        let p2 = PaForUser {
+            user_name: vec!["svc".to_string(), "web".to_string()],
+            user_realm: "ADRIAN.COM".into(),
+        };
+        let bytes2 = encode_pa_for_user(&p2);
+        let decoded2 = decode_pa_for_user(&bytes2).expect("decode");
+        assert_eq!(decoded2, p2);
+    }
+
+    /// S4U2Self without TRUSTED_TO_AUTH_FOR_DELEGATION is rejected.
+    #[tokio::test]
+    async fn s4u2self_without_trusted_to_auth_rejected() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        // web does NOT have trusted_to_auth_for_delegation.
+        let web = make_svc_principal("EXAMPLE.COM", "web.example.com", "svc-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let err = handle_tgs_req_s4u2self(&store, &krbtgt_key, &encode_tgs_req(&req), &pa_for_user)
+            .await
+            .expect_err("S4U2Self without TRUSTED_TO_AUTH_FOR_DELEGATION must be rejected");
+        match err {
+            KdcError::Policy(msg) => {
+                assert!(msg.contains("TRUSTED_TO_AUTH_FOR_DELEGATION"), "{msg}")
+            }
+            other => panic!("expected Policy error, got {other:?}"),
         }
     }
 

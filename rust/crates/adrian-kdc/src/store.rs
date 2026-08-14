@@ -32,10 +32,22 @@ pub struct PrincipalRecord {
     pub key: Aes256Key,
     /// Key version number (kvno) — bumped on every password reset.
     pub kvno: u32,
+    /// UAC `TRUSTED_TO_AUTH_FOR_DELEGATION` bit (0x100000) per ADR-087.
+    /// Required for S4U2Self — a service with this flag can request a
+    /// ticket to itself on behalf of any user.
+    pub trusted_to_auth_for_delegation: bool,
+    /// `msDS-AllowedToDelegateTo` SPN list per ADR-087 (classic constrained
+    /// delegation). The service can S4U2Proxy to any SPN in this list.
+    /// Empty = no constrained delegation allowed.
+    pub allowed_to_delegate_to: Vec<String>,
 }
 
 impl PrincipalRecord {
-    /// Construct a principal with the given key, kvno=1.
+    /// Construct a principal with the given key, kvno=1, and default
+    /// delegation fields (`trusted_to_auth_for_delegation = false`,
+    /// `allowed_to_delegate_to = empty`). Use the builder methods
+    /// [`with_trusted_to_auth_for_delegation`] and
+    /// [`with_allowed_to_delegate_to`] to set the delegation fields.
     pub fn new(
         uuid: Uuid,
         realm: impl Into<String>,
@@ -48,7 +60,24 @@ impl PrincipalRecord {
             components,
             key,
             kvno: 1,
+            trusted_to_auth_for_delegation: false,
+            allowed_to_delegate_to: Vec::new(),
         }
+    }
+
+    /// Builder: set the `TRUSTED_TO_AUTH_FOR_DELEGATION` UAC bit (ADR-087).
+    /// Required for S4U2Self.
+    pub fn with_trusted_to_auth_for_delegation(mut self, trusted: bool) -> Self {
+        self.trusted_to_auth_for_delegation = trusted;
+        self
+    }
+
+    /// Builder: set the `msDS-AllowedToDelegateTo` SPN list (ADR-087 classic
+    /// constrained delegation). The service can S4U2Proxy to any SPN in
+    /// this list.
+    pub fn with_allowed_to_delegate_to(mut self, targets: Vec<String>) -> Self {
+        self.allowed_to_delegate_to = targets;
+        self
     }
 
     /// The Kerberos salt for this principal per RFC 3962 §4:
@@ -67,6 +96,15 @@ impl PrincipalRecord {
         self.components.len() == 2
             && self.components[0].eq_ignore_ascii_case("krbtgt")
             && self.components[1].eq_ignore_ascii_case(&self.realm)
+    }
+
+    /// True iff this principal is allowed to S4U2Proxy to the given target
+    /// SPN (case-insensitive match against `allowed_to_delegate_to`).
+    /// Per ADR-087 §Decision (classic constrained delegation).
+    pub fn can_delegate_to(&self, target_spn: &str) -> bool {
+        self.allowed_to_delegate_to
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(target_spn))
     }
 }
 
