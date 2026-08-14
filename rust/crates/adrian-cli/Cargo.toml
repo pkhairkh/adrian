@@ -38,7 +38,10 @@ tracing-subscriber.workspace = true
 # issues real certs, and mounts real SMB shares. `tempfile` provides
 # per-test temp directories for the ccache + cert outputs.
 # `async-trait` is used by the MockAuthModule impl in tests.
+# Wave 4 adds `assert_cmd` for end-to-end CLI integration tests that
+# invoke the `adrian` binary as a subprocess (per T-403 / T-404).
 adrian-smb-server = { path = "../adrian-smb-server" }
 async-trait.workspace = true
 uuid.workspace = true
 tempfile = "3"
+assert_cmd = "2"
