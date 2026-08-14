@@ -18,7 +18,15 @@ adrian-auth-core = { path = "../adrian-auth-core" }
 adrian-storage-core = { path = "../adrian-storage-core" }
 adrian-identity-core = { path = "../adrian-identity-core" }
 adrian-policy-core = { path = "../adrian-policy-core" }
+adrian-policy-executor = { path = "../adrian-policy-executor" }
 adrian-smb-client = { path = "../adrian-smb-client" }
+adrian-smb-core = { path = "../adrian-smb-core" }
+adrian-smb-server = { path = "../adrian-smb-server", optional = true }
+adrian-directory-service = { path = "../adrian-directory-service" }
+adrian-storage-testkit = { path = "../adrian-storage-testkit", optional = true }
+adrian-repl-testkit = { path = "../adrian-repl-testkit", optional = true }
+adrian-identity-testkit = { path = "../adrian-identity-testkit", optional = true }
+adrian-ca = { path = "../adrian-ca" }
 # adrian-kdc is wired by `KerberosAuthModule::with_kdc` (Wave 3c, ADR-108).
 # The SDK drives an AS-REQ via `adrian_kdc::handlers::handle_as_req` when the
 # caller injects a `PrincipalStore` + krbtgt key.
@@ -32,3 +40,26 @@ serde_json.workspace = true
 ldap3.workspace = true
 rustls.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# In-workspace testkits used by Wave 1 wiring tests:
+# - `adrian-storage-testkit` / `adrian-repl-testkit` / `adrian-identity-testkit`
+#   back an in-process `Dsa` (LDAP server) so `LdapDirectoryModule::with_url`
+#   tests exercise a real LDAP round-trip without external infrastructure.
+# - `adrian-smb-server` provides an in-process SMB server used by
+#   `SmbFileModule::with_smb_addr` tests over `tokio::io::duplex`.
+# - `rasn` + `rasn-pkix` + `ring` are used to generate a real ECDSA-P256
+#   PKCS#10 CSR in the AcmeCertModule success test (mirrors the helper
+#   used by `adrian-ca`'s own tests).
+adrian-storage-testkit = { path = "../adrian-storage-testkit" }
+adrian-repl-testkit = { path = "../adrian-repl-testkit" }
+adrian-identity-testkit = { path = "../adrian-identity-testkit" }
+adrian-smb-server = { path = "../adrian-smb-server" }
+adrian-directory-service = { path = "../adrian-directory-service" }
+adrian-schema-traits = { path = "../adrian-schema-traits" }
+adrian-storage-core = { path = "../adrian-storage-core" }
+rasn.workspace = true
+rasn-pkix.workspace = true
+ring.workspace = true
+bitvec = "1"
+tokio = { workspace = true, features = ["test-util", "io-util", "net", "rt-multi-thread", "macros"] }
