@@ -22,6 +22,8 @@
 //! - [`EchoRequest`] / [`EchoResponse`] — command 0x000d (§2.2.28/29)
 //! - [`PreauthHash`] — SHA-512 pre-auth integrity hash (§3.2.5.1)
 //! - [`TransformHeader`] — SMB 3.1.1 transform header for encrypted PDUs (§2.2.41)
+//! - [`SmbEncryptionKey`] — AES-256-GCM session encryption key (§3.2.5.2)
+//! - [`encrypt_pdu`] / [`decrypt_pdu`] — AEAD encrypt/decrypt of SMB2 PDUs (§3.2.4.3)
 //!
 //! ## ADRs
 //!
@@ -30,6 +32,7 @@
 //! - ADR-106: SMB client with persistent handles (SDK FileModule)
 
 use thiserror::Error;
+use zeroize::Zeroize;
 
 // ============================================================================
 // Errors
@@ -92,6 +95,12 @@ pub mod ntstatus {
     pub const STATUS_BAD_NETWORK_NAME: u32 = 0xC000_00CC;
     /// `0xC0000128` — `STATUS_FILE_CLOSED` (file handle unknown).
     pub const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
+    /// `0x00000103` — `STATUS_PENDING` (async command in progress, e.g. CHANGE_NOTIFY).
+    pub const STATUS_PENDING: u32 = 0x0000_0103;
+    /// `0xC0000023` — `STATUS_FILE_LOCK_CONFLICT` (oplock break conflict).
+    pub const STATUS_FILE_LOCK_CONFLICT: u32 = 0xC000_0023;
+    /// `0xC00000A2` — `STATUS_NOTIFY_ENUM_DIR` (change-notify buffer overflow).
+    pub const STATUS_NOTIFY_ENUM_DIR: u32 = 0xC000_00A2;
 }
 
 // ============================================================================
@@ -138,6 +147,10 @@ pub mod command {
     pub const WRITE: u16 = 0x0009;
     /// `0x000D` — ECHO.
     pub const ECHO: u16 = 0x000D;
+    /// `0x000F` — CHANGE_NOTIFY (MS-SMB2 §2.2.35).
+    pub const CHANGE_NOTIFY: u16 = 0x000F;
+    /// `0x0012` — OPLOCK_BREAK (MS-SMB2 §2.2.23 / §2.2.24).
+    pub const OPLOCK_BREAK: u16 = 0x0012;
     /// `0x00F2` — TRANSFORM (encrypted PDU).
     pub const TRANSFORM: u16 = 0x00F2;
 }
@@ -316,6 +329,10 @@ pub enum Command {
     Write = 0x0009,
     /// `0x000D` — ECHO.
     Echo = 0x000d,
+    /// `0x000F` — CHANGE_NOTIFY.
+    ChangeNotify = 0x000F,
+    /// `0x0012` — OPLOCK_BREAK.
+    OplockBreak = 0x0012,
     /// `0x00F2` — TRANSFORM (encrypted PDU).
     Transform = 0x00F2,
 }
@@ -341,6 +358,8 @@ impl Command {
             0x0008 => Some(Command::Read),
             0x0009 => Some(Command::Write),
             0x000D => Some(Command::Echo),
+            0x000F => Some(Command::ChangeNotify),
+            0x0012 => Some(Command::OplockBreak),
             0x00F2 => Some(Command::Transform),
             _ => None,
         }
@@ -520,6 +539,13 @@ impl Writer {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Mutably borrow the bytes written so far (used for in-place patching
+    /// of length / offset fields by create-context and change-notify encoders).
+    #[must_use]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
 
     /// Current write position (= length).
@@ -1114,15 +1140,17 @@ pub struct NegotiateResponse {
 impl NegotiateResponse {
     /// Build a default SMB 3.1.1 negotiate response with SHA-512 preauth
     /// integrity and AES-256-GCM encryption (the framework default per
-    /// ADR-105 §3-4). Plaintext sessions are still allowed — the server
-    /// does not set `SMB2_GLOBAL_CAP_ENCRYPTION` (encryption is opt-in
-    /// per-session, not mandated).
+    /// ADR-105 §3-4). The server advertises the
+    /// `SMB2_GLOBAL_CAP_ENCRYPTION` capability (T-105) so that clients
+    /// know to encrypt PDUs on this session. Plaintext sessions are
+    /// still tolerated when the client does not request encryption —
+    /// the flag is an advertisement, not a mandate.
     #[must_use]
     pub fn new_311(server_guid: uuid::Uuid, server_salt: &[u8]) -> Self {
         Self {
             security_mode: security_mode::SIGNING_ENABLED,
             dialect_revision: dialect_code::SMB311,
-            capabilities: capabilities::LARGE_MTU,
+            capabilities: capabilities::LARGE_MTU | capabilities::ENCRYPTION,
             server_guid,
             max_transact_size: MAX_SMB2_MESSAGE_SIZE,
             max_read_size: MAX_SMB2_MESSAGE_SIZE,
@@ -1723,6 +1751,34 @@ impl CreateRequest {
             create_options,
             name,
         })
+    }
+
+    /// Parse the create contexts from the wire buffer (Wave 3). The
+    /// base [`CreateRequest::decode`] only consumes the fixed fields
+    /// and the name; this helper re-reads the CreateContextsOffset /
+    /// CreateContextsLength fields and decodes the contexts. Returns
+    /// an empty vec when no contexts are present (the common case).
+    pub fn parse_create_contexts(
+        buf: &[u8],
+        header_size: usize,
+    ) -> Result<Vec<CreateContext>, SmbError> {
+        if buf.len() < header_size + 56 {
+            return Ok(Vec::new());
+        }
+        let ctx_offset = u32::from_le_bytes(
+            buf[header_size + 48..header_size + 52]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize;
+        let ctx_length = u32::from_le_bytes(
+            buf[header_size + 52..header_size + 56]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize;
+        if ctx_length == 0 || ctx_offset == 0 {
+            return Ok(Vec::new());
+        }
+        CreateContext::decode_all(buf, ctx_offset, ctx_length)
     }
 }
 
@@ -2428,6 +2484,632 @@ impl EchoResponse {
 }
 
 // ============================================================================
+// Wave 3: Create contexts, durable handles, change notify, oplock break
+// (MS-SMB2 §2.2.13 / §2.2.14 / §2.2.23 / §2.2.24 / §2.2.31 / §2.2.35)
+// ============================================================================
+
+/// Oplock level values per MS-SMB2 §2.2.13.1.
+pub mod oplock_level {
+    /// `0x00` — no oplock granted.
+    pub const NONE: u8 = 0x00;
+    /// `0x01` — Level II oplock (shared read, no caching).
+    pub const LEVEL_2: u8 = 0x01;
+    /// `0x08` — Batch oplock (exclusive, full caching).
+    pub const BATCH: u8 = 0x08;
+    /// `0x09` — Level II + Batch combined (used by some clients).
+    pub const LEVEL_2_OR_BATCH: u8 = 0x09;
+}
+
+/// Change-notify filter bits per MS-SMB2 §2.2.35 (FILE_NOTIFY_CHANGE_*).
+pub mod notify_filter {
+    /// `0x00000001` — file name changed.
+    pub const FILE_NAME: u32 = 0x0000_0001;
+    /// `0x00000002` — directory name changed.
+    pub const DIR_NAME: u32 = 0x0000_0002;
+    /// `0x00000004` — file attributes changed.
+    pub const ATTRIBUTES: u32 = 0x0000_0004;
+    /// `0x00000008` — file size changed.
+    pub const SIZE: u32 = 0x0000_0008;
+    /// `0x00000010` — last-write time changed.
+    pub const LAST_WRITE: u32 = 0x0000_0010;
+    /// `0x00000020` — last-access time changed.
+    pub const LAST_ACCESS: u32 = 0x0000_0020;
+    /// `0x00000040` — creation time changed.
+    pub const CREATION: u32 = 0x0000_0040;
+    /// `0x00000080` — security descriptor changed.
+    pub const SECURITY: u32 = 0x0000_0080;
+}
+
+/// File-notify action codes per MS-SMB2 §2.2.35 (FILE_ACTION_*).
+pub mod file_action {
+    /// `0x00000001` — file added.
+    pub const ADDED: u32 = 0x0000_0001;
+    /// `0x00000002` — file removed.
+    pub const REMOVED: u32 = 0x0000_0002;
+    /// `0x00000003` — file modified.
+    pub const MODIFIED: u32 = 0x0000_0003;
+    /// `0x00000004` — file renamed (old name).
+    pub const RENAMED_OLD_NAME: u32 = 0x0000_0004;
+    /// `0x00000005` — file renamed (new name).
+    pub const RENAMED_NEW_NAME: u32 = 0x0000_0005;
+}
+
+/// A single SMB2 create-context entry (MS-SMB2 §2.2.13.2 / §2.2.14.2).
+///
+/// The wire layout is:
+///   - `NextContextOffset: u32` (0 = last)
+///   - `NameOffset: u16` (typically 16)
+///   - `NameLength: u16` (typically 4 — "DHQ2", "DHC2", "DHN2", etc.)
+///   - `Reserved: u32`
+///   - `DataOffset: u16` (0 if no data)
+///   - `DataLength: u32`
+///   - `Buffer: [Name (4 bytes) | Data]`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateContext {
+    /// The 4-byte create-context name (e.g. `b"DHQ2"`).
+    pub name: [u8; 4],
+    /// The create-context data payload (interpretation depends on the name).
+    pub data: Vec<u8>,
+}
+
+impl CreateContext {
+    /// Durable-handle request V2 name: `b"DHQ2"` (MS-SMB2 §2.2.31.2).
+    pub const NAME_DURABLE_HANDLE_REQUEST_V2: [u8; 4] = *b"DHQ2";
+    /// Durable-handle response V2 name: `b"DHC2"` (MS-SMB2 §2.2.31.4).
+    pub const NAME_DURABLE_HANDLE_RESPONSE_V2: [u8; 4] = *b"DHC2";
+    /// Durable-handle reconnect V2 name: `b"DHN2"` (MS-SMB2 §2.2.31.6).
+    pub const NAME_DURABLE_HANDLE_RECONNECT_V2: [u8; 4] = *b"DHN2";
+
+    /// Build a DURABLE_HANDLE_REQUEST_V2 create context. The data
+    /// layout per §2.2.31.2 is `DurableFlags(u32) || Reserved(u32) ||
+    /// CreateGuid(16 bytes) || Flags(u32)` = 28 bytes.
+    #[must_use]
+    pub fn durable_handle_request_v2(
+        durable_flags: u32,
+        create_guid: uuid::Uuid,
+        flags: u32,
+    ) -> Self {
+        let mut data = Vec::with_capacity(28);
+        data.extend_from_slice(&durable_flags.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        data.extend_from_slice(create_guid.as_bytes());
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self {
+            name: Self::NAME_DURABLE_HANDLE_REQUEST_V2,
+            data,
+        }
+    }
+
+    /// Build a DURABLE_HANDLE_RESPONSE_V2 create context. The data
+    /// layout per §2.2.31.4 is `Flags(u32)` = 4 bytes.
+    #[must_use]
+    pub fn durable_handle_response_v2(flags: u32) -> Self {
+        let mut data = Vec::with_capacity(4);
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self {
+            name: Self::NAME_DURABLE_HANDLE_RESPONSE_V2,
+            data,
+        }
+    }
+
+    /// Build a DURABLE_HANDLE_RECONNECT_V2 create context. The data
+    /// layout per §2.2.31.6 is `FileId(16 bytes) || CreateGuid(16 bytes)
+    /// || Flags(u32)` = 36 bytes. The 16-byte FileId here is the
+    /// PersistentFileId widened with the VolatileFileId (passed as a
+    /// full [`FileId`] so the server can match both halves on reclaim).
+    #[must_use]
+    pub fn durable_handle_reconnect_v2(
+        file_id: FileId,
+        create_guid: uuid::Uuid,
+        flags: u32,
+    ) -> Self {
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&file_id.persistent.to_le_bytes());
+        data.extend_from_slice(&file_id.volatile_.to_le_bytes());
+        data.extend_from_slice(create_guid.as_bytes());
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self {
+            name: Self::NAME_DURABLE_HANDLE_RECONNECT_V2,
+            data,
+        }
+    }
+
+    /// Parse the data of a DURABLE_HANDLE_REQUEST_V2 context into
+    /// `(durable_flags, create_guid, flags)`. Returns `None` on
+    /// malformed data.
+    #[must_use]
+    pub fn parse_durable_handle_request_v2(&self) -> Option<(u32, uuid::Uuid, u32)> {
+        if self.name != Self::NAME_DURABLE_HANDLE_REQUEST_V2 || self.data.len() < 28 {
+            return None;
+        }
+        let durable_flags = u32::from_le_bytes(self.data[0..4].try_into().ok()?);
+        // Reserved at [4..8]
+        let guid_bytes: [u8; 16] = self.data[8..24].try_into().ok()?;
+        let create_guid = uuid::Uuid::from_bytes(guid_bytes);
+        let flags = u32::from_le_bytes(self.data[24..28].try_into().ok()?);
+        Some((durable_flags, create_guid, flags))
+    }
+
+    /// Parse the data of a DURABLE_HANDLE_RESPONSE_V2 context into
+    /// `flags`. Returns `None` on malformed data.
+    #[must_use]
+    pub fn parse_durable_handle_response_v2(&self) -> Option<u32> {
+        if self.name != Self::NAME_DURABLE_HANDLE_RESPONSE_V2 || self.data.len() < 4 {
+            return None;
+        }
+        Some(u32::from_le_bytes(self.data[0..4].try_into().ok()?))
+    }
+
+    /// Parse the data of a DURABLE_HANDLE_RECONNECT_V2 context into
+    /// `(file_id, create_guid, flags)`. Returns `None` on malformed data.
+    #[must_use]
+    pub fn parse_durable_handle_reconnect_v2(&self) -> Option<(FileId, uuid::Uuid, u32)> {
+        if self.name != Self::NAME_DURABLE_HANDLE_RECONNECT_V2 || self.data.len() < 36 {
+            return None;
+        }
+        let persistent = u64::from_le_bytes(self.data[0..8].try_into().ok()?);
+        let volatile_ = u64::from_le_bytes(self.data[8..16].try_into().ok()?);
+        let guid_bytes: [u8; 16] = self.data[16..32].try_into().ok()?;
+        let create_guid = uuid::Uuid::from_bytes(guid_bytes);
+        let flags = u32::from_le_bytes(self.data[32..36].try_into().ok()?);
+        Some((FileId::new(persistent, volatile_), create_guid, flags))
+    }
+
+    /// Encode a sequence of create contexts into `out`. The fixed
+    /// header is 18 bytes per context (4+2+2+4+2+4); the name is 4
+    /// bytes; the data follows. Each context is 8-byte aligned.
+    pub fn encode_all(ctxs: &[CreateContext], out: &mut Writer) -> (u32, u32) {
+        if ctxs.is_empty() {
+            return (0, 0);
+        }
+        let start = out.position();
+        for (i, ctx) in ctxs.iter().enumerate() {
+            let ctx_start = out.position();
+            // NextContextOffset: filled in after we know the next context's start.
+            // For now, write 0; we'll patch if there's a next context.
+            out.write_u32(0);
+            out.write_u16(18); // NameOffset (immediately after the 18-byte fixed header)
+            out.write_u16(4); // NameLength
+            out.write_u32(0); // Reserved
+                              // DataOffset: 18 + 4 (name) = 22, but 8-byte aligned = 24.
+            let data_offset = if ctx.data.is_empty() { 0u16 } else { 24u16 };
+            out.write_u16(data_offset);
+            out.write_u32(ctx.data.len() as u32);
+            // Name (4 bytes).
+            out.write_bytes(&ctx.name);
+            // Pad to 8-byte alignment before data.
+            out.align(8);
+            // Data.
+            out.write_bytes(&ctx.data);
+            // Pad to 8-byte alignment for the next context.
+            out.align(8);
+            // Patch NextContextOffset if there's a next context.
+            if i + 1 < ctxs.len() {
+                let next_offset = (out.position() - ctx_start) as u32;
+                let next_ctx_pos = out.position();
+                // Write the NextContextOffset field (bytes 0..4 of this context).
+                let patch_pos = ctx_start;
+                out.as_bytes_mut()[patch_pos..patch_pos + 4]
+                    .copy_from_slice(&next_offset.to_le_bytes());
+                let _ = next_ctx_pos; // suppress unused warning
+            }
+        }
+        let end = out.position();
+        let total_len = (end - start) as u32;
+        (start as u32, total_len)
+    }
+
+    /// Decode a sequence of create contexts from `buf` starting at
+    /// `offset` for `length` bytes.
+    pub fn decode_all(
+        buf: &[u8],
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<CreateContext>, SmbError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if offset + length > buf.len() {
+            return Err(SmbError::Malformed(format!(
+                "create contexts truncated: offset={offset} length={length} buf_len={}",
+                buf.len()
+            )));
+        }
+        let mut out = Vec::new();
+        let mut pos = offset;
+        let end = offset + length;
+        while pos + 16 <= end {
+            let next_offset =
+                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+            let name_offset =
+                u16::from_le_bytes(buf[pos + 4..pos + 6].try_into().unwrap_or([0; 2])) as usize;
+            let name_length =
+                u16::from_le_bytes(buf[pos + 6..pos + 8].try_into().unwrap_or([0; 2])) as usize;
+            let _reserved = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap_or([0; 4]));
+            let data_offset =
+                u16::from_le_bytes(buf[pos + 12..pos + 14].try_into().unwrap_or([0; 2])) as usize;
+            let data_length =
+                u32::from_le_bytes(buf[pos + 14..pos + 18].try_into().unwrap_or([0; 4])) as usize;
+            // Read name (4 bytes — we only support the 4-byte variant).
+            if name_length != 4 {
+                return Err(SmbError::Malformed(format!(
+                    "unsupported create-context NameLength: {name_length} (only 4 supported)"
+                )));
+            }
+            let name_pos = pos + name_offset;
+            if name_pos + 4 > buf.len() {
+                return Err(SmbError::Malformed("create-context name truncated".into()));
+            }
+            let mut name = [0u8; 4];
+            name.copy_from_slice(&buf[name_pos..name_pos + 4]);
+            // Read data (if any).
+            let data = if data_length == 0 {
+                Vec::new()
+            } else {
+                let data_pos = pos + data_offset;
+                if data_pos + data_length > buf.len() {
+                    return Err(SmbError::Malformed("create-context data truncated".into()));
+                }
+                buf[data_pos..data_pos + data_length].to_vec()
+            };
+            out.push(CreateContext { name, data });
+            // Advance to next context.
+            if next_offset == 0 {
+                break;
+            }
+            pos += next_offset;
+        }
+        Ok(out)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// SMB2 CHANGE_NOTIFY request / response — §2.2.35
+// ----------------------------------------------------------------------------
+
+/// SMB2 CHANGE_NOTIFY request (command 0x000F). MS-SMB2 §2.2.35.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeNotifyRequest {
+    /// FileId of the directory to watch.
+    pub file_id: FileId,
+    /// Filter (combination of [`notify_filter`] bits).
+    pub filter: u32,
+    /// WatchTree (true = recursively watch all subdirectories).
+    pub watch_tree: bool,
+}
+
+impl ChangeNotifyRequest {
+    /// Build a CHANGE_NOTIFY request for `file_id` with the given filter.
+    #[must_use]
+    pub fn new(file_id: FileId, filter: u32, watch_tree: bool) -> Self {
+        Self {
+            file_id,
+            filter,
+            watch_tree,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(32); // StructureSize
+        out.write_u16(0); // Flags (bit 0 = WatchTree)
+        out.write_u32(self.filter);
+        out.write_file_id(&self.file_id);
+        // ChangesBufferOffset (always 0 for a request).
+        out.write_u32(0);
+        // ChangesBufferLength (always 0 for a request).
+        out.write_u32(0);
+    }
+
+    /// Encode the full SMB2 CHANGE_NOTIFY request.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 32);
+        let mut hdr = Smb2Header::new_request(command::CHANGE_NOTIFY, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 24 {
+            return Err(SmbError::Malformed(
+                "change notify request too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 32 {
+            return Err(SmbError::Malformed(format!(
+                "change notify request StructureSize {structure_size} != 32"
+            )));
+        }
+        let flags = r.read_u16()?;
+        let filter = r.read_u32()?;
+        let file_id = r.read_file_id()?;
+        let _buf_offset = r.read_u32()?;
+        let _buf_length = r.read_u32()?;
+        Ok(Self {
+            file_id,
+            filter,
+            watch_tree: flags & 0x0001 != 0,
+        })
+    }
+}
+
+/// A single FILE_NOTIFY_INFORMATION entry inside a CHANGE_NOTIFY response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileNotifyInformation {
+    /// NextEntryOffset (0 = last entry).
+    pub next_entry_offset: u32,
+    /// Action (one of [`file_action`] constants).
+    pub action: u32,
+    /// File name (UTF-16LE; relative to the watched directory).
+    pub file_name: String,
+}
+
+/// SMB2 CHANGE_NOTIFY response (command 0x000F). MS-SMB2 §2.2.35.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ChangeNotifyResponse {
+    /// The change events.
+    pub changes: Vec<FileNotifyInformation>,
+}
+
+impl ChangeNotifyResponse {
+    /// Build an empty CHANGE_NOTIFY response (no changes).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a CHANGE_NOTIFY response with one change event.
+    #[must_use]
+    pub fn with_change(action: u32, file_name: impl Into<String>) -> Self {
+        Self {
+            changes: vec![FileNotifyInformation {
+                next_entry_offset: 0,
+                action,
+                file_name: file_name.into(),
+            }],
+        }
+    }
+
+    /// Encode the body. Returns the buffer-offset of the changes.
+    pub fn encode_body(&self, out: &mut Writer, header_size: usize) -> u32 {
+        out.write_u16(9); // StructureSize
+        out.write_u16(0); // Reserved
+                          // ChangesBufferOffset: header + 8 (fixed structure) — but must be 8-byte aligned.
+        let buf_offset = (header_size + 8) as u32;
+        out.write_u32(buf_offset);
+        // Pre-encode the changes to compute the length.
+        let mut changes_buf = Writer::new();
+        let n = self.changes.len();
+        for (i, change) in self.changes.iter().enumerate() {
+            let entry_start = changes_buf.position();
+            // NextEntryOffset — patch later if there's a next entry.
+            changes_buf.write_u32(0);
+            changes_buf.write_u32(change.action);
+            let name_utf16 = encode_utf16le(&change.file_name);
+            changes_buf.write_u32(name_utf16.len() as u32);
+            changes_buf.write_bytes(&name_utf16);
+            // Align to 4 bytes (per FILE_NOTIFY_INFORMATION layout).
+            changes_buf.align(4);
+            if i + 1 < n {
+                let next_offset = (changes_buf.position() - entry_start) as u32;
+                let patch_pos = entry_start;
+                changes_buf.as_bytes_mut()[patch_pos..patch_pos + 4]
+                    .copy_from_slice(&next_offset.to_le_bytes());
+            }
+        }
+        let changes_len = changes_buf.as_bytes().len() as u32;
+        out.write_u32(changes_len);
+        out.write_bytes(changes_buf.as_bytes());
+        buf_offset
+    }
+
+    /// Encode the full SMB2 CHANGE_NOTIFY response.
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 64);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out, SMB2_HEADER_SIZE);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 8 {
+            return Err(SmbError::Malformed(
+                "change notify response too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 9 {
+            return Err(SmbError::Malformed(format!(
+                "change notify response StructureSize {structure_size} != 9"
+            )));
+        }
+        let _reserved = r.read_u16()?;
+        let buf_offset = r.read_u32()? as usize;
+        let buf_length = r.read_u32()? as usize;
+        if buf_length == 0 {
+            return Ok(Self::default());
+        }
+        if buf_offset + buf_length > buf.len() {
+            return Err(SmbError::Malformed(
+                "change notify response buffer truncated".into(),
+            ));
+        }
+        let changes_buf = &buf[buf_offset..buf_offset + buf_length];
+        let mut changes = Vec::new();
+        let mut pos = 0usize;
+        while pos + 12 <= changes_buf.len() {
+            let next_offset =
+                u32::from_le_bytes(changes_buf[pos..pos + 4].try_into().unwrap_or([0; 4]));
+            let action =
+                u32::from_le_bytes(changes_buf[pos + 4..pos + 8].try_into().unwrap_or([0; 4]));
+            let name_len =
+                u32::from_le_bytes(changes_buf[pos + 8..pos + 12].try_into().unwrap_or([0; 4]))
+                    as usize;
+            if pos + 12 + name_len > changes_buf.len() {
+                return Err(SmbError::Malformed(
+                    "change notify entry name truncated".into(),
+                ));
+            }
+            let file_name = decode_utf16le(&changes_buf[pos + 12..pos + 12 + name_len]);
+            changes.push(FileNotifyInformation {
+                next_entry_offset: next_offset,
+                action,
+                file_name,
+            });
+            if next_offset == 0 {
+                break;
+            }
+            pos += next_offset as usize;
+        }
+        Ok(Self { changes })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// SMB2 OPLOCK_BREAK notification + acknowledgment — §2.2.23 / §2.2.24
+// ----------------------------------------------------------------------------
+
+/// SMB2 OPLOCK_BREAK notification (server → client). MS-SMB2 §2.2.23.1.
+///
+/// The server sends this when a conflicting open forces a downgrade
+/// of an existing oplock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OplockBreakNotification {
+    /// OplockLevel currently held (before the break).
+    pub oplock_level: u8,
+    /// Reserved (0).
+    pub reserved: u8,
+    /// FileId of the file whose oplock is breaking.
+    pub file_id: FileId,
+}
+
+impl OplockBreakNotification {
+    /// Build a new OPLOCK_BREAK notification.
+    #[must_use]
+    pub fn new(oplock_level: u8, file_id: FileId) -> Self {
+        Self {
+            oplock_level,
+            reserved: 0,
+            file_id,
+        }
+    }
+
+    /// Encode the body.
+    pub fn encode_body(&self, out: &mut Writer) {
+        out.write_u16(24); // StructureSize
+        out.write_u8(self.oplock_level);
+        out.write_u8(self.reserved);
+        out.write_file_id(&self.file_id);
+    }
+
+    /// Encode the full SMB2 OPLOCK_BREAK notification (server → client).
+    pub fn encode(&self, request_header: &Smb2Header, status: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 24);
+        let mut hdr = Smb2Header::new_response(request_header);
+        hdr.status = status;
+        hdr.command = command::OPLOCK_BREAK;
+        hdr.encode(&mut out);
+        self.encode_body(&mut out);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed(
+                "oplock break notification too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 24 {
+            return Err(SmbError::Malformed(format!(
+                "oplock break StructureSize {structure_size} != 24"
+            )));
+        }
+        let oplock_level = r.read_u8()?;
+        let reserved = r.read_u8()?;
+        let file_id = r.read_file_id()?;
+        Ok(Self {
+            oplock_level,
+            reserved,
+            file_id,
+        })
+    }
+}
+
+/// SMB2 OPLOCK_BREAK acknowledgment (client → server). MS-SMB2 §2.2.24.1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OplockBreakAcknowledgment {
+    /// OplockLevel the client is downgrading to.
+    pub oplock_level: u8,
+    /// Reserved (0).
+    pub reserved: u8,
+    /// FileId of the file whose oplock is being acknowledged.
+    pub file_id: FileId,
+}
+
+impl OplockBreakAcknowledgment {
+    /// Build a new OPLOCK_BREAK acknowledgment.
+    #[must_use]
+    pub fn new(oplock_level: u8, file_id: FileId) -> Self {
+        Self {
+            oplock_level,
+            reserved: 0,
+            file_id,
+        }
+    }
+
+    /// Encode the full SMB2 OPLOCK_BREAK acknowledgment.
+    pub fn encode(&self, message_id: u64, session_id: u64, tree_id: u32) -> Vec<u8> {
+        let mut out = Writer::with_capacity(SMB2_HEADER_SIZE + 24);
+        let mut hdr = Smb2Header::new_request(command::OPLOCK_BREAK, message_id);
+        hdr.session_id = session_id;
+        hdr.tree_id = tree_id;
+        hdr.encode(&mut out);
+        out.write_u16(24); // StructureSize
+        out.write_u8(self.oplock_level);
+        out.write_u8(self.reserved);
+        out.write_file_id(&self.file_id);
+        out.into_bytes()
+    }
+
+    /// Decode the body.
+    pub fn decode(buf: &[u8], header_size: usize) -> Result<Self, SmbError> {
+        if buf.len() < header_size + 16 {
+            return Err(SmbError::Malformed(
+                "oplock break acknowledgment too short".into(),
+            ));
+        }
+        let mut r = Reader::at(buf, header_size)?;
+        let structure_size = r.read_u16()?;
+        if structure_size != 24 {
+            return Err(SmbError::Malformed(format!(
+                "oplock break ack StructureSize {structure_size} != 24"
+            )));
+        }
+        let oplock_level = r.read_u8()?;
+        let reserved = r.read_u8()?;
+        let file_id = r.read_file_id()?;
+        Ok(Self {
+            oplock_level,
+            reserved,
+            file_id,
+        })
+    }
+}
+
+// ============================================================================
 // TransformHeader (encrypted PDU prefix) — §2.2.41
 // ============================================================================
 
@@ -2577,6 +3259,844 @@ impl PreauthHash {
             h.update(m);
         }
         h.finalize()
+    }
+}
+
+// ============================================================================
+// SmbEncryptionKey — AES-256-GCM session encryption key (§3.2.5.2)
+// ============================================================================
+
+/// AES-256-GCM session encryption key (32 bytes) for SMB 3.1.1 encrypted
+/// PDUs. Derived from the SessionKey via HKDF-SHA-512 labeled
+/// `"SMBSessionKey"` with the preauth-integrity hash as context, per
+/// MS-SMB2 §3.2.5.2.1.
+///
+/// In SMB 3.1.1 the client and server each derive two keys
+/// (ServerIn / ServerOut) by appending the direction label; for the
+/// symmetric AES-256-GCM cipher used by this framework the same 32-byte
+/// key serves both directions in tests (a real deployment would derive
+/// two separate keys per §3.2.5.2.1).
+#[derive(Clone, Zeroize)]
+pub struct SmbEncryptionKey([u8; 32]);
+
+impl SmbEncryptionKey {
+    /// Wrap an existing 32-byte key.
+    #[must_use]
+    pub fn from_bytes(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    /// Build a deterministic test key from a fixed seed. NOT for
+    /// production use — production code must call
+    /// [`SmbEncryptionKey::derive_from_session_key`].
+    #[must_use]
+    pub fn for_test(seed: u8) -> Self {
+        Self([seed; 32])
+    }
+
+    /// Derive an AES-256-GCM encryption key from the session key and
+    /// preauth-integrity hash per MS-SMB2 §3.2.5.2.1.
+    ///
+    /// The KDF is HKDF-SHA-512 with:
+    ///   - IKM = `session_key`
+    ///   - salt = `preauth_hash` (64 bytes for SHA-512)
+    ///   - info = `b"SMBSessionKey" || preauth_hash`
+    ///   - L   = 32 bytes (AES-256 key length)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmbError::Encryption`] if `session_key` is empty (the
+    /// KDF requires a non-zero IKM length).
+    pub fn derive_from_session_key(
+        session_key: &[u8],
+        preauth_hash: &[u8; 64],
+    ) -> Result<Self, SmbError> {
+        if session_key.is_empty() {
+            return Err(SmbError::Encryption(
+                "session key is empty (KDF requires non-zero IKM)".into(),
+            ));
+        }
+        // HKDF-SHA-512 (RFC 5869) — extract then expand.
+        let prk = hkdf_extract_sha512(preauth_hash, session_key);
+        // info = "SMBSessionKey" || preauth_hash (per MS-SMB2 §3.2.5.2.1).
+        let mut info = Vec::with_capacity(14 + preauth_hash.len());
+        info.extend_from_slice(b"SMBSessionKey");
+        info.extend_from_slice(preauth_hash);
+        let okm = hkdf_expand_sha512(&prk, &info, 32);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&okm);
+        Ok(Self(key))
+    }
+
+    /// Borrow the raw key bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SmbEncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid leaking key material in debug output.
+        f.debug_struct("SmbEncryptionKey")
+            .field("len", &32)
+            .finish_non_exhaustive()
+    }
+}
+
+/// HKDF-Extract step (RFC 5869 §2.2) using HMAC-SHA-512.
+fn hkdf_extract_sha512(salt: &[u8], ikm: &[u8]) -> [u8; 64] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(salt).expect("HMAC accepts any salt length");
+    mac.update(ikm);
+    let out = mac.finalize().into_bytes();
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// HKDF-Expand step (RFC 5869 §2.3) using HMAC-SHA-512. Returns `L` bytes.
+fn hkdf_expand_sha512(prk: &[u8; 64], info: &[u8], length: usize) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let hash_len = 64usize;
+    let n = length.div_ceil(hash_len);
+    let mut t_prev: Vec<u8> = Vec::new();
+    let mut okm = Vec::with_capacity(length);
+    for counter in 1..=n {
+        let mut mac = HmacSha512::new_from_slice(prk).expect("HMAC accepts any PRK length");
+        mac.update(&t_prev);
+        mac.update(info);
+        mac.update(&[counter as u8]);
+        let block = mac.finalize().into_bytes();
+        okm.extend_from_slice(&block);
+        t_prev = block.to_vec();
+    }
+    okm.truncate(length);
+    okm
+}
+
+// ============================================================================
+// AES-256-GCM PDU encrypt / decrypt (§3.2.4.3 / §3.1.4.3)
+// ============================================================================
+
+/// AES-256-GCM nonce length (12 bytes per MS-SMB2 §3.2.5.2.1).
+pub const AES_256_GCM_NONCE_LEN: usize = 12;
+
+/// AES-256-GCM authentication tag length (16 bytes per MS-SMB2 §3.2.5.2.1).
+pub const AES_256_GCM_TAG_LEN: usize = 16;
+
+/// Encrypt an SMB2 PDU using AES-256-GCM and return the framed
+/// `SMB2_TRANSFORM_HEADER || ciphertext` byte stream (ready for
+/// NetBIOS framing).
+///
+/// Per MS-SMB2 §3.2.4.3:
+///   1. Allocate a 12-byte random nonce; place it in the low 12 bytes
+///      of the transform header's 16-byte Nonce field (the high 4
+///      bytes are reserved and set to zero).
+///   2. Build the 52-byte transform header with `Signature = 0`,
+///      `OriginalMessageSize = plaintext.len()`, `Flags = 0x0001`
+///      (Encrypted), `SessionId = session_id`.
+///   3. Compute AES-256-GCM over `plaintext` with the nonce and AAD =
+///      the 52-byte transform header (Signature already zeroed).
+///   4. The 16-byte GCM tag goes into the transform header's
+///      `Signature` field; the ciphertext (no tag appended) follows
+///      the header on the wire.
+///
+/// # Errors
+///
+/// Returns [`SmbError::Encryption`] if AES-GCM fails (only possible on
+/// nonce length mismatch, which is statically guaranteed not to happen
+/// here).
+pub fn encrypt_pdu(
+    key: &SmbEncryptionKey,
+    plaintext: &[u8],
+    session_id: u64,
+    nonce_seed: [u8; AES_256_GCM_NONCE_LEN],
+) -> Result<Vec<u8>, SmbError> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Key};
+
+    // 1) Pack the 12-byte nonce into the low 12 bytes of the 16-byte
+    //    Nonce field (high 4 bytes reserved = 0).
+    let mut nonce_field = [0u8; 16];
+    nonce_field[..AES_256_GCM_NONCE_LEN].copy_from_slice(&nonce_seed);
+
+    // 2) Build the transform header (Signature = 0).
+    let transform = TransformHeader {
+        signature: [0u8; 16],
+        nonce: nonce_field,
+        original_message_size: plaintext.len() as u32,
+        flags: 0x0001,
+        session_id,
+    };
+    let mut header_bytes = Vec::with_capacity(SMB2_TRANSFORM_HEADER_SIZE);
+    let mut w = Writer::new();
+    transform.encode(&mut w);
+    header_bytes.extend_from_slice(w.as_bytes());
+    debug_assert_eq!(header_bytes.len(), SMB2_TRANSFORM_HEADER_SIZE);
+
+    // 3) AES-256-GCM encrypt with AAD = the 52-byte header (Signature
+    //    is already zero).
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_bytes()));
+    let nonce_obj = aes_gcm::Nonce::from_slice(&nonce_seed);
+    let ciphertext_with_tag = cipher
+        .encrypt(
+            nonce_obj,
+            Payload {
+                msg: plaintext,
+                aad: &header_bytes,
+            },
+        )
+        .map_err(|e| SmbError::Encryption(format!("aes-256-gcm encrypt: {e}")))?;
+    // aes-gcm appends the 16-byte tag to the ciphertext. Split it off.
+    let ct_len = ciphertext_with_tag.len();
+    if ct_len < AES_256_GCM_TAG_LEN {
+        return Err(SmbError::Encryption(
+            "aes-256-gcm produced ciphertext shorter than tag".into(),
+        ));
+    }
+    let (ciphertext, tag) = ciphertext_with_tag.split_at(ct_len - AES_256_GCM_TAG_LEN);
+
+    // 4) Place the 16-byte tag into the Signature field.
+    let mut out = header_bytes;
+    debug_assert_eq!(out[4..20].len(), 16);
+    out[4..20].copy_from_slice(tag);
+    out.extend_from_slice(ciphertext);
+    Ok(out)
+}
+
+/// Decrypt an SMB2 PDU previously encrypted with [`encrypt_pdu`].
+///
+/// `frame` MUST be the complete `SMB2_TRANSFORM_HEADER || ciphertext`
+/// (no NetBIOS framing). The function:
+///   1. Decodes the 52-byte transform header.
+///   2. Verifies the Flags have bit 0x0001 set (Encrypted).
+///   3. Reconstructs the AAD = the 52-byte header with the Signature
+///      field zeroed (it currently holds the GCM tag).
+///   4. Recombines `ciphertext || tag` and calls AES-256-GCM decrypt.
+///
+/// # Errors
+///
+/// Returns [`SmbError::Malformed`] if the frame is too short or the
+/// transform magic is wrong. Returns [`SmbError::Encryption`] if the
+/// GCM tag verification fails (tampering, wrong key, etc).
+pub fn decrypt_pdu(key: &SmbEncryptionKey, frame: &[u8]) -> Result<Vec<u8>, SmbError> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Key};
+
+    if frame.len() < SMB2_TRANSFORM_HEADER_SIZE {
+        return Err(SmbError::Malformed(format!(
+            "encrypted frame too short: {} < {SMB2_TRANSFORM_HEADER_SIZE}",
+            frame.len()
+        )));
+    }
+    let header = TransformHeader::decode(frame)?;
+    if header.flags & 0x0001 == 0 {
+        return Err(SmbError::Encryption(
+            "transform header Flags bit 0x0001 (Encrypted) not set".into(),
+        ));
+    }
+    let ciphertext_body = &frame[SMB2_TRANSFORM_HEADER_SIZE..];
+    // AAD = header with Signature (bytes 4..20) zeroed.
+    let mut aad = frame[..SMB2_TRANSFORM_HEADER_SIZE].to_vec();
+    for b in &mut aad[4..20] {
+        *b = 0;
+    }
+    // Recombine ciphertext || tag for AES-GCM decrypt.
+    let mut cipher_with_tag = Vec::with_capacity(ciphertext_body.len() + AES_256_GCM_TAG_LEN);
+    cipher_with_tag.extend_from_slice(ciphertext_body);
+    cipher_with_tag.extend_from_slice(&header.signature);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_bytes()));
+    let nonce = &header.nonce[..AES_256_GCM_NONCE_LEN];
+    let nonce_obj = aes_gcm::Nonce::from_slice(nonce);
+    let plaintext = cipher
+        .decrypt(
+            nonce_obj,
+            Payload {
+                msg: &cipher_with_tag,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| SmbError::Encryption(format!("aes-256-gcm decrypt: {e}")))?;
+    Ok(plaintext)
+}
+
+// ============================================================================
+// GSS-API / SPNEGO — Kerberos session setup (MS-SMB2 §3.2.5.3, RFC 4178)
+// ============================================================================
+
+/// GSS-API / SPNEGO mechanism OIDs (DER-encoded, without the leading
+/// `06 LL` tag/length bytes — just the OID body). Used by [`gss_api`]
+/// to classify the offered mechanisms in a NegTokenInit.
+pub mod gss_api {
+    use super::SmbError;
+
+    /// SPNEGO OID body: `1.3.6.1.5.5.2` (RFC 4178).
+    pub const SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+
+    /// Kerberos5 OID body: `1.2.840.113554.1.2.2` (RFC 4121 / MS-KILE).
+    pub const KERBEROS5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+
+    /// NTLMSSP OID body: `1.3.6.1.4.1.311.2.2.10` (per ADR-085 — client-only).
+    pub const NTLMSSP: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+
+    /// Synthetic Kerberos AP-REQ marker — the first 7 bytes of every
+    /// mechToken produced by [`init_sec_context`] / accepted by
+    /// [`accept_sec_context`]. The marker spells `b"KRBAUTH"` and is
+    /// followed by the target SPN (UTF-8, length-prefixed) and a
+    /// 16-byte client nonce.
+    pub const KRB_AUTH_MARKER: &[u8] = b"KRBAUTH";
+
+    /// GSS-API acceptor result.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AcceptResult {
+        /// Session key derived from the Kerberos mechToken (16 bytes).
+        /// Used as the SMB2 SessionKey for signing/encryption key
+        /// derivation per MS-SMB2 §3.2.5.2.
+        pub session_key: [u8; 16],
+        /// SPNEGO response token to return to the client (empty on
+        /// completion — no further round-trips needed).
+        pub response_token: Vec<u8>,
+        /// True when the context is fully established; false when the
+        /// acceptor needs another token from the client (continued
+        /// authentication — not used in the synthetic implementation).
+        pub completed: bool,
+    }
+
+    /// A classification of the offered mechanism(s) in an SPNEGO
+    /// NegTokenInit blob.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum MechClass {
+        /// Kerberos5 was offered (and is accepted).
+        Kerberos,
+        /// Only NTLM was offered (refused per ADR-085).
+        NtlmOnly,
+        /// No recognised mechanisms were offered (anonymous / unknown).
+        Unknown,
+    }
+
+    /// Inspect a GSS-API initial token and classify the offered
+    /// mechanism(s). This is a minimal hand-rolled DER walker: it scans
+    /// the blob for the well-known OID bodies (Kerberos5, NTLMSSP) and
+    /// returns the strongest classification.
+    ///
+    /// The function does NOT verify the SPNEGO NegTokenInit structure
+    /// strictly — it looks for the OID bodies anywhere in the blob,
+    /// which is robust to DER length-encoding variations and to
+    /// non-canonical encoders (e.g. Samba's Heimdal-derived encoder).
+    #[must_use]
+    pub fn classify_mech(token: &[u8]) -> MechClass {
+        let mut has_krb = false;
+        let mut has_ntlm = false;
+        // Sliding-window search for the OID bodies. OIDs in DER are
+        // preceded by `06 LL` (tag 06, length LL) but we just look for
+        // the body to keep the walker trivial.
+        if contains_subslice(token, KERBEROS5) {
+            has_krb = true;
+        }
+        if contains_subslice(token, NTLMSSP) {
+            has_ntlm = true;
+        }
+        if has_krb {
+            MechClass::Kerberos
+        } else if has_ntlm {
+            MechClass::NtlmOnly
+        } else {
+            MechClass::Unknown
+        }
+    }
+
+    /// Accept a GSS-API security context (server-side SPNEGO acceptor).
+    ///
+    /// The function:
+    ///   1. Classifies the offered mechanisms via [`classify_mech`].
+    ///   2. Refuses NTLM-only tokens (per ADR-085) and unknown / empty
+    ///      tokens (anonymous — refused per MS-SMB2 §3.2.5.3).
+    ///   3. Extracts the Kerberos mechToken (looking for the
+    ///      [`KRB_AUTH_MARKER`] sentinel and parsing the SPN + client
+    ///      nonce that follows it).
+    ///   4. Derives a 16-byte session key from
+    ///      `HKDF-SHA-256(mechToken || server_secret, "SMBSessionKey")`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmbError::Encryption`] (re-used as the "auth" error
+    /// surface, since the SMB layer maps it to `STATUS_LOGON_FAILURE`)
+    /// when:
+    ///   - the token is empty (anonymous refused),
+    ///   - only NTLM is offered (ADR-085),
+    ///   - the mechanism is unknown,
+    ///   - the Kerberos mechToken cannot be parsed.
+    pub fn accept_sec_context(
+        input_token: &[u8],
+        server_secret: &[u8],
+    ) -> Result<AcceptResult, SmbError> {
+        if input_token.is_empty() {
+            return Err(SmbError::Encryption(
+                "anonymous session setup refused (token empty)".into(),
+            ));
+        }
+        let class = classify_mech(input_token);
+        match class {
+            MechClass::NtlmOnly => Err(SmbError::Encryption(
+                "NTLM session setup refused per ADR-085 (client-only)".into(),
+            )),
+            MechClass::Unknown => Err(SmbError::Encryption(
+                "unknown mechanism — anonymous session setup refused".into(),
+            )),
+            MechClass::Kerberos => {
+                // Extract the synthetic Kerberos mechToken (KRBAUTH || spn_len(u8) || spn || nonce[16]).
+                let mech_token = extract_mech_token(input_token)?;
+                if mech_token.len() < KRB_AUTH_MARKER.len() + 1 + 16 {
+                    return Err(SmbError::Encryption(format!(
+                        "Kerberos mechToken too short: {} bytes",
+                        mech_token.len()
+                    )));
+                }
+                if &mech_token[..KRB_AUTH_MARKER.len()] != KRB_AUTH_MARKER {
+                    return Err(SmbError::Encryption(
+                        "Kerberos mechToken marker missing".into(),
+                    ));
+                }
+                // Derive a deterministic 16-byte session key from the
+                // mechToken + server_secret using HKDF-SHA-256.
+                let mut ikm = Vec::with_capacity(mech_token.len() + server_secret.len());
+                ikm.extend_from_slice(&mech_token);
+                ikm.extend_from_slice(server_secret);
+                let session_key = derive_smb_session_key(&ikm, b"SMBSessionKey");
+                Ok(AcceptResult {
+                    session_key,
+                    response_token: Vec::new(),
+                    completed: true,
+                })
+            }
+        }
+    }
+
+    /// Initialize a GSS-API security context (client-side SPNEGO
+    /// initiator) for `target_spn`. Returns an SPNEGO NegTokenInit
+    /// blob suitable for the SessionSetup request's SecurityBuffer.
+    ///
+    /// The blob advertises Kerberos5 as the only mechanism (so the
+    /// server's [`accept_sec_context`] never falls back to NTLM) and
+    /// carries a synthetic AP-REQ containing the SPN and a 16-byte
+    /// client nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmbError::Encryption`] only if the SPN is empty.
+    pub fn init_sec_context(target_spn: &str, client_secret: &[u8]) -> Result<Vec<u8>, SmbError> {
+        if target_spn.is_empty() {
+            return Err(SmbError::Encryption(
+                "init_sec_context: target SPN must not be empty".into(),
+            ));
+        }
+        // Build the synthetic Kerberos mechToken:
+        //   KRBAUTH || spn_len(u8 LE) || spn_utf8 || client_nonce[16]
+        let spn_bytes = target_spn.as_bytes();
+        if spn_bytes.len() > 255 {
+            return Err(SmbError::Encryption(format!(
+                "target SPN too long ({} bytes > 255)",
+                spn_bytes.len()
+            )));
+        }
+        let mut mech_token = Vec::with_capacity(KRB_AUTH_MARKER.len() + 1 + spn_bytes.len() + 16);
+        mech_token.extend_from_slice(KRB_AUTH_MARKER);
+        mech_token.push(spn_bytes.len() as u8);
+        mech_token.extend_from_slice(spn_bytes);
+        // 16-byte deterministic client nonce derived from client_secret
+        // (production code would use a CSPRNG; the framework's KDC
+        // integration is wired in a later wave).
+        let mut client_nonce = [0u8; 16];
+        let secret_len = client_secret.len().min(16);
+        client_nonce[..secret_len].copy_from_slice(&client_secret[..secret_len]);
+        mech_token.extend_from_slice(&client_nonce);
+
+        // Build the SPNEGO NegTokenInit DER blob:
+        //   [APPLICATION 0] SEQUENCE {
+        //     SPNEGO_OID,
+        //     [0] NegTokenInit SEQUENCE {
+        //       [0] MechTypeList SEQUENCE OF { Kerberos5_OID },
+        //       [2] MechToken OCTET STRING { mech_token }
+        //     }
+        //   }
+        let krb_oid_tlv = der_oid(KERBEROS5);
+        let spnego_oid_tlv = der_oid(SPNEGO);
+        let mech_token_tlv = der_octet_string(&mech_token);
+
+        // MechTypeList = SEQUENCE OF { Kerberos5 }
+        let mech_type_list = der_sequence(&krb_oid_tlv);
+        // [0] mechTypes (context tag 0, constructed)
+        let mech_types_tlv = der_context_constructed(0, &mech_type_list);
+        // [2] mechToken (context tag 2, constructed)
+        let mech_token_ctx_tlv = der_context_constructed(2, &mech_token_tlv);
+        // NegTokenInit = SEQUENCE { mechTypes, mechToken }
+        let neg_token_init =
+            der_sequence(&[mech_types_tlv.as_slice(), mech_token_ctx_tlv.as_slice()].concat());
+        // [0] NegTokenInit wrapper (context tag 0, constructed)
+        let neg_token_init_ctx = der_context_constructed(0, &neg_token_init);
+        // InitialContextToken = [APPLICATION 0] SEQUENCE { SPNEGO_OID, NegTokenInit-wrapped }
+        let inner = [spnego_oid_tlv.as_slice(), neg_token_init_ctx.as_slice()].concat();
+        let initial_context_token = der_application_constructed(0, &inner);
+        Ok(initial_context_token)
+    }
+
+    /// Derive a 16-byte SMB session key from `ikm` using HKDF-SHA-256
+    /// (RFC 5869) with the given label as `info`.
+    fn derive_smb_session_key(ikm: &[u8], label: &[u8]) -> [u8; 16] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        // HKDF-Extract: PRK = HMAC-SHA-256(salt="", ikm)
+        let mut mac = HmacSha256::new_from_slice(&[]).expect("HMAC accepts empty salt");
+        mac.update(ikm);
+        let prk = mac.finalize().into_bytes();
+        // HKDF-Expand: T(1) = HMAC-SHA-256(PRK, info || 0x01)
+        let mut mac = HmacSha256::new_from_slice(&prk).expect("HMAC accepts PRK");
+        mac.update(label);
+        mac.update(&[0x01]);
+        let t1 = mac.finalize().into_bytes();
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&t1[..16]);
+        key
+    }
+
+    /// Extract the synthetic Kerberos mechToken from an SPNEGO
+    /// NegTokenInit blob. Walks the DER looking for an OCTET STRING
+    /// whose body starts with the [`KRB_AUTH_MARKER`].
+    fn extract_mech_token(blob: &[u8]) -> Result<Vec<u8>, SmbError> {
+        // Sliding-window search for the marker.
+        let marker_len = KRB_AUTH_MARKER.len();
+        for i in 0..blob.len().saturating_sub(marker_len) {
+            if &blob[i..i + marker_len] == KRB_AUTH_MARKER {
+                // Found the marker — the mechToken is the marker + the
+                // following spn_len + spn + nonce[16] bytes. We don't
+                // strictly know the length here (we'd need to parse the
+                // surrounding OCTET STRING TLV), so we conservatively
+                // return everything from the marker to the end of the
+                // blob. The caller validates the minimum length and
+                // only reads the SPN + 16-byte nonce prefix.
+                return Ok(blob[i..].to_vec());
+            }
+        }
+        Err(SmbError::Encryption(
+            "Kerberos mechToken marker not found in SPNEGO blob".into(),
+        ))
+    }
+
+    // ---- Minimal DER encoders (definite-length) ----
+
+    fn der_encode_len(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            vec![len as u8]
+        } else if len <= 0xFF {
+            vec![0x81, len as u8]
+        } else if len <= 0xFFFF {
+            vec![0x82, (len >> 8) as u8, (len & 0xFF) as u8]
+        } else {
+            // SPNEGO blobs are tiny; 3-byte length encoding is the
+            // most we ever need.
+            vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        }
+    }
+
+    fn der_oid(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + body.len());
+        out.push(0x06); // OBJECT IDENTIFIER
+        out.extend(der_encode_len(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn der_octet_string(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + body.len());
+        out.push(0x04); // OCTET STRING
+        out.extend(der_encode_len(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn der_sequence(contents: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + contents.len());
+        out.push(0x30); // SEQUENCE
+        out.extend(der_encode_len(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    fn der_context_constructed(tag: u8, contents: &[u8]) -> Vec<u8> {
+        debug_assert!(tag < 0x20, "context tag must fit in 5 bits");
+        let mut out = Vec::with_capacity(2 + contents.len());
+        out.push(0xA0 | tag); // context tag, constructed
+        out.extend(der_encode_len(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    fn der_application_constructed(tag: u8, contents: &[u8]) -> Vec<u8> {
+        debug_assert!(tag < 0x20, "application tag must fit in 5 bits");
+        let mut out = Vec::with_capacity(2 + contents.len());
+        out.push(0x60 | tag); // application tag, constructed
+        out.extend(der_encode_len(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // ---- Tests for the gss_api module ----
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn classify_mech_detects_kerberos_oid() {
+            let blob = init_sec_context("cifs/dc01.example.com", &[0xAB; 16]).expect("init ok");
+            assert_eq!(classify_mech(&blob), MechClass::Kerberos);
+        }
+
+        #[test]
+        fn classify_mech_detects_ntlm_only_blob() {
+            // Hand-craft an NTLM-only SPNEGO blob.
+            let ntlm_oid_tlv = der_oid(NTLMSSP);
+            let mech_list = der_sequence(&ntlm_oid_tlv);
+            let mech_types_tlv = der_context_constructed(0, &mech_list);
+            let neg_init = der_sequence(&mech_types_tlv);
+            let neg_init_ctx = der_context_constructed(0, &neg_init);
+            let spnego_oid_tlv = der_oid(SPNEGO);
+            let inner = [spnego_oid_tlv.as_slice(), neg_init_ctx.as_slice()].concat();
+            let blob = der_application_constructed(0, &inner);
+            assert_eq!(classify_mech(&blob), MechClass::NtlmOnly);
+        }
+
+        #[test]
+        fn classify_mech_returns_unknown_for_empty_blob() {
+            assert_eq!(classify_mech(&[]), MechClass::Unknown);
+        }
+    }
+}
+
+// ============================================================================
+// Wave 4: DFS-N referrals (MS-DFSN §2.2.3 / §2.2.4)
+// ============================================================================
+
+/// A single DFS referral entry (a target `\\server\share` for a DFS path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DfsReferralEntry {
+    /// The DFS path that this referral resolves (e.g.
+    /// `\\domain.example.com\shares\docs`).
+    pub dfs_path: String,
+    /// The target UNC path the client should connect to (e.g.
+    /// `\\dc01.example.com\docs$`).
+    pub target_path: String,
+    /// Target priority (lower = higher priority; 0 = highest).
+    pub priority: u16,
+}
+
+/// A DFS referral request (MS-DFSN §2.2.3). The client sends the
+/// DFS path it wants to resolve; the server returns one or more
+/// referral entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DfsReferralRequest {
+    /// The DFS path to resolve (e.g. `\\domain.example.com\shares\docs`).
+    pub path: String,
+}
+
+impl DfsReferralRequest {
+    /// Build a new DFS referral request for `path`.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Encode the request as a simple length-prefixed UTF-16LE path
+    /// (the framework's wire format for DFS referral requests — the
+    /// real MS-DFSN format is more complex; this minimal form
+    /// suffices for the framework's own client/server pair).
+    pub fn encode(&self) -> Vec<u8> {
+        let path_utf16 = encode_utf16le(&self.path);
+        let mut out = Vec::with_capacity(4 + path_utf16.len());
+        out.extend_from_slice(&(path_utf16.len() as u32).to_le_bytes());
+        out.extend_from_slice(&path_utf16);
+        out
+    }
+
+    /// Decode a DFS referral request.
+    pub fn decode(buf: &[u8]) -> Result<Self, SmbError> {
+        if buf.len() < 4 {
+            return Err(SmbError::Malformed("dfs referral request too short".into()));
+        }
+        let path_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if 4 + path_len > buf.len() {
+            return Err(SmbError::Malformed(
+                "dfs referral request path truncated".into(),
+            ));
+        }
+        let path = decode_utf16le(&buf[4..4 + path_len]);
+        Ok(Self { path })
+    }
+}
+
+/// A DFS referral response (MS-DFSN §2.2.4). Contains one or more
+/// referral entries the client should follow.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DfsReferralResponse {
+    /// The referral entries (ordered by priority).
+    pub entries: Vec<DfsReferralEntry>,
+}
+
+impl DfsReferralResponse {
+    /// Build an empty DFS referral response.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a DFS referral response with one entry.
+    #[must_use]
+    pub fn with_entry(
+        dfs_path: impl Into<String>,
+        target_path: impl Into<String>,
+        priority: u16,
+    ) -> Self {
+        Self {
+            entries: vec![DfsReferralEntry {
+                dfs_path: dfs_path.into(),
+                target_path: target_path.into(),
+                priority,
+            }],
+        }
+    }
+
+    /// Encode the response as a count-prefixed list of entries. Each
+    /// entry is encoded as `dfs_path_len(u32 LE) || dfs_path_utf16 ||
+    /// target_path_len(u32 LE) || target_path_utf16 || priority(u16 LE)`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * 64);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            let dfs_utf16 = encode_utf16le(&entry.dfs_path);
+            let target_utf16 = encode_utf16le(&entry.target_path);
+            out.extend_from_slice(&(dfs_utf16.len() as u32).to_le_bytes());
+            out.extend_from_slice(&dfs_utf16);
+            out.extend_from_slice(&(target_utf16.len() as u32).to_le_bytes());
+            out.extend_from_slice(&target_utf16);
+            out.extend_from_slice(&entry.priority.to_le_bytes());
+        }
+        out
+    }
+
+    /// Decode a DFS referral response.
+    pub fn decode(buf: &[u8]) -> Result<Self, SmbError> {
+        if buf.len() < 4 {
+            return Err(SmbError::Malformed(
+                "dfs referral response too short".into(),
+            ));
+        }
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let mut pos = 4usize;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if pos + 4 > buf.len() {
+                return Err(SmbError::Malformed(
+                    "dfs entry dfs_path length truncated".into(),
+                ));
+            }
+            let dfs_len =
+                u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            pos += 4;
+            if pos + dfs_len > buf.len() {
+                return Err(SmbError::Malformed("dfs entry dfs_path truncated".into()));
+            }
+            let dfs_path = decode_utf16le(&buf[pos..pos + dfs_len]);
+            pos += dfs_len;
+            if pos + 4 > buf.len() {
+                return Err(SmbError::Malformed(
+                    "dfs entry target_path length truncated".into(),
+                ));
+            }
+            let target_len =
+                u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            pos += 4;
+            if pos + target_len > buf.len() {
+                return Err(SmbError::Malformed(
+                    "dfs entry target_path truncated".into(),
+                ));
+            }
+            let target_path = decode_utf16le(&buf[pos..pos + target_len]);
+            pos += target_len;
+            if pos + 2 > buf.len() {
+                return Err(SmbError::Malformed("dfs entry priority truncated".into()));
+            }
+            let priority = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            pos += 2;
+            entries.push(DfsReferralEntry {
+                dfs_path,
+                target_path,
+                priority,
+            });
+        }
+        Ok(Self { entries })
+    }
+}
+
+/// A DFS referral resolver. Wraps a referral-source callable and
+/// exposes a [`DfsResolver::resolve`] method that returns the first
+/// (highest-priority) target for a DFS path.
+///
+/// Per ADR-044 the framework's SMB client follows DFS referrals
+/// transparently: when a TreeConnect to `\\domain\share` returns a
+/// referral, the client re-issues the TreeConnect to the first
+/// target. The resolver is the piece that turns a referral response
+/// into the next TreeConnect target.
+pub struct DfsResolver<F>
+where
+    F: Fn(&str) -> Option<DfsReferralResponse>,
+{
+    fetch: F,
+}
+
+impl<F> DfsResolver<F>
+where
+    F: Fn(&str) -> Option<DfsReferralResponse>,
+{
+    /// Construct a new resolver backed by the given fetch callable
+    /// (typically a closure that queries a server-side referral
+    /// table or sends an SMB2 GET_DFS_REFERRAL IOCTL over the wire).
+    #[must_use]
+    pub fn new(fetch: F) -> Self {
+        Self { fetch }
+    }
+
+    /// Resolve a DFS path to its first (highest-priority) target.
+    /// Returns `None` if the path is not in the DFS namespace or the
+    /// referral response has no entries.
+    #[must_use]
+    pub fn resolve(&self, dfs_path: &str) -> Option<DfsReferralEntry> {
+        let response = (self.fetch)(dfs_path)?;
+        response.entries.iter().min_by_key(|e| e.priority).cloned()
+    }
+
+    /// Resolve a DFS path and return all referral entries (ordered
+    /// by priority — caller is responsible for falling through to
+    /// the next target if the first is unreachable).
+    #[must_use]
+    pub fn resolve_all(&self, dfs_path: &str) -> Option<Vec<DfsReferralEntry>> {
+        let response = (self.fetch)(dfs_path)?;
+        let mut entries = response.entries;
+        entries.sort_by_key(|e| e.priority);
+        Some(entries)
     }
 }
 
@@ -2946,6 +4466,108 @@ mod tests {
         assert_eq!(out.position(), 52);
         let decoded = TransformHeader::decode(out.as_bytes()).expect("decode");
         assert_eq!(decoded, hdr);
+    }
+
+    // ---- Wave 1: AES-256-GCM encryption ----
+
+    /// Helper: build a deterministic 12-byte nonce for tests (production
+    /// code MUST use a CSPRNG; this is a test-only fixture so the
+    /// round-trip is reproducible).
+    fn test_nonce(counter: u8) -> [u8; AES_256_GCM_NONCE_LEN] {
+        [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, counter,
+        ]
+    }
+
+    #[test]
+    fn wave1_encrypt_decrypt_pdu_round_trips() {
+        // T-102 / T-103: encrypt_pdu followed by decrypt_pdu returns the
+        // original plaintext byte-for-byte.
+        let key = SmbEncryptionKey::for_test(0xA5);
+        let plaintext = b"hello, encrypted SMB world!\n";
+        let session_id = 0xCAFE_BABE_1234_5678u64;
+        let frame = encrypt_pdu(&key, plaintext, session_id, test_nonce(1)).expect("encrypt ok");
+        // Frame = 52-byte transform header + ciphertext (== plaintext len
+        // for AES-GCM since the tag is stored in the Signature field).
+        assert_eq!(frame.len(), SMB2_TRANSFORM_HEADER_SIZE + plaintext.len());
+        let decoded = decrypt_pdu(&key, &frame).expect("decrypt ok");
+        assert_eq!(decoded, plaintext);
+    }
+
+    #[test]
+    fn wave1_tampered_ciphertext_is_rejected() {
+        // T-106 negative path: flipping a single ciphertext byte MUST
+        // surface a decrypt error (GCM tag verification failure).
+        let key = SmbEncryptionKey::for_test(0x3C);
+        let plaintext = b"sensitive payload";
+        let mut frame = encrypt_pdu(&key, plaintext, 0x100, test_nonce(2)).expect("encrypt ok");
+        // Flip the first ciphertext byte (just after the 52-byte header).
+        frame[SMB2_TRANSFORM_HEADER_SIZE] ^= 0xFF;
+        let err = decrypt_pdu(&key, &frame).expect_err("must reject tampered ciphertext");
+        assert!(
+            matches!(err, SmbError::Encryption(ref msg) if msg.contains("decrypt")),
+            "expected Encryption error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wave1_wrong_key_is_rejected() {
+        // T-106 negative path: decrypting with a different key MUST fail
+        // (the GCM tag was computed under the original key).
+        let key_a = SmbEncryptionKey::for_test(0x01);
+        let key_b = SmbEncryptionKey::for_test(0x02);
+        let plaintext = b"confidential";
+        let frame = encrypt_pdu(&key_a, plaintext, 0x200, test_nonce(3)).expect("encrypt ok");
+        let err = decrypt_pdu(&key_b, &frame).expect_err("must reject wrong key");
+        assert!(
+            matches!(err, SmbError::Encryption(ref msg) if msg.contains("decrypt")),
+            "expected Encryption error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wave1_transform_header_round_trips_through_encrypt_decrypt() {
+        // T-104: the TransformHeader emitted by encrypt_pdu round-trips
+        // through TransformHeader::decode, carrying the right session id,
+        // OriginalMessageSize, Flags, and nonce.
+        let key = SmbEncryptionKey::for_test(0x77);
+        let plaintext = b"round-trip through codec";
+        let session_id = 0x1234_AAAA_BBBB_CCCCu64;
+        let nonce = test_nonce(4);
+        let frame = encrypt_pdu(&key, plaintext, session_id, nonce).expect("encrypt ok");
+        let header = TransformHeader::decode(&frame).expect("decode header");
+        // OriginalMessageSize matches the plaintext length.
+        assert_eq!(header.original_message_size, plaintext.len() as u32);
+        // Flags has bit 0x0001 (Encrypted) set.
+        assert_ne!(header.flags & 0x0001, 0);
+        // SessionId is carried through.
+        assert_eq!(header.session_id, session_id);
+        // Nonce: the low 12 bytes match the input nonce; the high 4
+        // bytes are reserved and must be zero.
+        assert_eq!(&header.nonce[..AES_256_GCM_NONCE_LEN], &nonce);
+        assert_eq!(&header.nonce[AES_256_GCM_NONCE_LEN..], &[0u8; 4]);
+        // Signature is non-zero (it holds the 16-byte GCM tag).
+        assert!(header.signature.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn wave1_negotiate_response_advertises_encryption_capability() {
+        // T-105: NegotiateResponse::new_311 must set the
+        // SMB2_GLOBAL_CAP_ENCRYPTION capability bit so that clients know
+        // to encrypt PDUs on this session.
+        let server_guid = uuid::Uuid::from_u128(0xAAAA_0000_0000_0000_0000_0000_0000_0001);
+        let salt = [0xABu8; 16];
+        let resp = NegotiateResponse::new_311(server_guid, &salt);
+        assert_ne!(
+            resp.capabilities & capabilities::ENCRYPTION,
+            0,
+            "NegotiateResponse must advertise SMB2_GLOBAL_CAP_ENCRYPTION"
+        );
+        // Round-trip through encode/decode to ensure the flag survives the wire.
+        let req_hdr = Smb2Header::new_request(command::NEGOTIATE, 1);
+        let bytes = resp.encode(&req_hdr);
+        let decoded = NegotiateResponse::decode(&bytes, SMB2_HEADER_SIZE).expect("decode");
+        assert_ne!(decoded.capabilities & capabilities::ENCRYPTION, 0);
     }
 
     // ---- SMB1 refused ----
