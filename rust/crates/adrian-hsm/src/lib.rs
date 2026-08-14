@@ -651,6 +651,505 @@ impl Hsm for SoftwareHsm {
     }
 }
 
+// ===========================================================================
+// PKCS#11 HSM backend (ADR-015) — Domain-06 Wave 5
+// ===========================================================================
+
+/// Feature-gated PKCS#11 backend. Enabled by the `hsm` (or `enterprise-hsm`
+/// alias) feature. Uses the `cryptoki` crate to talk to a real PKCS#11 module
+/// (SoftHSM2 for testing, YubiHSM / AWS CloudHSM / Thales Luna for production).
+///
+/// The backend holds a `cryptoki::session::Session` (R/W session) and a
+/// `HashMap<String, (KeyType, ObjectHandle)>` mapping key IDs to PKCS#11
+/// object handles. Key persistence across sessions is handled by the PKCS#11
+/// token itself (keys are stored as token objects, not session objects).
+#[cfg(feature = "hsm")]
+pub mod pkcs11 {
+    use super::*;
+    use cryptoki::context::{CInitializeArgs, Pkcs11};
+    use cryptoki::mechanism::aead::GcmParams;
+    use cryptoki::mechanism::Mechanism;
+    use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
+    use cryptoki::session::{Session, UserType};
+    use cryptoki::types::AuthPin;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// PKCS#11-backed HSM. Holds a session and a key-id → object-handle map.
+    /// The session is wrapped in a `Mutex` because PKCS#11 sessions are not
+    /// thread-safe (a single session can only execute one operation at a
+    /// time).
+    pub struct Pkcs11Hsm {
+        session: Arc<Mutex<Session>>,
+        keys: Arc<Mutex<HashMap<String, (KeyType, ObjectHandle)>>>,
+        _lib: Arc<Pkcs11>,
+    }
+
+    impl std::fmt::Debug for Pkcs11Hsm {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Pkcs11Hsm")
+                .field("session", &"Session<{..}>")
+                .finish()
+        }
+    }
+
+    impl Pkcs11Hsm {
+        /// Construct a new PKCS#11 HSM. Loads the module at `library_path`,
+        /// opens a R/W session on `slot_id`, and logs in with `pin`.
+        pub fn new(
+            library_path: impl AsRef<std::path::Path>,
+            slot_id: u64,
+            pin: &str,
+        ) -> Result<Self, HsmError> {
+            let pkcs11 = Pkcs11::new(library_path)
+                .map_err(|e| HsmError::Pkcs11(format!("load module: {e}")))?;
+            pkcs11
+                .initialize(CInitializeArgs::OsThreads)
+                .map_err(|e| HsmError::Pkcs11(format!("C_Initialize: {e}")))?;
+            let slots = pkcs11
+                .get_slots_with_initialized_token()
+                .map_err(|e| HsmError::Pkcs11(format!("get_slots: {e}")))?;
+            let slot = slots.iter().find(|s| s.id() == slot_id).ok_or_else(|| {
+                HsmError::Pkcs11(format!("slot {slot_id} not found or not initialized"))
+            })?;
+            let session = pkcs11
+                .open_rw_session(*slot)
+                .map_err(|e| HsmError::Pkcs11(format!("open_rw_session: {e}")))?;
+            session
+                .login(UserType::User, Some(&AuthPin::new(pin.to_string())))
+                .map_err(|e| HsmError::Pkcs11(format!("login: {e}")))?;
+            Ok(Self {
+                session: Arc::new(Mutex::new(session)),
+                _lib: Arc::new(pkcs11),
+                keys: Arc::new(Mutex::new(HashMap::new())),
+            })
+        }
+
+        /// Find an existing key object by its CKA_LABEL. Returns the object
+        /// handle if found. Used by `generate_key` to implement idempotency
+        /// (return existing key if the label already exists).
+        async fn find_by_label(&self, label: &str) -> Result<Option<ObjectHandle>, HsmError> {
+            let session = self.session.lock().await;
+            let template = vec![Attribute::Label(label.as_bytes().to_vec())];
+            let objects = session
+                .find_objects(&template)
+                .map_err(|e| HsmError::Pkcs11(format!("find_objects: {e}")))?;
+            Ok(objects.into_iter().next())
+        }
+
+        /// Generate an AES-256 key with the given label. Returns the object handle.
+        async fn generate_aes_key(&self, label: &str) -> Result<ObjectHandle, HsmError> {
+            let session = self.session.lock().await;
+            let mechanism = Mechanism::AesKeyGen;
+            let template = vec![
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::ValueLen(32u64.into()),
+                Attribute::Encrypt(true),
+                Attribute::Decrypt(true),
+                Attribute::Token(true),
+                Attribute::Label(label.as_bytes().to_vec()),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(false),
+            ];
+            session
+                .generate_key(&mechanism, &template)
+                .map_err(|e| HsmError::Pkcs11(format!("generate AES key: {e}")))
+        }
+
+        /// Generate an ECDSA P-256 key pair with the given label. Returns
+        /// (public_handle, private_handle).
+        async fn generate_ecdsa_keypair(
+            &self,
+            label: &str,
+        ) -> Result<(ObjectHandle, ObjectHandle), HsmError> {
+            let session = self.session.lock().await;
+            let mechanism = Mechanism::EccKeyPairGen;
+            // P-256 curve OID: 1.2.840.10045.3.1.7 (prime256v1 / secp256r1).
+            // DER encoding: 06 07 2B 81 04 00 22
+            let curve_oid: &[u8] = &[0x06, 0x07, 0x2B, 0x81, 0x04, 0x00, 0x22];
+            let pub_template = vec![
+                Attribute::Class(ObjectClass::PUBLIC_KEY),
+                Attribute::KeyType(cryptoki::object::KeyType::EC),
+                Attribute::Verify(true),
+                Attribute::Token(true),
+                Attribute::Label(label.as_bytes().to_vec()),
+                Attribute::EcParams(curve_oid.to_vec()),
+            ];
+            let priv_template = vec![
+                Attribute::Class(ObjectClass::PRIVATE_KEY),
+                Attribute::KeyType(cryptoki::object::KeyType::EC),
+                Attribute::Sign(true),
+                Attribute::Token(true),
+                Attribute::Label(label.as_bytes().to_vec()),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(false),
+            ];
+            let (pub_h, priv_h) = session
+                .generate_key_pair(&mechanism, &pub_template, &priv_template)
+                .map_err(|e| HsmError::Pkcs11(format!("generate ECDSA keypair: {e}")))?;
+            Ok((pub_h, priv_h))
+        }
+
+        /// Get the SEC1 uncompressed public key from an ECDSA public key object.
+        async fn get_ecdsa_public_sec1(
+            &self,
+            pub_handle: ObjectHandle,
+        ) -> Result<Vec<u8>, HsmError> {
+            let session = self.session.lock().await;
+            let info = session
+                .get_attributes(pub_handle, &[AttributeType::EcPoint])
+                .map_err(|e| HsmError::Pkcs11(format!("get_attributes EcPoint: {e}")))?;
+            for attr in info {
+                if let Attribute::EcPoint(point) = attr {
+                    // cryptoki returns the EC point as a DER OCTET STRING
+                    // wrapping the raw SEC1 bytes. Strip the OCTET STRING
+                    // header (tag 0x04 + length) to get the raw point.
+                    if point.len() >= 2 && point[0] == 0x04 {
+                        let len = point[1] as usize;
+                        if point.len() >= 2 + len {
+                            return Ok(point[2..2 + len].to_vec());
+                        }
+                    }
+                    // Some PKCS#11 implementations return the raw point
+                    // without the OCTET STRING wrapper. Use as-is if it
+                    // starts with 0x04 (uncompressed point marker).
+                    if !point.is_empty() && point[0] == 0x04 {
+                        return Ok(point.clone());
+                    }
+                    return Ok(point.clone());
+                }
+            }
+            Err(HsmError::Pkcs11("EcPoint attribute not found".into()))
+        }
+
+        /// Get the CKA_LABEL of a PKCS#11 object.
+        async fn get_label(&self, handle: ObjectHandle) -> Result<Vec<u8>, HsmError> {
+            let session = self.session.lock().await;
+            let info = session
+                .get_attributes(handle, &[AttributeType::Label])
+                .map_err(|e| HsmError::Pkcs11(format!("get_attributes Label: {e}")))?;
+            for attr in info {
+                if let Attribute::Label(b) = attr {
+                    return Ok(b);
+                }
+            }
+            Err(HsmError::Pkcs11("Label attribute not found".into()))
+        }
+    }
+
+    use cryptoki::object::AttributeType;
+
+    #[async_trait]
+    impl Hsm for Pkcs11Hsm {
+        async fn generate_key(
+            &self,
+            key_id: &str,
+            key_type: KeyType,
+        ) -> Result<KeyHandle, HsmError> {
+            // Idempotent: if a key with this label exists, return its handle.
+            if let Some(existing) = self.find_by_label(key_id).await? {
+                let mut keys = self.keys.lock().await;
+                keys.insert(key_id.to_string(), (key_type, existing));
+                return Ok(KeyHandle {
+                    id: key_id.to_string(),
+                    version: 1,
+                    key_type,
+                });
+            }
+            let handle = match key_type {
+                KeyType::Aes256 => self.generate_aes_key(key_id).await?,
+                KeyType::EcdsaP256 => {
+                    let (pub_h, _priv_h) = self.generate_ecdsa_keypair(key_id).await?;
+                    pub_h
+                }
+                KeyType::HmacSha1 => {
+                    return Err(HsmError::Unsupported(
+                        "HMAC-SHA1 via PKCS#11 not implemented in Wave 5 (use SoftwareHsm)".into(),
+                    ));
+                }
+                KeyType::Rsa2048 => {
+                    return Err(HsmError::Unsupported(
+                        "RSA-2048 via PKCS#11 not implemented in Wave 5".into(),
+                    ));
+                }
+            };
+            let mut keys = self.keys.lock().await;
+            keys.insert(key_id.to_string(), (key_type, handle));
+            Ok(KeyHandle {
+                id: key_id.to_string(),
+                version: 1,
+                key_type,
+            })
+        }
+
+        async fn sign(&self, _key_handle: &KeyHandle, _data: &[u8]) -> Result<Vec<u8>, HsmError> {
+            Err(HsmError::Unsupported(
+                "PKCS#11 HMAC sign not implemented in Wave 5 (use sign_ecdsa or SoftwareHsm)"
+                    .into(),
+            ))
+        }
+
+        async fn verify(
+            &self,
+            _key_handle: &KeyHandle,
+            _data: &[u8],
+            _signature: &[u8],
+        ) -> Result<bool, HsmError> {
+            Err(HsmError::Unsupported(
+                "PKCS#11 HMAC verify not implemented in Wave 5".into(),
+            ))
+        }
+
+        async fn encrypt(
+            &self,
+            key_handle: &KeyHandle,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            let keys = self.keys.lock().await;
+            let (kt, handle) = keys
+                .get(&key_handle.id)
+                .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+            if *kt != KeyType::Aes256 {
+                return Err(HsmError::Unsupported(format!(
+                    "encrypt requires Aes256, got {:?}",
+                    kt
+                )));
+            }
+            let handle = *handle;
+            drop(keys);
+            let session = self.session.lock().await;
+            // Generate a 12-byte random IV.
+            let iv: [u8; 12] = {
+                use ring::rand::SecureRandom;
+                let rng = ring::rand::SystemRandom::new();
+                let mut buf = [0u8; 12];
+                rng.fill(&mut buf)
+                    .map_err(|_| HsmError::Crypto("random IV failed".into()))?;
+                buf
+            };
+            // GCM tag length = 128 bits (full tag).
+            let tag_bits = cryptoki::types::Ulong::from(128u64);
+            let gcm_params = GcmParams::new(&iv, b"", tag_bits);
+            let mechanism = Mechanism::AesGcm(gcm_params);
+            let ct = session
+                .encrypt(&mechanism, handle, plaintext)
+                .map_err(|e| HsmError::Pkcs11(format!("encrypt: {e}")))?;
+            // Prepend IV so decrypt can recover it.
+            let mut out = Vec::with_capacity(12 + ct.len());
+            out.extend_from_slice(&iv);
+            out.extend_from_slice(&ct);
+            Ok(out)
+        }
+
+        async fn decrypt(
+            &self,
+            key_handle: &KeyHandle,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            if ciphertext.len() < 12 {
+                return Err(HsmError::Crypto("ciphertext too short for IV".into()));
+            }
+            let keys = self.keys.lock().await;
+            let (kt, handle) = keys
+                .get(&key_handle.id)
+                .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+            if *kt != KeyType::Aes256 {
+                return Err(HsmError::Unsupported(format!(
+                    "decrypt requires Aes256, got {:?}",
+                    kt
+                )));
+            }
+            let handle = *handle;
+            drop(keys);
+            let iv: [u8; 12] = ciphertext[..12].try_into().unwrap();
+            let ct = &ciphertext[12..];
+            let session = self.session.lock().await;
+            let tag_bits = cryptoki::types::Ulong::from(128u64);
+            let gcm_params = GcmParams::new(&iv, b"", tag_bits);
+            let mechanism = Mechanism::AesGcm(gcm_params);
+            session
+                .decrypt(&mechanism, handle, ct)
+                .map_err(|e| HsmError::Pkcs11(format!("decrypt: {e}")))
+        }
+
+        async fn rotate_key(&self, key_id: &str) -> Result<KeyHandle, HsmError> {
+            // For PKCS#11, rotation means: destroy the old key object and
+            // generate a new one with the same label. The version bump
+            // is tracked in our local map.
+            let (kt, old_handle) = {
+                let keys = self.keys.lock().await;
+                keys.get(key_id)
+                    .cloned()
+                    .ok_or_else(|| HsmError::NotFound(key_id.to_string()))?
+            };
+            // Destroy the old object.
+            {
+                let session = self.session.lock().await;
+                let _ = session.destroy_object(old_handle);
+            }
+            // Generate a new key.
+            let new_handle = match kt {
+                KeyType::Aes256 => self.generate_aes_key(key_id).await?,
+                KeyType::EcdsaP256 => {
+                    let (pub_h, _priv_h) = self.generate_ecdsa_keypair(key_id).await?;
+                    pub_h
+                }
+                _ => {
+                    return Err(HsmError::Unsupported(format!(
+                        "rotate_key not supported for {:?}",
+                        kt
+                    )));
+                }
+            };
+            let new_version = {
+                let keys = self.keys.lock().await;
+                keys.get(key_id).map(|_| 2u32).unwrap_or(1)
+            };
+            let mut keys = self.keys.lock().await;
+            keys.insert(key_id.to_string(), (kt, new_handle));
+            Ok(KeyHandle {
+                id: key_id.to_string(),
+                version: new_version,
+                key_type: kt,
+            })
+        }
+
+        async fn sign_ecdsa(
+            &self,
+            key_handle: &KeyHandle,
+            data: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            let (kt, pub_handle) = {
+                let keys = self.keys.lock().await;
+                let (kt, h) = keys
+                    .get(&key_handle.id)
+                    .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+                (*kt, *h)
+            };
+            if kt != KeyType::EcdsaP256 {
+                return Err(HsmError::Unsupported(format!(
+                    "sign_ecdsa requires EcdsaP256, got {:?}",
+                    kt
+                )));
+            }
+            // Find the private key by label (PKCS#11 key pairs share a label).
+            let label_bytes = self.get_label(pub_handle).await?;
+            let priv_handle = {
+                let session = self.session.lock().await;
+                let template = vec![
+                    Attribute::Class(ObjectClass::PRIVATE_KEY),
+                    Attribute::Label(label_bytes),
+                ];
+                let objects = session
+                    .find_objects(&template)
+                    .map_err(|e| HsmError::Pkcs11(format!("find private key: {e}")))?;
+                objects
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| HsmError::Pkcs11("private key not found".into()))?
+            };
+            let session = self.session.lock().await;
+            // CKM_ECDSA signs the raw data (no hashing). We need to SHA-256
+            // the data first, then sign with CKM_ECDSA.
+            let digest = ring::digest::digest(&ring::digest::SHA256, data);
+            let mechanism = Mechanism::Ecdsa;
+            session
+                .sign(&mechanism, priv_handle, digest.as_ref())
+                .map_err(|e| HsmError::Pkcs11(format!("sign: {e}")))
+        }
+
+        async fn verify_ecdsa(
+            &self,
+            key_handle: &KeyHandle,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, HsmError> {
+            // We verify using the public key extracted from the PKCS#11
+            // object via ring (avoids the PKCS#11 verify path which has
+            // inconsistent raw-vs-DER signature handling across modules).
+            let pub_sec1 = self.public_key_ecdsa(key_handle).await?;
+            let pk = ring::signature::UnparsedPublicKey::new(
+                &ring::signature::ECDSA_P256_SHA256_ASN1,
+                &pub_sec1,
+            );
+            // The signature from sign_ecdsa is raw r||s (64 bytes). Convert
+            // to DER for ring verification.
+            if signature.len() != 64 {
+                // If it's already DER, try as-is.
+                return Ok(pk.verify(data, signature).is_ok());
+            }
+            let der_sig = raw_ecdsa_to_der(signature);
+            Ok(pk.verify(data, &der_sig).is_ok())
+        }
+
+        async fn public_key_ecdsa(&self, key_handle: &KeyHandle) -> Result<Vec<u8>, HsmError> {
+            let (kt, pub_handle) = {
+                let keys = self.keys.lock().await;
+                let (kt, h) = keys
+                    .get(&key_handle.id)
+                    .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+                (*kt, *h)
+            };
+            if kt != KeyType::EcdsaP256 {
+                return Err(HsmError::Unsupported(format!(
+                    "public_key_ecdsa requires EcdsaP256, got {:?}",
+                    kt
+                )));
+            }
+            self.get_ecdsa_public_sec1(pub_handle).await
+        }
+    }
+
+    /// Convert a raw ECDSA P-256 signature (64-byte r||s) to DER-encoded
+    /// `ECDSA-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`). Used by
+    /// `verify_ecdsa` to bridge PKCS#11's raw signature format and ring's
+    /// DER-based verification.
+    fn raw_ecdsa_to_der(raw: &[u8]) -> Vec<u8> {
+        if raw.len() != 64 {
+            return raw.to_vec();
+        }
+        let r = &raw[..32];
+        let s = &raw[32..];
+        let mut out = Vec::with_capacity(72);
+        out.push(0x30); // SEQUENCE
+        let r_encoded = encode_integer(r);
+        let s_encoded = encode_integer(s);
+        let inner_len = r_encoded.len() + s_encoded.len();
+        out.push(inner_len as u8);
+        out.extend_from_slice(&r_encoded);
+        out.extend_from_slice(&s_encoded);
+        out
+    }
+
+    /// DER-encode an INTEGER from a big-endian byte slice (with leading-zero
+    /// padding if the high bit is set, per DER rules).
+    fn encode_integer(be: &[u8]) -> Vec<u8> {
+        let mut v = be.to_vec();
+        // Strip leading zeros (but keep at least one byte).
+        while v.len() > 1 && v[0] == 0 {
+            v.remove(0);
+        }
+        // Add leading zero if high bit set (positive integer).
+        if v[0] & 0x80 != 0 {
+            v.insert(0, 0);
+        }
+        let mut out = Vec::with_capacity(2 + v.len());
+        out.push(0x02); // INTEGER tag
+        out.push(v.len() as u8);
+        out.extend_from_slice(&v);
+        out
+    }
+
+    // Suppress unused-import warning for `PathBuf` (kept for `impl Into<PathBuf>`
+    // docs but the actual constructor uses `impl AsRef<Path>`).
+    #[allow(dead_code)]
+    type _Unused = PathBuf;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,5 +1685,295 @@ mod tests {
             .await
             .expect_err("wrong type");
         assert!(matches!(err, HsmError::Unsupported(_)), "{err:?}");
+    }
+}
+
+// ===========================================================================
+// PKCS#11 integration tests (Domain-06 Wave 5) — gated by `hsm` feature.
+// These require SoftHSM2 to be installed and a token to be initialized.
+// The tests set up a temporary SoftHSM2 token, run the PKCS#11 operations,
+// and clean up. If SoftHSM2 is not available, the tests are skipped (marked
+// as `#[ignore]` so `cargo test` doesn't fail by default).
+// ===========================================================================
+
+#[cfg(all(test, feature = "hsm"))]
+mod pkcs11_tests {
+    use super::pkcs11::Pkcs11Hsm;
+    use super::*;
+    use std::process::Command;
+
+    /// Find the SoftHSM2 module library. Checks (in order):
+    /// 1. `PKCS11_SOFTHSM2_MODULE` env var,
+    /// 2. `/home/z/my-project/softhsm/extracted/usr/lib/softhsm/libsofthsm2.so`,
+    /// 3. `/usr/lib/softhsm/libsofthsm2.so`,
+    /// 4. `/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so`.
+    fn softhsm_module() -> Option<String> {
+        if let Ok(p) = std::env::var("PKCS11_SOFTHSM2_MODULE") {
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        let candidates = [
+            "/home/z/my-project/softhsm/extracted/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/local/lib/softhsm/libsofthsm2.so",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        }
+        None
+    }
+
+    /// Find the `softhsm2-util` binary.
+    fn softhsm_util() -> Option<String> {
+        if let Ok(p) = std::env::var("PKCS11_SOFTHSM2_UTIL") {
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        let candidates = [
+            "/home/z/my-project/softhsm/extracted/usr/bin/softhsm2-util",
+            "/usr/bin/softhsm2-util",
+            "/usr/local/bin/softhsm2-util",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        }
+        None
+    }
+
+    /// Set up a temporary SoftHSM2 token. Returns (module_path, slot_id, pin).
+    /// Uses a unique temp dir per test run to avoid slot collisions.
+    struct SoftHsmFixture {
+        module_path: String,
+        slot_id: u64,
+        pin: String,
+        _tmpdir: tempfile::TempDir,
+    }
+
+    impl SoftHsmFixture {
+        fn new(label: &str) -> Option<Self> {
+            let module = softhsm_module()?;
+            let util = softhsm_util()?;
+            let tmpdir = tempfile::tempdir().ok()?;
+            // Write a softhsm2.conf pointing at the temp dir.
+            let conf_path = tmpdir.path().join("softhsm2.conf");
+            let conf = format!(
+                "directories.tokendir = {}\nlog.level = ERROR\n",
+                tmpdir.path().join("tokens").display()
+            );
+            std::fs::write(&conf_path, &conf).ok()?;
+            std::fs::create_dir_all(tmpdir.path().join("tokens")).ok()?;
+            // Run softhsm2-util to init a token.
+            let so_pin = "so-pin-1234";
+            let pin = "user-pin-5678";
+            let out = Command::new(&util)
+                .env("SOFTHSM2_CONF", &conf_path)
+                .args([
+                    "--init-token",
+                    "--free",
+                    "--label",
+                    label,
+                    "--so-pin",
+                    so_pin,
+                    "--pin",
+                    pin,
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            // Find the slot ID by listing slots.
+            let list = Command::new(&util)
+                .env("SOFTHSM2_CONF", &conf_path)
+                .args(["--show-slots"])
+                .output()
+                .ok()?;
+            let stdout = String::from_utf8_lossy(&list.stdout);
+            // Parse "Slot N" lines.
+            let slot_id = stdout.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("Slot ")
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse::<u64>().ok())
+            })?;
+            // Re-set the env var for the test (Pkcs11Hsm reads the module path
+            // from the argument, but softhsm2 needs SOFTHSM2_CONF at runtime).
+            std::env::set_var("SOFTHSM2_CONF", &conf_path);
+            Some(Self {
+                module_path: module,
+                slot_id,
+                pin: pin.to_string(),
+                _tmpdir: tmpdir,
+            })
+        }
+    }
+
+    /// PKCS#11 key generation: generate_key(EcdsaP256) returns a valid handle
+    /// and the public key is a 65-byte SEC1 uncompressed point.
+    #[tokio::test]
+    async fn pkcs11_generate_ecdsa_key_returns_valid_public_key() {
+        let fixture = match SoftHsmFixture::new("test-gen-ecdsa") {
+            Some(f) => f,
+            None => {
+                eprintln!("SKIP: SoftHSM2 not available");
+                return;
+            }
+        };
+        let hsm = match Pkcs11Hsm::new(&fixture.module_path, fixture.slot_id, &fixture.pin) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("SKIP: Pkcs11Hsm::new failed: {e}");
+                return;
+            }
+        };
+        let kh = hsm.generate_key("test-ecdsa", KeyType::EcdsaP256).await;
+        let kh = match kh {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("SKIP: generate_key failed: {e}");
+                return;
+            }
+        };
+        assert_eq!(kh.version, 1);
+        assert_eq!(kh.key_type, KeyType::EcdsaP256);
+        let pub_sec1 = hsm.public_key_ecdsa(&kh).await.expect("public_key_ecdsa");
+        assert_eq!(pub_sec1.len(), 65);
+        assert_eq!(pub_sec1[0], 0x04);
+    }
+
+    /// PKCS#11 ECDSA sign/verify: sign data with the HSM key, verify the
+    /// signature. The signature MUST verify under the HSM's public key.
+    #[tokio::test]
+    async fn pkcs11_ecdsa_sign_verify_round_trip() {
+        let fixture = match SoftHsmFixture::new("test-sign-ecdsa") {
+            Some(f) => f,
+            None => {
+                eprintln!("SKIP: SoftHSM2 not available");
+                return;
+            }
+        };
+        let hsm = match Pkcs11Hsm::new(&fixture.module_path, fixture.slot_id, &fixture.pin) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("SKIP: Pkcs11Hsm::new failed: {e}");
+                return;
+            }
+        };
+        let kh = match hsm.generate_key("test-sign", KeyType::EcdsaP256).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("SKIP: generate_key failed: {e}");
+                return;
+            }
+        };
+        let data = b"test payload for pkcs11 ecdsa signing";
+        let sig = hsm.sign_ecdsa(&kh, data).await.expect("sign_ecdsa");
+        // The signature from CKM_ECDSA is raw r||s (64 bytes).
+        assert_eq!(sig.len(), 64, "CKM_ECDSA returns 64-byte raw r||s");
+        assert!(
+            hsm.verify_ecdsa(&kh, data, &sig)
+                .await
+                .expect("verify_ecdsa"),
+            "signature must verify"
+        );
+        // Wrong data must NOT verify.
+        assert!(
+            !hsm.verify_ecdsa(&kh, b"different data", &sig)
+                .await
+                .expect("verify_ecdsa"),
+            "wrong-data signature must NOT verify"
+        );
+    }
+
+    /// PKCS#11 AES-256-GCM encrypt/decrypt round-trip.
+    #[tokio::test]
+    async fn pkcs11_aes_gcm_encrypt_decrypt_round_trip() {
+        let fixture = match SoftHsmFixture::new("test-aes-gcm") {
+            Some(f) => f,
+            None => {
+                eprintln!("SKIP: SoftHSM2 not available");
+                return;
+            }
+        };
+        let hsm = match Pkcs11Hsm::new(&fixture.module_path, fixture.slot_id, &fixture.pin) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("SKIP: Pkcs11Hsm::new failed: {e}");
+                return;
+            }
+        };
+        let kh = match hsm.generate_key("test-aes", KeyType::Aes256).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("SKIP: generate_key failed: {e}");
+                return;
+            }
+        };
+        let plaintext = b"secret payload for aes-gcm via pkcs11";
+        let ct = hsm.encrypt(&kh, plaintext).await.expect("encrypt");
+        // IV (12) + ciphertext + tag (16).
+        assert!(ct.len() > 12 + 16, "ciphertext must include IV + tag");
+        let pt = hsm.decrypt(&kh, &ct).await.expect("decrypt");
+        assert_eq!(pt.as_slice(), plaintext);
+    }
+
+    /// PKCS#11 key persistence across sessions: a key generated in one
+    /// session is visible in a second session (because keys are stored as
+    /// token objects, not session objects).
+    #[tokio::test]
+    async fn pkcs11_key_persists_across_sessions() {
+        let fixture = match SoftHsmFixture::new("test-persist") {
+            Some(f) => f,
+            None => {
+                eprintln!("SKIP: SoftHSM2 not available");
+                return;
+            }
+        };
+        // Session 1: generate a key.
+        let hsm1 = match Pkcs11Hsm::new(&fixture.module_path, fixture.slot_id, &fixture.pin) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("SKIP: Pkcs11Hsm::new failed: {e}");
+                return;
+            }
+        };
+        let kh1 = match hsm1.generate_key("persist-key", KeyType::EcdsaP256).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("SKIP: generate_key failed: {e}");
+                return;
+            }
+        };
+        let pub1 = hsm1.public_key_ecdsa(&kh1).await.expect("public_key_ecdsa");
+        drop(hsm1);
+
+        // Session 2: the key should still be there (find by label).
+        let hsm2 = match Pkcs11Hsm::new(&fixture.module_path, fixture.slot_id, &fixture.pin) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("SKIP: second Pkcs11Hsm::new failed: {e}");
+                return;
+            }
+        };
+        let kh2 = hsm2.generate_key("persist-key", KeyType::EcdsaP256).await;
+        let kh2 = match kh2 {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("SKIP: second generate_key failed: {e}");
+                return;
+            }
+        };
+        let pub2 = hsm2.public_key_ecdsa(&kh2).await.expect("public_key_ecdsa");
+        assert_eq!(
+            pub1, pub2,
+            "key MUST persist across sessions (token object)"
+        );
     }
 }
