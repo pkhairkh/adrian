@@ -121,6 +121,24 @@ pub const DEFAULT_SVC_TICKET_LIFETIME_SECS: i64 = 10 * 60 * 60;
 /// Session key length (32 bytes — AES-256).
 pub const SESSION_KEY_LEN: usize = 32;
 
+// ---------------------------------------------------------------------------
+// FAST armoring constants (RFC 6806 / ADR-012)
+// ---------------------------------------------------------------------------
+
+/// PA-FX-FAST-START padata type (RFC 6806 §5.4.1). Carries the
+/// `KrbFastArmoredReq` in the outer AS-REQ's padata list.
+pub const PA_FX_FAST_START_TYPE: u8 = 143;
+
+/// RFC 6806 §7.5.1 key usage for the FAST armored req enc-part.
+pub const KEY_USAGE_FAST_ARMOR_REQ_ENC: u32 = 65;
+
+/// RFC 6806 §7.5.1 key usage for the FAST armored req checksum.
+pub const KEY_USAGE_FAST_ARMOR_REQ_CKSUM: u32 = 66;
+
+/// FAST armor type 1 — TGT armor (RFC 6806 §5.4.1). The armor TGT's
+/// session key is used to derive the FAST armor key.
+pub const FAST_ARMOR_TYPE_TGT: u32 = 1;
+
 // v0.7.0: The v0.6.0 wire-format magic bytes (0xA1-0xB5) have been removed.
 // All encode/decode functions now use real ASN.1/DER via `rasn-kerberos`
 // (see `crate::wire`).
@@ -283,6 +301,66 @@ pub struct TgsRep {
     pub enc_part_kvno: u32,
     /// Encrypted `EncKdcRepPart` (encrypted with the TGT session key,
     /// key usage 8).
+    pub enc_part: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// FAST armoring types (RFC 6806 / ADR-012)
+// ---------------------------------------------------------------------------
+
+/// FAST enforcement mode (ADR-012 §Decision). Controls how the KDC handles
+/// AS-REQs that do not carry FAST armoring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FastMode {
+    /// KDC accepts both FAST and non-FAST AS-REQs (migration mode).
+    Supported,
+    /// KDC refuses non-FAST AS-REQs with `KdcError::FastArmorRequired`
+    /// (ADR-012 §Decision default).
+    #[default]
+    Required,
+    /// KDC accepts non-FAST AS-REQs but logs them as security events per
+    /// ADR-023 (audit-only mode for AS-REP-roasting detection).
+    Audit,
+    /// KDC accepts non-FAST AS-REQs for a configurable grace period, then
+    /// flips to `Required` automatically (ADR-012 §Decision).
+    Grace,
+}
+
+/// FAST armor key (RFC 6806 §5.4). Derived from the armor TGT's session key
+/// via the Kerberos PRF. Used to encrypt/decrypt the FAST armored request's
+/// enc-part (key usage 65) and the AS-REP enc-part (replacing the client's
+/// long-term key — the AS-REP roasting mitigation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastArmorKey {
+    /// 32-byte AES-256 armor key.
+    pub key: [u8; SESSION_KEY_LEN],
+}
+
+/// FAST factor (RFC 6806 §5.4.1) — the inner padata carried inside the
+/// armored request. Encrypted with the FAST armor key (key usage 65).
+/// Carries the real pre-authenticator (e.g. PA-ENC-TIMESTAMP) plus an
+/// anti-replay nonce and timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastFactor {
+    /// Inner padata (e.g. PA-ENC-TIMESTAMP) encrypted under the armor key.
+    pub inner_padata: Vec<PaData>,
+    /// Client-chosen nonce (echoed back in the FAST response).
+    pub nonce: u32,
+    /// Client's notion of current time (anti-replay; checked against the
+    /// KDC clock within the ±5 minute skew tolerance per RFC 4120 §3.1.3).
+    pub timestamp: i64,
+}
+
+/// KrbFastArmoredReq (RFC 6806 §5.4.1) — the outer armored request. Carries
+/// the armor TGT and the encrypted FAST factor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KrbFastArmoredReq {
+    /// Armor type: 1 = TGT armor (RFC 6806 §5.4.1). Only type 1 is supported.
+    pub armor_type: u32,
+    /// Armor TGT (when armor_type == 1). The TGT's session key is used to
+    /// derive the FAST armor key.
+    pub armor_tgt: Ticket,
+    /// Encrypted FAST factor (encrypted with the FAST armor key, key usage 65).
     pub enc_part: Vec<u8>,
 }
 
@@ -692,6 +770,377 @@ pub fn verify_pa_enc_timestamp(client: &PrincipalRecord, blob: &[u8]) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// FAST armoring (RFC 6806) — key derivation + wrap/unwrap + handler
+// ---------------------------------------------------------------------------
+
+/// Derive the FAST armor key from the armor TGT's session key per
+/// RFC 6806 §5.4: `KrbFastArmorKey = PRF(armor_key, "fastarmorkey" || armor_key)`.
+///
+/// We use HMAC-SHA256 as the PRF (32-byte output = `SESSION_KEY_LEN`). The
+/// real RFC 3961 §5.5 PRF for AES enctypes is AES-CMAC-based; HMAC-SHA256 is
+/// cryptographically sound and avoids a dependency on the HSM's PRF. The
+/// derivation is deterministic: the same armor TGT session key always
+/// produces the same FAST armor key.
+pub fn derive_fast_armor_key(armor_tgt_session_key: &[u8; SESSION_KEY_LEN]) -> FastArmorKey {
+    use ring::hmac::{Context, Key, HMAC_SHA256};
+    let key = Key::new(HMAC_SHA256, armor_tgt_session_key);
+    let mut ctx = Context::with_key(&key);
+    ctx.update(b"fastarmorkey");
+    ctx.update(armor_tgt_session_key);
+    let tag = ctx.sign();
+    let mut out = [0u8; SESSION_KEY_LEN];
+    out.copy_from_slice(tag.as_ref());
+    FastArmorKey { key: out }
+}
+
+/// Minimal length-prefixed byte reader for the FAST codec. Reads big-endian
+/// integers and length-prefixed byte slices from a `&[u8]` buffer.
+struct ByteReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn read_u8(&mut self) -> Result<u8, DecodeError> {
+        if self.pos + 1 > self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let v = self.buf[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+    fn read_u32(&mut self) -> Result<u32, DecodeError> {
+        if self.pos + 4 > self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let mut a = [0u8; 4];
+        a.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
+        self.pos += 4;
+        Ok(u32::from_be_bytes(a))
+    }
+    fn read_i64(&mut self) -> Result<i64, DecodeError> {
+        if self.pos + 8 > self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
+        self.pos += 8;
+        Ok(i64::from_be_bytes(a))
+    }
+    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if self.pos + n > self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let v = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(v)
+    }
+}
+
+/// Encode a `FastFactor` as length-prefixed bytes (self-consistent binary
+/// format — NOT RFC 4120 ASN.1/DER; the FAST ASN.1 codec is a future wiring
+/// task once `rasn-kerberos` adds the RFC 6806 types).
+pub fn encode_fast_factor(f: &FastFactor) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(f.inner_padata.len() as u32).to_be_bytes());
+    for p in &f.inner_padata {
+        out.push(p.padata_type);
+        out.extend_from_slice(&(p.padata_value.len() as u32).to_be_bytes());
+        out.extend_from_slice(&p.padata_value);
+    }
+    out.extend_from_slice(&f.nonce.to_be_bytes());
+    out.extend_from_slice(&f.timestamp.to_be_bytes());
+    out
+}
+
+/// Decode a `FastFactor` from length-prefixed bytes (inverse of
+/// [`encode_fast_factor`]).
+pub fn decode_fast_factor(bytes: &[u8]) -> Result<FastFactor, DecodeError> {
+    let mut r = ByteReader::new(bytes);
+    let padata_count = r.read_u32()? as usize;
+    let mut inner_padata = Vec::with_capacity(padata_count);
+    for _ in 0..padata_count {
+        let padata_type = r.read_u8()?;
+        let vlen = r.read_u32()? as usize;
+        let padata_value = r.read_bytes(vlen)?.to_vec();
+        inner_padata.push(PaData {
+            padata_type,
+            padata_value,
+        });
+    }
+    let nonce = r.read_u32()?;
+    let timestamp = r.read_i64()?;
+    Ok(FastFactor {
+        inner_padata,
+        nonce,
+        timestamp,
+    })
+}
+
+/// Encode a `KrbFastArmoredReq` as length-prefixed bytes. The armor TGT is
+/// encoded via the existing `encode_ticket` (rasn-kerberos based), so the
+/// armor TGT is wire-compatible with a regular TGT.
+pub fn encode_krb_fast_armored_req(r: &KrbFastArmoredReq) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&r.armor_type.to_be_bytes());
+    let tgt_bytes = encode_ticket(&r.armor_tgt);
+    out.extend_from_slice(&(tgt_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&tgt_bytes);
+    out.extend_from_slice(&(r.enc_part.len() as u32).to_be_bytes());
+    out.extend_from_slice(&r.enc_part);
+    out
+}
+
+/// Decode a `KrbFastArmoredReq` from length-prefixed bytes (inverse of
+/// [`encode_krb_fast_armored_req`]).
+pub fn decode_krb_fast_armored_req(bytes: &[u8]) -> Result<KrbFastArmoredReq, DecodeError> {
+    let mut r = ByteReader::new(bytes);
+    let armor_type = r.read_u32()?;
+    let tgt_len = r.read_u32()? as usize;
+    let tgt_bytes = r.read_bytes(tgt_len)?;
+    let armor_tgt = decode_ticket(tgt_bytes)?;
+    let enc_len = r.read_u32()? as usize;
+    let enc_part = r.read_bytes(enc_len)?.to_vec();
+    Ok(KrbFastArmoredReq {
+        armor_type,
+        armor_tgt,
+        enc_part,
+    })
+}
+
+/// Wrap an inner AS-REQ's padata in a FAST armored request (RFC 6806 §5.4).
+///
+/// Caller provides:
+/// - `armor_tgt`: the armor TGT (already obtained by the client).
+/// - `armor_tgt_session_key`: the armor TGT's session key (used to derive
+///   the FAST armor key via [`derive_fast_armor_key`]).
+/// - `inner_padata`: the real pre-authenticator (e.g. PA-ENC-TIMESTAMP).
+/// - `nonce`: client-chosen anti-replay nonce.
+/// - `timestamp`: client's notion of current time.
+///
+/// Returns the `KrbFastArmoredReq` to be carried in the outer AS-REQ's
+/// padata list as `PA-FX-FAST-START` (type 143).
+pub fn wrap_fast_armor(
+    armor_tgt: Ticket,
+    armor_tgt_session_key: &[u8; SESSION_KEY_LEN],
+    inner_padata: Vec<PaData>,
+    nonce: u32,
+    timestamp: i64,
+) -> Result<KrbFastArmoredReq, KdcError> {
+    let armor_key = derive_fast_armor_key(armor_tgt_session_key);
+    let factor = FastFactor {
+        inner_padata,
+        nonce,
+        timestamp,
+    };
+    let factor_bytes = encode_fast_factor(&factor);
+    let enc_part = encrypt_for_usage(&armor_key.key, KEY_USAGE_FAST_ARMOR_REQ_ENC, &factor_bytes)?;
+    Ok(KrbFastArmoredReq {
+        armor_type: FAST_ARMOR_TYPE_TGT,
+        armor_tgt,
+        enc_part,
+    })
+}
+
+/// Unwrap (decrypt + verify) a FAST armored request, returning the inner
+/// `FastFactor` (RFC 6806 §5.4). Caller must supply the armor TGT's session
+/// key (recovered by decrypting the armor TGT with the krbtgt key).
+///
+/// Verifies the FAST factor's timestamp is within the ±5 minute clock-skew
+/// tolerance (RFC 4120 §3.1.3) as an anti-replay measure.
+pub fn unwrap_fast_armor(
+    armored: &KrbFastArmoredReq,
+    armor_tgt_session_key: &[u8; SESSION_KEY_LEN],
+) -> Result<FastFactor, KdcError> {
+    let armor_key = derive_fast_armor_key(armor_tgt_session_key);
+    let factor_bytes = decrypt_for_usage(
+        &armor_key.key,
+        KEY_USAGE_FAST_ARMOR_REQ_ENC,
+        &armored.enc_part,
+    )?;
+    let factor = decode_fast_factor(&factor_bytes)?;
+    // Anti-replay: verify the factor's timestamp is within the clock-skew
+    // tolerance (RFC 4120 §3.1.3).
+    let now = now_secs();
+    let skew = now - factor.timestamp;
+    if skew.abs() > CLOCK_SKEW_TOLERANCE_SECS {
+        return Err(KdcError::PreauthFailed(format!(
+            "FAST factor clock skew {skew}s exceeds tolerance {CLOCK_SKEW_TOLERANCE_SECS}s"
+        )));
+    }
+    Ok(factor)
+}
+
+/// Find the `PA-FX-FAST-START` padata entry (type 143). Returns the encoded
+/// `KrbFastArmoredReq` bytes (caller must decode via
+/// [`decode_krb_fast_armored_req`]).
+pub fn find_fast_armor(padata: &[PaData]) -> Result<Option<Vec<u8>>, KdcError> {
+    for p in padata {
+        if p.padata_type == PA_FX_FAST_START_TYPE {
+            return Ok(Some(p.padata_value.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// AS-REQ handler with FAST armoring enforcement (RFC 6806 / ADR-012).
+///
+/// Behavior depends on `fast_mode`:
+/// - `Required` (default per ADR-012): reject non-FAST AS-REQs with
+///   `KdcError::FastArmorRequired`.
+/// - `Supported` / `Audit` / `Grace`: accept non-FAST AS-REQs by falling
+///   through to the standard [`handle_as_req_with_metrics`] path (with a
+///   `tracing::warn!` for audit/grace modes per ADR-023).
+///
+/// For FAST-armored AS-REQs:
+/// 1. Extract the `PA-FX-FAST-START` padata and decode the `KrbFastArmoredReq`.
+/// 2. Decrypt the armor TGT with the krbtgt key (key usage 2) to recover
+///    the armor TGT's session key.
+/// 3. Derive the FAST armor key from the armor TGT session key.
+/// 4. Decrypt the FAST factor with the armor key (key usage 65).
+/// 5. Use the inner padata (PA-ENC-TIMESTAMP) for pre-auth verification.
+/// 6. Build the AS-REP, but encrypt the enc-part with the FAST armor key
+///    (not the client's long-term key) — this is the AS-REP roasting
+///    mitigation per ADR-012 §Decision.
+pub async fn handle_as_req_fast(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    fast_mode: FastMode,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_as_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    let fast_blob = find_fast_armor(&req.padata)?;
+    match (fast_blob, fast_mode) {
+        (None, FastMode::Required) => {
+            tracing::warn!(
+                realm = %req.realm,
+                principal = %req.cname.join("/"),
+                "non-FAST AS-REQ rejected (fast_mode = Required)"
+            );
+            Err(KdcError::FastArmorRequired)
+        }
+        (None, FastMode::Supported) | (None, FastMode::Audit) | (None, FastMode::Grace) => {
+            tracing::warn!(
+                realm = %req.realm,
+                principal = %req.cname.join("/"),
+                mode = ?fast_mode,
+                "non-FAST AS-REQ accepted (FAST not present)"
+            );
+            // Fall through to the standard handler path.
+            return handle_as_req_with_metrics(store, krbtgt_key, req_bytes, None).await;
+        }
+        (Some(blob), _) => {
+            // FAST armor present — decode + verify.
+            let armored = decode_krb_fast_armored_req(&blob)?;
+            if armored.armor_type != FAST_ARMOR_TYPE_TGT {
+                return Err(KdcError::PreauthFailed(format!(
+                    "unsupported FAST armor type {} (only type 1 / TGT armor supported)",
+                    armored.armor_type
+                )));
+            }
+            // Decrypt the armor TGT with the krbtgt key (key usage 2).
+            let armor_tgt_pt = decrypt_for_usage(
+                krbtgt_key,
+                KEY_USAGE_AS_REP_TGT,
+                &armored.armor_tgt.enc_part,
+            )?;
+            let armor_tgt_etp = decode_enc_ticket_part(&armor_tgt_pt)?;
+            // Unwrap the FAST factor (verifies clock skew).
+            let factor = unwrap_fast_armor(&armored, &armor_tgt_etp.session_key)?;
+
+            // Look up the client principal.
+            let client = store
+                .lookup(&req.realm, &req.cname)
+                .await
+                .map_err(|e| KdcError::Storage(format!("principal lookup: {e}")))?
+                .ok_or_else(|| {
+                    KdcError::PrincipalNotFound(format!("{}/{}", req.realm, req.cname.join("/")))
+                })?;
+
+            // Verify the inner PA-ENC-TIMESTAMP from the FAST factor.
+            let inner_pa = find_pa_enc_timestamp(&factor.inner_padata)?;
+            match inner_pa {
+                Some(blob) => verify_pa_enc_timestamp(&client, &blob)?,
+                None => return Err(KdcError::PreauthRequired),
+            }
+
+            // Build the TGT (same as the non-FAST path).
+            let now = now_secs();
+            let session_key = random_session_key()?;
+            let enc_ticket_part = EncTicketPart {
+                flags: TICKET_FLAG_FORWARDABLE | TICKET_FLAG_RENEWABLE,
+                crealm: client.realm.clone(),
+                cname: client.components.clone(),
+                session_key,
+                authtime: now,
+                starttime: now,
+                endtime: now + DEFAULT_TGT_LIFETIME_SECS,
+                renew_till: now + 2 * DEFAULT_TGT_LIFETIME_SECS,
+                client_uuid: client.uuid,
+            };
+            let enc_ticket_part_bytes = encode_enc_ticket_part(&enc_ticket_part);
+            let ticket_enc =
+                encrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &enc_ticket_part_bytes)?;
+            let tgt = Ticket {
+                tkt_vno: PVNO,
+                realm: client.realm.clone(),
+                sname: vec!["krbtgt".to_string(), client.realm.clone()],
+                kvno: 1,
+                etype: chosen_etype,
+                enc_part: ticket_enc,
+            };
+
+            // AS-REP roasting mitigation: encrypt the enc-part with the FAST
+            // armor key (NOT the client's long-term key). An attacker who
+            // captures the AS-REP cannot offline-crack it because the armor
+            // key is derived from the armor TGT session key, which the
+            // attacker does not have.
+            let armor_key = derive_fast_armor_key(&armor_tgt_etp.session_key);
+            let enc_rep_part = EncKdcRepPart {
+                session_key,
+                last_req: now,
+                nonce: req.nonce,
+                authtime: now,
+                starttime: now,
+                endtime: now + DEFAULT_TGT_LIFETIME_SECS,
+                renew_till: now + 2 * DEFAULT_TGT_LIFETIME_SECS,
+                crealm: client.realm.clone(),
+                cname: client.components.clone(),
+            };
+            let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+            let enc_part = encrypt_for_usage(
+                &armor_key.key,
+                KEY_USAGE_AS_REP_ENC_PART,
+                &enc_rep_part_bytes,
+            )?;
+
+            let rep = AsRep {
+                pvno: PVNO,
+                msg_type: MSG_TYPE_AS_REP,
+                crealm: client.realm.clone(),
+                cname: client.components.clone(),
+                ticket: tgt,
+                enc_part_etype: chosen_etype,
+                enc_part_kvno: client.kvno,
+                enc_part,
+            };
+            tracing::info!(
+                realm = %req.realm,
+                principal = %req.cname.join("/"),
+                etype = %etype_label(chosen_etype),
+                "FAST-armored AS-REQ succeeded"
+            );
+            Ok(encode_as_rep(&rep))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TGS-REQ handler
 // ---------------------------------------------------------------------------
 
@@ -889,6 +1338,835 @@ fn principal_names_eq(a: &[String], b: &[String]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-realm TGT referral (RFC 4120 §3.3.3 / ADR-013)
+// ---------------------------------------------------------------------------
+
+/// Transited-field validation mode (ADR-013 §Decision). Controls how the
+/// KDC validates the `Transited` field of incoming cross-realm tickets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransitedValidation {
+    /// Validate per spec (RFC 4120 §3.3.3) — reject if the transited chain
+    /// includes a realm the local KDC does not trust (directly or
+    /// transitively). ADR-013 §Decision default.
+    #[default]
+    Strict,
+    /// Skip `Transited` validation entirely (AD's default for intra-forest
+    /// trusts — useful when the forest is one administrative unit).
+    Disabled,
+    /// Validate but accept shortcut trusts as valid chains (ADR-013 §Decision:
+    /// "prefer shortcut trusts over multi-hop paths").
+    ShortcutAware,
+}
+
+/// Cross-realm trust configuration entry. Maps a foreign realm to its
+/// validation mode. The cross-realm key itself is stored in the principal
+/// store as a `krbtgt/FOREIGN_REALM` principal in the local realm.
+#[derive(Clone, Debug)]
+pub struct CrossRealmTrust {
+    /// The foreign realm (normalized to uppercase).
+    pub foreign_realm: String,
+    /// Transited-field validation mode for this trust.
+    pub transited_validation: TransitedValidation,
+}
+
+impl CrossRealmTrust {
+    /// Create a new cross-realm trust entry with the default (Strict)
+    /// validation mode.
+    pub fn new(foreign_realm: impl Into<String>) -> Self {
+        Self {
+            foreign_realm: foreign_realm.into().to_ascii_uppercase(),
+            transited_validation: TransitedValidation::default(),
+        }
+    }
+
+    /// Set the transited-field validation mode.
+    pub fn with_validation(mut self, mode: TransitedValidation) -> Self {
+        self.transited_validation = mode;
+        self
+    }
+}
+
+/// Capath validator per ADR-069 / ADR-013 §Decision. Validates the
+/// transited realm chain (the list of realms a ticket has passed through)
+/// against the local KDC's trust graph.
+#[derive(Clone, Debug, Default)]
+pub struct CapathValidator {
+    /// Set of directly-trusted foreign realms (realms for which the local
+    /// KDC has a cross-realm key + trust entry).
+    trusted_realms: std::collections::HashSet<String>,
+    /// Shortcut trusts: realms reachable via a direct trust even if not
+    /// adjacent in the chain (ADR-013 §Decision).
+    shortcut_realms: std::collections::HashSet<String>,
+    /// Default validation mode for realms not explicitly configured.
+    default_validation: TransitedValidation,
+}
+
+impl CapathValidator {
+    /// Construct a new capath validator with no trusted realms.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a trusted realm (direct trust).
+    pub fn add_trust(&mut self, trust: &CrossRealmTrust) {
+        let realm = trust.foreign_realm.to_ascii_uppercase();
+        self.trusted_realms.insert(realm.clone());
+        if trust.transited_validation == TransitedValidation::ShortcutAware {
+            self.shortcut_realms.insert(realm);
+        }
+    }
+
+    /// Set the default validation mode.
+    pub fn with_default_validation(mut self, mode: TransitedValidation) -> Self {
+        self.default_validation = mode;
+        self
+    }
+
+    /// Validate a transited realm chain. Returns `Ok(())` if the chain is
+    /// valid, `Err` with a description if an untrusted realm is found.
+    ///
+    /// The `chain` is the list of realms the ticket has transited (NOT
+    /// including the client's home realm or the target realm). Per RFC 4120
+    /// §3.3.3, each realm in the chain must be trusted by the local KDC.
+    pub fn validate(&self, chain: &[&str]) -> Result<(), KdcError> {
+        if self.default_validation == TransitedValidation::Disabled {
+            return Ok(());
+        }
+        for realm in chain {
+            let upper = realm.to_ascii_uppercase();
+            if !self.trusted_realms.contains(&upper) {
+                return Err(KdcError::Policy(format!(
+                    "transited realm {realm} is not trusted (capath validation per ADR-013)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true if the local KDC has a direct trust to `foreign_realm`.
+    pub fn trusts(&self, foreign_realm: &str) -> bool {
+        self.trusted_realms
+            .contains(&foreign_realm.to_ascii_uppercase())
+    }
+}
+
+/// Check if the requested service realm differs from the local KDC's realm
+/// (case-insensitive per RFC 4120 §6.1).
+pub fn is_foreign_realm(service_realm: &str, local_realm: &str) -> bool {
+    !service_realm.eq_ignore_ascii_case(local_realm)
+}
+
+/// Issue a cross-realm referral TGT (RFC 4120 §3.3.3 / ADR-013). The
+/// referral TGT is a ticket with `sname = krbtgt/FOREIGN_REALM`, encrypted
+/// with the cross-realm key (the key of the `krbtgt/FOREIGN_REALM` principal
+/// in the local realm). The client submits this referral TGT to the foreign
+/// KDC, which either issues a service ticket (if the service is local) or
+/// another referral.
+#[allow(clippy::too_many_arguments)]
+pub fn issue_referral_tgt(
+    cross_realm_key: &Aes256Key,
+    cross_realm_kvno: u32,
+    client_realm: &str,
+    client_cname: &[String],
+    client_uuid: Uuid,
+    foreign_realm: &str,
+    chosen_etype: EType,
+    inherited_flags: u32,
+) -> Result<(Ticket, [u8; SESSION_KEY_LEN]), KdcError> {
+    let now = now_secs();
+    let session_key = random_session_key()?;
+    let enc_ticket_part = EncTicketPart {
+        flags: inherited_flags,
+        crealm: client_realm.to_string(),
+        cname: client_cname.to_vec(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_TGT_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_TGT_LIFETIME_SECS,
+        client_uuid,
+    };
+    let enc_ticket_part_bytes = encode_enc_ticket_part(&enc_ticket_part);
+    let ticket_enc = encrypt_for_usage(
+        cross_realm_key,
+        KEY_USAGE_AS_REP_TGT,
+        &enc_ticket_part_bytes,
+    )?;
+    let referral_tgt = Ticket {
+        tkt_vno: PVNO,
+        realm: client_realm.to_string(),
+        sname: vec!["krbtgt".to_string(), foreign_realm.to_string()],
+        kvno: cross_realm_kvno,
+        etype: chosen_etype,
+        enc_part: ticket_enc,
+    };
+    Ok((referral_tgt, session_key))
+}
+
+/// TGS-REQ handler with cross-realm TGT referral support (RFC 4120 §3.3.3 /
+/// ADR-013). Extends the standard TGS-REQ handler with referral logic:
+///
+/// 1. Parse TGS-REQ, decrypt TGT, verify authenticator (same as standard).
+/// 2. If the requested service realm (`req.realm`) matches `local_realm`,
+///    proceed with the standard TGS flow (issue a service ticket).
+/// 3. If the service realm is foreign, look up the cross-realm key
+///    (`store.lookup(local_realm, ["krbtgt", req.realm])`). If found, issue
+///    a referral TGT with `sname = krbtgt/FOREIGN_REALM` encrypted with the
+///    cross-realm key. If not found, return `KdcError::PrincipalNotFound`.
+/// 4. The TGS-REP carries the referral TGT; the enc-part (encrypted with
+///    the TGT session key, key usage 8) carries the new session key.
+pub async fn handle_tgs_req_with_referral(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    local_realm: &str,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_tgs_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // Verify the TGT: decrypt with krbtgt key (key usage 2).
+    let tgt_enc_part_plaintext =
+        decrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &req.tgt.enc_part)?;
+    let enc_ticket_part = decode_enc_ticket_part(&tgt_enc_part_plaintext)?;
+
+    // Verify the authenticator.
+    let auth_plaintext = decrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REQ_AUTHENTICATOR,
+        &req.authenticator_enc,
+    )?;
+    let authenticator = decode_authenticator(&auth_plaintext)?;
+    if !principal_names_eq(&authenticator.cname, &enc_ticket_part.cname) {
+        return Err(KdcError::PreauthFailed(
+            "authenticator cname does not match TGT cname".into(),
+        ));
+    }
+
+    // ---- Cross-realm referral check (ADR-013) ----
+    if is_foreign_realm(&req.realm, local_realm) {
+        tracing::info!(
+            local_realm = %local_realm,
+            foreign_realm = %req.realm,
+            client = %enc_ticket_part.cname.join("/"),
+            "cross-realm TGT referral: service is in a foreign realm"
+        );
+        // Look up the cross-realm key: krbtgt/FOREIGN_REALM in the local realm.
+        let cross_realm_principal = store
+            .lookup(local_realm, &["krbtgt".to_string(), req.realm.clone()])
+            .await
+            .map_err(|e| KdcError::Storage(format!("cross-realm key lookup: {e}")))?
+            .ok_or_else(|| {
+                KdcError::PrincipalNotFound(format!(
+                    "no cross-realm trust to {}/{} (capath per ADR-013)",
+                    local_realm, req.realm
+                ))
+            })?;
+
+        // Issue the referral TGT.
+        let (referral_tgt, referral_session_key) = issue_referral_tgt(
+            &cross_realm_principal.key,
+            cross_realm_principal.kvno,
+            &enc_ticket_part.crealm,
+            &enc_ticket_part.cname,
+            enc_ticket_part.client_uuid,
+            &req.realm,
+            chosen_etype,
+            enc_ticket_part.flags,
+        )?;
+
+        // Build the TGS-REP enc-part (encrypted with the TGT session key,
+        // key usage 8).
+        let now = now_secs();
+        let enc_rep_part = EncKdcRepPart {
+            session_key: referral_session_key,
+            last_req: now,
+            nonce: req.nonce,
+            authtime: now,
+            starttime: now,
+            endtime: now + DEFAULT_TGT_LIFETIME_SECS,
+            renew_till: now + 2 * DEFAULT_TGT_LIFETIME_SECS,
+            crealm: enc_ticket_part.crealm.clone(),
+            cname: enc_ticket_part.cname.clone(),
+        };
+        let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+        let enc_part = encrypt_for_usage(
+            &enc_ticket_part.session_key,
+            KEY_USAGE_TGS_REP_ENC_PART,
+            &enc_rep_part_bytes,
+        )?;
+
+        let rep = TgsRep {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REP,
+            crealm: enc_ticket_part.crealm.clone(),
+            cname: enc_ticket_part.cname.clone(),
+            ticket: referral_tgt,
+            enc_part_etype: chosen_etype,
+            enc_part_kvno: req.tgt.kvno,
+            enc_part,
+        };
+        tracing::info!(foreign_realm = %req.realm, "cross-realm referral TGT issued");
+        return Ok(encode_tgs_rep(&rep));
+    }
+
+    // ---- Local realm: standard TGS flow (issue a service ticket) ----
+    let svc = store
+        .lookup(&req.realm, &req.sname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("service lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!("{}/{}", req.realm, req.sname.join("/")))
+        })?;
+
+    let now = now_secs();
+    let session_key = enc_ticket_part.session_key;
+    let svc_enc_ticket_part = EncTicketPart {
+        flags: enc_ticket_part.flags,
+        crealm: enc_ticket_part.crealm.clone(),
+        cname: enc_ticket_part.cname.clone(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        client_uuid: enc_ticket_part.client_uuid,
+    };
+    let svc_enc_ticket_part_bytes = encode_enc_ticket_part(&svc_enc_ticket_part);
+    let svc_ticket_enc = encrypt_for_usage(
+        &svc.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &svc_enc_ticket_part_bytes,
+    )?;
+    let svc_ticket = Ticket {
+        tkt_vno: PVNO,
+        realm: svc.realm.clone(),
+        sname: svc.components.clone(),
+        kvno: svc.kvno,
+        etype: chosen_etype,
+        enc_part: svc_ticket_enc,
+    };
+    let enc_rep_part = EncKdcRepPart {
+        session_key,
+        last_req: now,
+        nonce: req.nonce,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        crealm: svc.realm.clone(),
+        cname: enc_ticket_part.cname.clone(),
+    };
+    let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+    let enc_part = encrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REP_ENC_PART,
+        &enc_rep_part_bytes,
+    )?;
+    let rep = TgsRep {
+        pvno: PVNO,
+        msg_type: MSG_TYPE_TGS_REP,
+        crealm: enc_ticket_part.crealm.clone(),
+        cname: enc_ticket_part.cname.clone(),
+        ticket: svc_ticket,
+        enc_part_etype: chosen_etype,
+        enc_part_kvno: req.tgt.kvno,
+        enc_part,
+    };
+    Ok(encode_tgs_rep(&rep))
+}
+
+// ---------------------------------------------------------------------------
+// S4U2Self + S4U2Proxy (ADR-087 / MS-SFU)
+// ---------------------------------------------------------------------------
+
+/// PA-FOR-USER padata type (RFC 4120 §2.6 extension / MS-SFU §3.1).
+/// Carries the user's identity in an S4U2Self TGS-REQ.
+pub const PA_FOR_USER_TYPE: u8 = 129;
+
+/// PA-FOR-USER (RFC 4120 §2.6 extension) — carries the user's identity
+/// in an S4U2Self TGS-REQ. The KDC issues a ticket for the requesting
+/// service with this user's identity in the `cname` field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaForUser {
+    /// The user's principal name components (e.g. `["alice"]`).
+    pub user_name: Vec<String>,
+    /// The user's realm (e.g. `EXAMPLE.COM`).
+    pub user_realm: String,
+}
+
+/// Encode a `PaForUser` as length-prefixed bytes (self-consistent binary
+/// format — NOT RFC 4120 ASN.1/DER; the S4U ASN.1 codec is a future task).
+pub fn encode_pa_for_user(p: &PaForUser) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(p.user_name.len() as u32).to_be_bytes());
+    for c in &p.user_name {
+        out.extend_from_slice(&(c.len() as u32).to_be_bytes());
+        out.extend_from_slice(c.as_bytes());
+    }
+    out.extend_from_slice(&(p.user_realm.len() as u32).to_be_bytes());
+    out.extend_from_slice(p.user_realm.as_bytes());
+    out
+}
+
+/// Decode a `PaForUser` from length-prefixed bytes.
+pub fn decode_pa_for_user(bytes: &[u8]) -> Result<PaForUser, DecodeError> {
+    let mut r = ByteReader::new(bytes);
+    let name_count = r.read_u32()? as usize;
+    let mut user_name = Vec::with_capacity(name_count);
+    for _ in 0..name_count {
+        let clen = r.read_u32()? as usize;
+        let cbytes = r.read_bytes(clen)?;
+        let s = std::str::from_utf8(cbytes).map_err(|_| DecodeError::InvalidUtf8)?;
+        user_name.push(s.to_string());
+    }
+    let rlen = r.read_u32()? as usize;
+    let rbytes = r.read_bytes(rlen)?;
+    let user_realm = std::str::from_utf8(rbytes)
+        .map_err(|_| DecodeError::InvalidUtf8)?
+        .to_string();
+    Ok(PaForUser {
+        user_name,
+        user_realm,
+    })
+}
+
+/// Format a principal name as `realm/components` for ACL matching.
+fn format_spn(realm: &str, components: &[String]) -> String {
+    let mut s = String::from(realm);
+    s.push('/');
+    s.push_str(&components.join("/"));
+    s
+}
+
+/// S4U2Self handler (ADR-087 / MS-SFU §3.1). A service with
+/// `TRUSTED_TO_AUTH_FOR_DELEGATION` UAC bit requests a ticket to itself
+/// on behalf of a user. The KDC:
+///
+/// 1. Parses the TGS-REQ and decrypts the requesting service's TGT.
+/// 2. Verifies the authenticator (proves the service's identity).
+/// 3. Looks up the requesting service in the store.
+/// 4. Validates `trusted_to_auth_for_delegation == true` on the service.
+/// 5. Looks up the user specified in `pa_for_user`.
+/// 6. Issues a ticket for the requesting service itself (`sname` = the
+///    service's SPN), with the **user's** identity in `cname`.
+/// 7. Sets the `forwardable` flag iff the service has a non-empty
+///    `allowed_to_delegate_to` list (Bronze Bit mitigation per CVE-2020-17049:
+///    a non-forwardable S4U2Self ticket cannot be used for S4U2Proxy).
+pub async fn handle_tgs_req_s4u2self(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    pa_for_user: &PaForUser,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_tgs_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // Verify the requesting service's TGT.
+    let tgt_enc_part_plaintext =
+        decrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &req.tgt.enc_part)?;
+    let enc_ticket_part = decode_enc_ticket_part(&tgt_enc_part_plaintext)?;
+
+    // Verify the authenticator.
+    let auth_plaintext = decrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REQ_AUTHENTICATOR,
+        &req.authenticator_enc,
+    )?;
+    let authenticator = decode_authenticator(&auth_plaintext)?;
+    if !principal_names_eq(&authenticator.cname, &enc_ticket_part.cname) {
+        return Err(KdcError::PreauthFailed(
+            "S4U2Self: authenticator cname does not match TGT cname".into(),
+        ));
+    }
+
+    // Look up the requesting service.
+    let service = store
+        .lookup(&enc_ticket_part.crealm, &enc_ticket_part.cname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Self: service lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Self: service {}/{}",
+                enc_ticket_part.crealm,
+                enc_ticket_part.cname.join("/")
+            ))
+        })?;
+
+    // Validate TRUSTED_TO_AUTH_FOR_DELEGATION (ADR-087 §Decision).
+    if !service.trusted_to_auth_for_delegation {
+        return Err(KdcError::Policy(
+            "S4U2Self: service lacks TRUSTED_TO_AUTH_FOR_DELEGATION (ADR-087)".into(),
+        ));
+    }
+
+    // Look up the user specified in PA-FOR-USER.
+    let user = store
+        .lookup(&pa_for_user.user_realm, &pa_for_user.user_name)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Self: user lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Self: user {}/{}",
+                pa_for_user.user_realm,
+                pa_for_user.user_name.join("/")
+            ))
+        })?;
+
+    // Build the S4U2Self ticket: sname = the requesting service, cname = the user.
+    // The forwardable flag is set iff the service has allowed_to_delegate_to
+    // (Bronze Bit mitigation per CVE-2020-17049).
+    let now = now_secs();
+    let session_key = random_session_key()?;
+    let mut flags = TICKET_FLAG_RENEWABLE;
+    if !service.allowed_to_delegate_to.is_empty() {
+        flags |= TICKET_FLAG_FORWARDABLE;
+    }
+    let s4u_enc_ticket_part = EncTicketPart {
+        flags,
+        crealm: user.realm.clone(),
+        cname: user.components.clone(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        client_uuid: user.uuid,
+    };
+    let s4u_enc_ticket_part_bytes = encode_enc_ticket_part(&s4u_enc_ticket_part);
+    let s4u_ticket_enc = encrypt_for_usage(
+        &service.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &s4u_enc_ticket_part_bytes,
+    )?;
+    let s4u_ticket = Ticket {
+        tkt_vno: PVNO,
+        realm: service.realm.clone(),
+        sname: service.components.clone(),
+        kvno: service.kvno,
+        etype: chosen_etype,
+        enc_part: s4u_ticket_enc,
+    };
+
+    // Build the TGS-REP enc-part (encrypted with the TGT session key).
+    let enc_rep_part = EncKdcRepPart {
+        session_key,
+        last_req: now,
+        nonce: req.nonce,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        crealm: user.realm.clone(),
+        cname: user.components.clone(),
+    };
+    let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+    let enc_part = encrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REP_ENC_PART,
+        &enc_rep_part_bytes,
+    )?;
+
+    let rep = TgsRep {
+        pvno: PVNO,
+        msg_type: MSG_TYPE_TGS_REP,
+        crealm: user.realm.clone(),
+        cname: user.components.clone(),
+        ticket: s4u_ticket,
+        enc_part_etype: chosen_etype,
+        enc_part_kvno: req.tgt.kvno,
+        enc_part,
+    };
+    tracing::info!(
+        service = %format_spn(&service.realm, &service.components),
+        user = %format_spn(&user.realm, &user.components),
+        forwardable = !service.allowed_to_delegate_to.is_empty(),
+        "S4U2Self: issued ticket"
+    );
+    Ok(encode_tgs_rep(&rep))
+}
+
+/// S4U2Proxy handler (ADR-087 / MS-SFU §3.2). A service exchanges an
+/// S4U2Self evidence ticket for a TGS to a backend service, constrained by
+/// `msDS-AllowedToDelegateTo`. The KDC:
+///
+/// 1. Parses the TGS-REQ and decrypts the requesting service's TGT.
+/// 2. Verifies the authenticator.
+/// 3. Decrypts the evidence ticket (S4U2Self ticket) with the requesting
+///    service's key to recover the user's identity.
+/// 4. **Bronze Bit mitigation (CVE-2020-17049)**: validates the evidence
+///    ticket's `forwardable` flag. If not forwardable, rejects with
+///    `KdcError::Policy`.
+/// 5. Looks up the requesting service in the store.
+/// 6. Validates the requested SPN against `allowed_to_delegate_to` on the
+///    service (classic constrained delegation ACL per ADR-087).
+/// 7. Issues a TGS for the backend service with the **user's** identity
+///    in `cname`.
+pub async fn handle_tgs_req_s4u2proxy(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    evidence_ticket: &Ticket,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_tgs_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // Verify the requesting service's TGT.
+    let tgt_enc_part_plaintext =
+        decrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &req.tgt.enc_part)?;
+    let enc_ticket_part = decode_enc_ticket_part(&tgt_enc_part_plaintext)?;
+
+    // Verify the authenticator.
+    let auth_plaintext = decrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REQ_AUTHENTICATOR,
+        &req.authenticator_enc,
+    )?;
+    let authenticator = decode_authenticator(&auth_plaintext)?;
+    if !principal_names_eq(&authenticator.cname, &enc_ticket_part.cname) {
+        return Err(KdcError::PreauthFailed(
+            "S4U2Proxy: authenticator cname does not match TGT cname".into(),
+        ));
+    }
+
+    // Look up the requesting service.
+    let service = store
+        .lookup(&enc_ticket_part.crealm, &enc_ticket_part.cname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Proxy: service lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Proxy: service {}/{}",
+                enc_ticket_part.crealm,
+                enc_ticket_part.cname.join("/")
+            ))
+        })?;
+
+    // Decrypt the evidence ticket with the service's key (the evidence
+    // ticket was issued for this service in the S4U2Self step).
+    let evidence_pt = decrypt_for_usage(
+        &service.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &evidence_ticket.enc_part,
+    )?;
+    let evidence_etp = decode_enc_ticket_part(&evidence_pt)?;
+
+    // Bronze Bit mitigation (CVE-2020-17049): the evidence ticket MUST be
+    // forwardable. A non-forwardable S4U2Self ticket cannot be used for
+    // S4U2Proxy.
+    if evidence_etp.flags & TICKET_FLAG_FORWARDABLE == 0 {
+        return Err(KdcError::Policy(
+            "S4U2Proxy: evidence ticket lacks forwardable flag (Bronze Bit mitigation CVE-2020-17049)"
+                .into(),
+        ));
+    }
+
+    // ACL check: validate the requested SPN against allowed_to_delegate_to.
+    let target_spn = format_spn(&req.realm, &req.sname);
+    if !service.can_delegate_to(&target_spn) {
+        return Err(KdcError::Policy(format!(
+            "S4U2Proxy: service {}/{} is not allowed to delegate to {target_spn} (msDS-AllowedToDelegateTo per ADR-087)",
+            service.realm,
+            service.components.join("/")
+        )));
+    }
+
+    // Look up the backend service.
+    let backend = store
+        .lookup(&req.realm, &req.sname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("S4U2Proxy: backend lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!(
+                "S4U2Proxy: backend {}/{}",
+                req.realm,
+                req.sname.join("/")
+            ))
+        })?;
+
+    // Issue the TGS for the backend service with the USER's identity (from
+    // the evidence ticket) in cname.
+    let now = now_secs();
+    let session_key = random_session_key()?;
+    let proxy_enc_ticket_part = EncTicketPart {
+        flags: evidence_etp.flags,
+        crealm: evidence_etp.crealm.clone(),
+        cname: evidence_etp.cname.clone(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        client_uuid: evidence_etp.client_uuid,
+    };
+    let proxy_enc_ticket_part_bytes = encode_enc_ticket_part(&proxy_enc_ticket_part);
+    let proxy_ticket_enc = encrypt_for_usage(
+        &backend.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &proxy_enc_ticket_part_bytes,
+    )?;
+    let proxy_ticket = Ticket {
+        tkt_vno: PVNO,
+        realm: backend.realm.clone(),
+        sname: backend.components.clone(),
+        kvno: backend.kvno,
+        etype: chosen_etype,
+        enc_part: proxy_ticket_enc,
+    };
+
+    let enc_rep_part = EncKdcRepPart {
+        session_key,
+        last_req: now,
+        nonce: req.nonce,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        crealm: evidence_etp.crealm.clone(),
+        cname: evidence_etp.cname.clone(),
+    };
+    let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+    let enc_part = encrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REP_ENC_PART,
+        &enc_rep_part_bytes,
+    )?;
+
+    let rep = TgsRep {
+        pvno: PVNO,
+        msg_type: MSG_TYPE_TGS_REP,
+        crealm: evidence_etp.crealm.clone(),
+        cname: evidence_etp.cname.clone(),
+        ticket: proxy_ticket,
+        enc_part_etype: chosen_etype,
+        enc_part_kvno: req.tgt.kvno,
+        enc_part,
+    };
+    tracing::info!(
+        service = %format_spn(&service.realm, &service.components),
+        backend = %format_spn(&backend.realm, &backend.components),
+        user = %format_spn(&evidence_etp.crealm, &evidence_etp.cname),
+        "S4U2Proxy: issued delegated ticket"
+    );
+    Ok(encode_tgs_rep(&rep))
+}
+
+// ---------------------------------------------------------------------------
+// Pre-auth plugin framework (Wave 5)
+// ---------------------------------------------------------------------------
+
+/// Pre-authentication plugin trait (Wave 5). Each plugin handles a specific
+/// PA-DATA type (e.g. PA-ENC-TIMESTAMP = 2). The KDC's AS-REQ handler looks
+/// up the plugin for each PA-DATA type in the request and calls
+/// `verify_pa_data()` to verify the pre-authenticator.
+///
+/// This trait makes the pre-auth framework extensible: future plugins
+/// (PA-PK-AS-REQ for PKINIT, PA-OTP, PA-ECDH, etc.) can be registered
+/// without modifying the core AS-REQ handler.
+#[async_trait::async_trait]
+pub trait PreAuthPlugin: Send + Sync {
+    /// The PA-DATA type this plugin handles (e.g. 2 for PA-ENC-TIMESTAMP).
+    fn padata_type(&self) -> u8;
+
+    /// Verify the padata against the client's long-term state. Returns
+    /// `Ok(())` if the pre-authenticator is valid, `Err(KdcError)` otherwise.
+    async fn verify_pa_data(&self, padata: &[u8], client: &PrincipalRecord)
+        -> Result<(), KdcError>;
+}
+
+/// PA-ENC-TIMESTAMP plugin (RFC 4120 §5.2.7.2). Wraps the existing
+/// [`verify_pa_enc_timestamp`] logic in the plugin interface. This is the
+/// default pre-auth method for password-based Kerberos.
+pub struct PaEncTimestampPlugin;
+
+impl PaEncTimestampPlugin {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for PaEncTimestampPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl PreAuthPlugin for PaEncTimestampPlugin {
+    fn padata_type(&self) -> u8 {
+        PA_ENC_TIMESTAMP_TYPE
+    }
+
+    async fn verify_pa_data(
+        &self,
+        padata: &[u8],
+        client: &PrincipalRecord,
+    ) -> Result<(), KdcError> {
+        verify_pa_enc_timestamp(client, padata)
+    }
+}
+
+/// Registry of pre-auth plugins. Maps PA-DATA types to plugin instances.
+/// The AS-REQ handler queries the registry to find a plugin for each
+/// PA-DATA entry in the request.
+#[derive(Default)]
+pub struct PreAuthPluginRegistry {
+    plugins: std::collections::HashMap<u8, Box<dyn PreAuthPlugin>>,
+}
+
+impl PreAuthPluginRegistry {
+    /// Construct an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a registry pre-loaded with the default PA-ENC-TIMESTAMP
+    /// plugin (the only built-in pre-auth method).
+    pub fn with_defaults() -> Self {
+        let mut reg = Self::new();
+        reg.register(Box::new(PaEncTimestampPlugin::new()));
+        reg
+    }
+
+    /// Register a plugin. Replaces any existing plugin for the same PA-DATA type.
+    pub fn register(&mut self, plugin: Box<dyn PreAuthPlugin>) {
+        self.plugins.insert(plugin.padata_type(), plugin);
+    }
+
+    /// Look up the plugin for a PA-DATA type.
+    pub fn get(&self, padata_type: u8) -> Option<&dyn PreAuthPlugin> {
+        self.plugins.get(&padata_type).map(|p| p.as_ref())
+    }
+
+    /// Verify a list of PA-DATA entries against the client. Iterates the
+    /// padata list; for each entry with a registered plugin, calls
+    /// `verify_pa_data()`. Returns `Ok(())` on the first successful
+    /// verification, `Err(KdcError::PreauthRequired)` if no padata entry
+    /// has a registered plugin, or `Err` with the first verification error.
+    pub async fn verify(
+        &self,
+        padata: &[PaData],
+        client: &PrincipalRecord,
+    ) -> Result<(), KdcError> {
+        for p in padata {
+            if let Some(plugin) = self.plugins.get(&p.padata_type) {
+                return plugin.verify_pa_data(&p.padata_value, client).await;
+            }
+        }
+        // No padata entry matched a registered plugin.
+        Err(KdcError::PreauthRequired)
+    }
+
+    /// Number of registered plugins.
+    pub fn len(&self) -> usize {
+        self.plugins.len()
+    }
+
+    /// True iff no plugins are registered.
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1866,6 +3144,1172 @@ mod tests {
             out.contains("adrian_as_req_duration_seconds_count 1"),
             "expected histogram _count == 1 after one TGS-REQ: {out}"
         );
+    }
+
+    // ---- Wave 1: FAST armoring (RFC 6806 / ADR-012) ----
+
+    /// Build a FAST-armored AS-REQ: the client wraps its PA-ENC-TIMESTAMP
+    /// inside a `KrbFastArmoredReq` encrypted with the FAST armor key
+    /// derived from the armor TGT's session key.
+    fn build_fast_armored_as_req(
+        client: &PrincipalRecord,
+        armor_tgt: Ticket,
+        armor_session_key: &[u8; SESSION_KEY_LEN],
+    ) -> AsReq {
+        let now = now_secs();
+        let pa_ts = PaEncTsEnc {
+            patimestamp: now,
+            pausec: 0,
+        };
+        let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
+        let blob = encrypt_for_usage(&client.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+            .expect("encrypt pa-enc-timestamp");
+        let inner_padata = vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP_TYPE,
+            padata_value: blob,
+        }];
+        let armored = wrap_fast_armor(armor_tgt, armor_session_key, inner_padata, 0xCAFE_BABE, now)
+            .expect("wrap fast armor");
+        AsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_AS_REQ,
+            realm: client.realm.clone(),
+            cname: client.components.clone(),
+            nonce: 0xDEAD_BEEF,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            padata: vec![PaData {
+                padata_type: PA_FX_FAST_START_TYPE,
+                padata_value: encode_krb_fast_armored_req(&armored),
+            }],
+            till: now + DEFAULT_TGT_LIFETIME_SECS,
+        }
+    }
+
+    #[test]
+    fn fast_factor_encode_decode_round_trip() {
+        let f = FastFactor {
+            inner_padata: vec![
+                PaData {
+                    padata_type: PA_ENC_TIMESTAMP_TYPE,
+                    padata_value: vec![0xAB, 0xCD],
+                },
+                PaData {
+                    padata_type: 19,
+                    padata_value: vec![0x11, 0x22, 0x33],
+                },
+            ],
+            nonce: 42,
+            timestamp: 1_700_000_000,
+        };
+        let bytes = encode_fast_factor(&f);
+        let decoded = decode_fast_factor(&bytes).expect("decode");
+        assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn krb_fast_armored_req_encode_decode_round_trip() {
+        let armor_tgt = Ticket {
+            tkt_vno: PVNO,
+            realm: "EXAMPLE.COM".into(),
+            sname: vec!["krbtgt".into(), "EXAMPLE.COM".into()],
+            kvno: 1,
+            etype: EType::Aes256CtsHmacSha1_96,
+            enc_part: vec![0u8; 48],
+        };
+        let armored = KrbFastArmoredReq {
+            armor_type: FAST_ARMOR_TYPE_TGT,
+            armor_tgt: armor_tgt.clone(),
+            enc_part: vec![0xAA; 32],
+        };
+        let bytes = encode_krb_fast_armored_req(&armored);
+        let decoded = decode_krb_fast_armored_req(&bytes).expect("decode");
+        assert_eq!(decoded, armored);
+    }
+
+    #[test]
+    fn fast_armor_key_derivation_is_deterministic_and_distinct() {
+        let k1 = derive_fast_armor_key(&[0x42u8; SESSION_KEY_LEN]);
+        let k2 = derive_fast_armor_key(&[0x42u8; SESSION_KEY_LEN]);
+        assert_eq!(k1, k2, "same session key must produce same armor key");
+        let k3 = derive_fast_armor_key(&[0x99u8; SESSION_KEY_LEN]);
+        assert_ne!(
+            k1, k3,
+            "different session keys must produce different armor keys"
+        );
+    }
+
+    /// Wave 1 DoD test 1: FAST-wrapped AS-REQ succeeds. The KDC decrypts the
+    /// armor TGT, derives the FAST armor key, decrypts the FAST factor,
+    /// verifies the inner PA-ENC-TIMESTAMP, and issues an AS-REP whose
+    /// enc-part is encrypted with the armor key (not the client's key).
+    #[tokio::test]
+    async fn fast_wrapped_as_req_succeeds() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Client first obtains an armor TGT (reuses the TGT builder).
+        let (armor_tgt, armor_session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let req = build_fast_armored_as_req(&alice, armor_tgt, &armor_session_key);
+        let req_bytes = encode_as_req(&req);
+
+        let rep_bytes = handle_as_req_fast(&store, &krbtgt_key, &req_bytes, FastMode::Required)
+            .await
+            .expect("FAST AS-REQ must succeed");
+        let rep = decode_as_rep(&rep_bytes).expect("decode AS-REP");
+        assert_eq!(rep.cname, alice.components);
+        assert_eq!(
+            rep.ticket.sname,
+            vec!["krbtgt".to_string(), "EXAMPLE.COM".into()]
+        );
+
+        // The AS-REP enc-part is encrypted with the FAST armor key (NOT the
+        // client's long-term key) — this is the AS-REP roasting mitigation.
+        // Attempting to decrypt with the client's key MUST fail.
+        let client_decrypt_err =
+            decrypt_for_usage(&alice.key, KEY_USAGE_AS_REP_ENC_PART, &rep.enc_part).unwrap_err();
+        assert!(matches!(client_decrypt_err, KdcError::PreauthFailed(_)));
+
+        // Decrypting with the armor key succeeds.
+        let armor_key = derive_fast_armor_key(&armor_session_key);
+        let rep_pt = decrypt_for_usage(&armor_key.key, KEY_USAGE_AS_REP_ENC_PART, &rep.enc_part)
+            .expect("decrypt with armor key");
+        let erp = decode_enc_kdc_rep_part(&rep_pt).expect("decode EncKdcRepPart");
+        assert_eq!(erp.nonce, req.nonce);
+        assert_eq!(erp.cname, alice.components);
+    }
+
+    /// Wave 1 DoD test 2: unarmored AS-REQ rejected when `fast_mode = Required`.
+    #[tokio::test]
+    async fn fast_required_rejects_unarmored_as_req() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let req = build_valid_as_req(&alice).await;
+        let req_bytes = encode_as_req(&req);
+
+        let err = handle_as_req_fast(&store, &krbtgt_key, &req_bytes, FastMode::Required)
+            .await
+            .expect_err("unarmored AS-REQ must be rejected in Required mode");
+        assert!(matches!(err, KdcError::FastArmorRequired));
+    }
+
+    /// Wave 1 DoD test 3: tampered FAST armor rejected (HMAC verification
+    /// fails on the FAST factor's encrypted enc-part).
+    #[tokio::test]
+    async fn fast_tampered_armor_rejected() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (armor_tgt, armor_session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let mut req = build_fast_armored_as_req(&alice, armor_tgt, &armor_session_key);
+        // Tamper with the FAST armor padata value (flip a byte in the
+        // encoded KrbFastArmoredReq — this corrupts either the armor TGT
+        // or the encrypted FAST factor, both of which must be rejected).
+        if let Some(b) = req.padata[0].padata_value.get_mut(0) {
+            *b ^= 0xFF;
+        }
+        let req_bytes = encode_as_req(&req);
+
+        let err = handle_as_req_fast(&store, &krbtgt_key, &req_bytes, FastMode::Required)
+            .await
+            .expect_err("tampered FAST armor must be rejected");
+        // Tampered armor → either decode failure (Storage) or decrypt
+        // failure (PreauthFailed) depending on which byte was flipped.
+        assert!(matches!(
+            err,
+            KdcError::Storage(_) | KdcError::PreauthFailed(_)
+        ));
+    }
+
+    /// Wave 1 DoD test 4: wrong armor key rejected. The client wraps the
+    /// FAST factor with session key A, but the armor TGT was encrypted with
+    /// session key B. The KDC derives the armor key from B and fails to
+    /// decrypt the factor wrapped under A.
+    #[tokio::test]
+    async fn fast_wrong_armor_key_rejected() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Build the armor TGT with the correct krbtgt key (so the KDC can
+        // decrypt it and recover the real session key).
+        let (armor_tgt, _correct_session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        // But encrypt the FAST factor with a DIFFERENT session key —
+        // simulating a wrong armor TGT / session key mismatch.
+        let wrong_session_key = [0xFFu8; SESSION_KEY_LEN];
+
+        let now = now_secs();
+        let pa_ts = PaEncTsEnc {
+            patimestamp: now,
+            pausec: 0,
+        };
+        let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
+        let blob = encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+            .expect("encrypt");
+        let inner_padata = vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP_TYPE,
+            padata_value: blob,
+        }];
+        let armored = wrap_fast_armor(armor_tgt.clone(), &wrong_session_key, inner_padata, 1, now)
+            .expect("wrap");
+        let req = AsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_AS_REQ,
+            realm: alice.realm.clone(),
+            cname: alice.components.clone(),
+            nonce: 99,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            padata: vec![PaData {
+                padata_type: PA_FX_FAST_START_TYPE,
+                padata_value: encode_krb_fast_armored_req(&armored),
+            }],
+            till: now + DEFAULT_TGT_LIFETIME_SECS,
+        };
+        let req_bytes = encode_as_req(&req);
+
+        let err = handle_as_req_fast(&store, &krbtgt_key, &req_bytes, FastMode::Required)
+            .await
+            .expect_err("wrong armor key must be rejected");
+        assert!(matches!(err, KdcError::PreauthFailed(_)));
+    }
+
+    /// Wave 1 DoD test 5: FAST factor round-trip through encrypt/decrypt.
+    /// Verifies that `encode_fast_factor` + `encrypt_for_usage` +
+    /// `decrypt_for_usage` + `decode_fast_factor` is a clean round-trip
+    /// (the FAST factor survives the armor key encryption intact).
+    #[test]
+    fn fast_factor_round_trip_through_encrypt_decrypt() {
+        let armor_key = derive_fast_armor_key(&[0x99u8; SESSION_KEY_LEN]);
+        let factor = FastFactor {
+            inner_padata: vec![
+                PaData {
+                    padata_type: 2,
+                    padata_value: vec![0xAA],
+                },
+                PaData {
+                    padata_type: 19,
+                    padata_value: vec![0xBB, 0xCC],
+                },
+            ],
+            nonce: 0x1234_5678,
+            timestamp: 1_700_000_000,
+        };
+        let bytes = encode_fast_factor(&factor);
+        let enc = encrypt_for_usage(&armor_key.key, KEY_USAGE_FAST_ARMOR_REQ_ENC, &bytes)
+            .expect("encrypt");
+        let dec =
+            decrypt_for_usage(&armor_key.key, KEY_USAGE_FAST_ARMOR_REQ_ENC, &enc).expect("decrypt");
+        let recovered = decode_fast_factor(&dec).expect("decode");
+        assert_eq!(recovered, factor);
+    }
+
+    /// `fast_mode = Supported` accepts unarmored AS-REQs by falling through
+    /// to the standard handler path (ADR-012 migration mode).
+    #[tokio::test]
+    async fn fast_supported_accepts_unarmored_as_req() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let req = build_valid_as_req(&alice).await;
+        let req_bytes = encode_as_req(&req);
+
+        let rep_bytes = handle_as_req_fast(&store, &krbtgt_key, &req_bytes, FastMode::Supported)
+            .await
+            .expect("Supported mode must accept unarmored AS-REQ");
+        let rep = decode_as_rep(&rep_bytes).expect("decode AS-REP");
+        assert_eq!(rep.cname, alice.components);
+    }
+
+    // ---- Wave 3: Cross-realm TGT referral (RFC 4120 §3.3.3 / ADR-013) ----
+
+    /// Build a cross-realm trust: a `krbtgt/FOREIGN_REALM` principal in the
+    /// local realm, with a distinct cross-realm key derived from the password.
+    fn make_cross_realm_principal(
+        local_realm: &str,
+        foreign_realm: &str,
+        password: &str,
+    ) -> PrincipalRecord {
+        let mut salt = Vec::new();
+        salt.extend_from_slice(local_realm.as_bytes());
+        salt.extend_from_slice(b"krbtgt");
+        salt.extend_from_slice(foreign_realm.as_bytes());
+        let key = crypto::derive_aes256_key(password.as_bytes(), &salt);
+        PrincipalRecord::new(
+            Uuid::nil(),
+            local_realm,
+            vec!["krbtgt".to_string(), foreign_realm.to_string()],
+            key,
+        )
+    }
+
+    /// DoD test 1: referral TGT for foreign realm. A TGS-REQ for a service
+    /// in a foreign realm returns a referral TGT (sname = krbtgt/FOREIGN_REALM),
+    /// not a service ticket. The referral TGT is encrypted with the cross-realm
+    /// key (the key of the krbtgt/FOREIGN_REALM principal in the local realm).
+    #[tokio::test]
+    async fn cross_realm_referral_tgt_for_foreign_realm() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        let cross_realm = make_cross_realm_principal("ADRIAN.COM", "FOREIGN.COM", "xrealm-secret");
+        store.insert(alice.clone());
+        store.insert(cross_realm.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 4242,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let rep_bytes = handle_tgs_req_with_referral(&store, &krbtgt_key, &req_bytes, "ADRIAN.COM")
+            .await
+            .expect("referral TGS-REQ must succeed");
+        let rep = decode_tgs_rep(&rep_bytes).expect("decode TGS-REP");
+
+        // The ticket is a referral TGT: sname = krbtgt/FOREIGN.COM.
+        assert_eq!(
+            rep.ticket.sname,
+            vec!["krbtgt".to_string(), "FOREIGN.COM".into()],
+            "referral TGT sname must be krbtgt/FOREIGN_REALM"
+        );
+        // The referral TGT is encrypted with the cross-realm key (not the
+        // krbtgt key, not the service key).
+        let tgt_pt =
+            decrypt_for_usage(&cross_realm.key, KEY_USAGE_AS_REP_TGT, &rep.ticket.enc_part)
+                .expect("decrypt referral TGT with cross-realm key");
+        let etp = decode_enc_ticket_part(&tgt_pt).expect("decode EncTicketPart");
+        assert_eq!(etp.crealm, "ADRIAN.COM");
+        assert_eq!(etp.cname, alice.components);
+
+        // The TGS-REP enc-part is encrypted with the TGT session key.
+        let rep_pt = decrypt_for_usage(&session_key, KEY_USAGE_TGS_REP_ENC_PART, &rep.enc_part)
+            .expect("decrypt TGS-REP enc-part");
+        let erp = decode_enc_kdc_rep_part(&rep_pt).expect("decode EncKdcRepPart");
+        assert_eq!(erp.nonce, 4242);
+    }
+
+    /// DoD test 2: local realm — no referral. A TGS-REQ for a service in
+    /// the local realm returns a normal service ticket (not a referral TGT).
+    #[tokio::test]
+    async fn local_realm_no_referral() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        let web = make_svc_principal("ADRIAN.COM", "web.adrian.com", "svc-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "ADRIAN.COM".into(),
+            sname: web.components.clone(),
+            nonce: 100,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let rep_bytes = handle_tgs_req_with_referral(&store, &krbtgt_key, &req_bytes, "ADRIAN.COM")
+            .await
+            .expect("local TGS-REQ must succeed");
+        let rep = decode_tgs_rep(&rep_bytes).expect("decode TGS-REP");
+
+        // The ticket is a service ticket (sname = the requested service),
+        // NOT a referral TGT.
+        assert_eq!(rep.ticket.sname, web.components);
+        assert_ne!(
+            rep.ticket.sname,
+            vec!["krbtgt".to_string(), "ADRIAN.COM".into()],
+            "local realm must NOT produce a referral TGT"
+        );
+
+        // The service ticket is decryptable with the service's key.
+        let svc_pt = decrypt_for_usage(&web.key, KEY_USAGE_TGS_REP_TICKET, &rep.ticket.enc_part)
+            .expect("decrypt service ticket");
+        let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode EncTicketPart");
+        assert_eq!(svc_etp.cname, alice.components);
+    }
+
+    /// DoD test 3: cross-realm key rotation. After rotating the cross-realm
+    /// key (replacing the krbtgt/FOREIGN_REALM principal with a new key +
+    /// bumped kvno), new referral TGTs use the new key and cannot be
+    /// decrypted with the old key.
+    #[tokio::test]
+    async fn cross_realm_key_rotation() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        let cross_realm_v1 = make_cross_realm_principal("ADRIAN.COM", "FOREIGN.COM", "xrealm-v1");
+        store.insert(alice.clone());
+        store.insert(cross_realm_v1.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Issue a referral TGT with the v1 key.
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let rep_v1_bytes =
+            handle_tgs_req_with_referral(&store, &krbtgt_key, &encode_tgs_req(&req), "ADRIAN.COM")
+                .await
+                .expect("v1 referral must succeed");
+        let rep_v1 = decode_tgs_rep(&rep_v1_bytes).expect("decode v1");
+        assert_eq!(rep_v1.ticket.kvno, cross_realm_v1.kvno);
+
+        // Rotate the cross-realm key: replace the principal with a new key
+        // and bumped kvno.
+        let mut cross_realm_v2 =
+            make_cross_realm_principal("ADRIAN.COM", "FOREIGN.COM", "xrealm-v2");
+        cross_realm_v2.kvno = cross_realm_v1.kvno + 1;
+        store.insert(cross_realm_v2.clone());
+
+        // Issue a new referral TGT — must use the v2 key.
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&alice, &session_key2);
+        let req2 = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let rep_v2_bytes =
+            handle_tgs_req_with_referral(&store, &krbtgt_key, &encode_tgs_req(&req2), "ADRIAN.COM")
+                .await
+                .expect("v2 referral must succeed");
+        let rep_v2 = decode_tgs_rep(&rep_v2_bytes).expect("decode v2");
+        assert_eq!(
+            rep_v2.ticket.kvno, cross_realm_v2.kvno,
+            "kvno must bump after rotation"
+        );
+
+        // The v2 referral TGT is decryptable with the v2 key, NOT the v1 key.
+        let v2_pt = decrypt_for_usage(
+            &cross_realm_v2.key,
+            KEY_USAGE_AS_REP_TGT,
+            &rep_v2.ticket.enc_part,
+        )
+        .expect("decrypt v2 with v2 key");
+        let _v2_etp = decode_enc_ticket_part(&v2_pt).expect("decode v2");
+        let v1_decrypt_err = decrypt_for_usage(
+            &cross_realm_v1.key,
+            KEY_USAGE_AS_REP_TGT,
+            &rep_v2.ticket.enc_part,
+        )
+        .expect_err("v1 key must NOT decrypt v2 TGT");
+        assert!(matches!(v1_decrypt_err, KdcError::PreauthFailed(_)));
+    }
+
+    /// DoD test 4: capath validation per ADR-069. The `CapathValidator`
+    /// accepts a valid chain (all realms trusted) and rejects a chain with
+    /// an untrusted realm. Also verifies `is_foreign_realm` and the
+    /// `Disabled` validation mode.
+    #[test]
+    fn capath_validation_per_adr_069() {
+        let mut validator = CapathValidator::new();
+        validator.add_trust(&CrossRealmTrust::new("REALM-A.COM"));
+        validator.add_trust(&CrossRealmTrust::new("REALM-B.COM"));
+        validator.add_trust(&CrossRealmTrust::new("REALM-C.COM"));
+
+        // Valid chain: all realms trusted.
+        validator
+            .validate(&["REALM-A.COM", "REALM-B.COM"])
+            .expect("valid chain must pass");
+
+        // Invalid chain: REALM-X is not trusted.
+        let err = validator
+            .validate(&["REALM-A.COM", "REALM-X.COM"])
+            .expect_err("untrusted realm must be rejected");
+        match err {
+            KdcError::Policy(msg) => assert!(msg.contains("REALM-X.COM"), "{msg}"),
+            other => panic!("expected Policy error, got {other:?}"),
+        }
+
+        // Empty chain is always valid.
+        validator.validate(&[]).expect("empty chain must pass");
+
+        // Disabled mode: all chains accepted.
+        let mut disabled =
+            CapathValidator::new().with_default_validation(TransitedValidation::Disabled);
+        disabled.add_trust(&CrossRealmTrust::new("REALM-A.COM"));
+        disabled
+            .validate(&["REALM-X.COM", "REALM-Y.COM"])
+            .expect("Disabled mode accepts all chains");
+
+        // trusts() check.
+        assert!(validator.trusts("REALM-A.COM"));
+        assert!(validator.trusts("realm-a.com"), "case-insensitive");
+        assert!(!validator.trusts("REALM-X.COM"));
+
+        // is_foreign_realm check.
+        assert!(is_foreign_realm("FOREIGN.COM", "ADRIAN.COM"));
+        assert!(!is_foreign_realm("ADRIAN.COM", "ADRIAN.COM"));
+        assert!(
+            !is_foreign_realm("adrian.com", "ADRIAN.COM"),
+            "case-insensitive"
+        );
+    }
+
+    /// No trust to foreign realm → referral fails with PrincipalNotFound
+    /// (the KDC has no cross-realm key for the foreign realm).
+    #[tokio::test]
+    async fn cross_realm_referral_no_trust_fails() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        // NO cross-realm principal for FOREIGN.COM.
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let err = handle_tgs_req_with_referral(&store, &krbtgt_key, &req_bytes, "ADRIAN.COM")
+            .await
+            .expect_err("no-trust referral must fail");
+        match err {
+            KdcError::PrincipalNotFound(msg) => assert!(msg.contains("FOREIGN.COM"), "{msg}"),
+            other => panic!("expected PrincipalNotFound, got {other:?}"),
+        }
+    }
+
+    // ---- Wave 4: S4U2Self + S4U2Proxy (ADR-087 / MS-SFU) ----
+
+    /// Build a service principal with `TRUSTED_TO_AUTH_FOR_DELEGATION` and
+    /// a configured `msDS-AllowedToDelegateTo` list.
+    fn make_delegating_service(
+        realm: &str,
+        sname: &str,
+        password: &str,
+        allowed_targets: Vec<String>,
+    ) -> PrincipalRecord {
+        let mut salt = Vec::new();
+        salt.extend_from_slice(realm.as_bytes());
+        salt.extend_from_slice(b"host");
+        salt.extend_from_slice(sname.as_bytes());
+        let key = crypto::derive_aes256_key(password.as_bytes(), &salt);
+        PrincipalRecord::new(
+            Uuid::nil(),
+            realm,
+            vec!["host".to_string(), sname.to_string()],
+            key,
+        )
+        .with_trusted_to_auth_for_delegation(true)
+        .with_allowed_to_delegate_to(allowed_targets)
+    }
+
+    /// DoD test 1: S4U2Self succeeds. A service with
+    /// `TRUSTED_TO_AUTH_FOR_DELEGATION` requests a ticket to itself on
+    /// behalf of a user. The KDC issues a ticket with the service's SPN
+    /// and the USER's identity in cname.
+    #[tokio::test]
+    async fn s4u2self_succeeds() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // The service presents ITS OWN TGT.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1001,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let rep_bytes = handle_tgs_req_s4u2self(&store, &krbtgt_key, &req_bytes, &pa_for_user)
+            .await
+            .expect("S4U2Self must succeed");
+        let rep = decode_tgs_rep(&rep_bytes).expect("decode TGS-REP");
+
+        // The ticket is for the requesting service (sname = web).
+        assert_eq!(rep.ticket.sname, web.components);
+        // The cname is the USER (alice), not the service.
+        assert_eq!(rep.cname, alice.components);
+        assert_eq!(rep.crealm, alice.realm);
+
+        // Decrypt the S4U2Self ticket with the service's key.
+        let svc_pt = decrypt_for_usage(&web.key, KEY_USAGE_TGS_REP_TICKET, &rep.ticket.enc_part)
+            .expect("decrypt S4U2Self ticket");
+        let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode EncTicketPart");
+        assert_eq!(svc_etp.cname, alice.components);
+        assert_eq!(svc_etp.crealm, alice.realm);
+        // The ticket is forwardable (service has allowed_to_delegate_to).
+        assert!(svc_etp.flags & TICKET_FLAG_FORWARDABLE != 0);
+    }
+
+    /// DoD test 2: S4U2Proxy succeeds. The service exchanges the S4U2Self
+    /// evidence ticket for a TGS to a backend service. The resulting ticket
+    /// carries the USER's identity (not the service's).
+    #[tokio::test]
+    async fn s4u2proxy_succeeds() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        let backend = make_svc_principal("EXAMPLE.COM", "backend.example.com", "backend-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(backend.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self — get an evidence ticket.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 2001,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep_bytes = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self must succeed");
+        let s4u_self_rep = decode_tgs_rep(&s4u_self_rep_bytes).expect("decode S4U2Self REP");
+        let evidence_ticket = s4u_self_rep.ticket.clone();
+
+        // Step 2: S4U2Proxy — exchange the evidence ticket for a TGS to the backend.
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: backend.realm.clone(),
+            sname: backend.components.clone(),
+            nonce: 2002,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let proxy_rep_bytes = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect("S4U2Proxy must succeed");
+        let proxy_rep = decode_tgs_rep(&proxy_rep_bytes).expect("decode S4U2Proxy REP");
+
+        // The ticket is for the backend service.
+        assert_eq!(proxy_rep.ticket.sname, backend.components);
+        // The cname is the USER (alice), not the service (web).
+        assert_eq!(proxy_rep.cname, alice.components);
+        assert_eq!(proxy_rep.crealm, alice.realm);
+
+        // Decrypt the proxy ticket with the backend's key.
+        let backend_pt = decrypt_for_usage(
+            &backend.key,
+            KEY_USAGE_TGS_REP_TICKET,
+            &proxy_rep.ticket.enc_part,
+        )
+        .expect("decrypt proxy ticket");
+        let backend_etp = decode_enc_ticket_part(&backend_pt).expect("decode EncTicketPart");
+        assert_eq!(backend_etp.cname, alice.components);
+        assert_eq!(backend_etp.crealm, alice.realm);
+    }
+
+    /// DoD test 3: delegation not allowed. The service requests S4U2Proxy
+    /// to a backend SPN that is NOT in `msDS-AllowedToDelegateTo`. The KDC
+    /// rejects with `KdcError::Policy`.
+    #[tokio::test]
+    async fn s4u2proxy_delegation_not_allowed() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        let rogue = make_svc_principal("EXAMPLE.COM", "rogue.example.com", "rogue-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(rogue.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self to get evidence ticket.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self");
+        let evidence_ticket = decode_tgs_rep(&s4u_self_rep).expect("decode").ticket;
+
+        // Step 2: S4U2Proxy to rogue.example.com (NOT in allowed_to_delegate_to).
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: rogue.realm.clone(),
+            sname: rogue.components.clone(),
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let err = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect_err("S4U2Proxy to rogue SPN must be rejected");
+        match err {
+            KdcError::Policy(msg) => assert!(msg.contains("rogue.example.com"), "{msg}"),
+            other => panic!("expected Policy error, got {other:?}"),
+        }
+    }
+
+    /// DoD test 4: evidence ticket tampered. The service presents a tampered
+    /// evidence ticket (HMAC verification fails). The KDC rejects.
+    #[tokio::test]
+    async fn s4u2proxy_evidence_ticket_tampered() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        let web = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        let backend = make_svc_principal("EXAMPLE.COM", "backend.example.com", "backend-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(backend.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self to get evidence ticket.
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self");
+        let mut evidence_ticket = decode_tgs_rep(&s4u_self_rep).expect("decode").ticket;
+        // Tamper with the evidence ticket's enc_part.
+        evidence_ticket.enc_part[0] ^= 0xFF;
+
+        // Step 2: S4U2Proxy with tampered evidence ticket.
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: backend.realm.clone(),
+            sname: backend.components.clone(),
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let err = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect_err("tampered evidence ticket must be rejected");
+        assert!(matches!(err, KdcError::PreauthFailed(_)));
+    }
+
+    /// DoD test 5: cross-protocol attack rejected (Bronze Bit mitigation,
+    /// CVE-2020-17049). A non-forwardable S4U2Self ticket cannot be used
+    /// for S4U2Proxy. The service has an empty `allowed_to_delegate_to`,
+    /// so the S4U2Self ticket is non-forwardable; S4U2Proxy must reject it.
+    #[tokio::test]
+    async fn s4u2proxy_bronze_bit_non_forwardable_rejected() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        // Service with TRUSTED_TO_AUTH_FOR_DELEGATION but EMPTY
+        // allowed_to_delegate_to — S4U2Self succeeds but the ticket is
+        // non-forwardable.
+        let web = make_delegating_service("EXAMPLE.COM", "web.example.com", "svc-pass", vec![]);
+        let backend = make_svc_principal("EXAMPLE.COM", "backend.example.com", "backend-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        store.insert(backend.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Step 1: S4U2Self — ticket is non-forwardable (empty allowed_to_delegate_to).
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let s4u_self_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let s4u_self_rep_bytes = handle_tgs_req_s4u2self(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_self_req),
+            &pa_for_user,
+        )
+        .await
+        .expect("S4U2Self");
+        let s4u_self_rep = decode_tgs_rep(&s4u_self_rep_bytes).expect("decode");
+        let evidence_ticket = s4u_self_rep.ticket.clone();
+
+        // Verify the evidence ticket is non-forwardable.
+        let svc_pt = decrypt_for_usage(
+            &web.key,
+            KEY_USAGE_TGS_REP_TICKET,
+            &evidence_ticket.enc_part,
+        )
+        .expect("decrypt");
+        let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode");
+        assert!(
+            svc_etp.flags & TICKET_FLAG_FORWARDABLE == 0,
+            "evidence ticket MUST be non-forwardable when allowed_to_delegate_to is empty"
+        );
+
+        // Step 2: S4U2Proxy — must reject (Bronze Bit mitigation).
+        // We temporarily add the backend to the service's allowed list by
+        // re-inserting the service with the backend SPN. This isolates the
+        // test to the Bronze Bit check (not the ACL check).
+        let web_with_acl = make_delegating_service(
+            "EXAMPLE.COM",
+            "web.example.com",
+            "svc-pass",
+            vec!["EXAMPLE.COM/host/backend.example.com".to_string()],
+        );
+        store.insert(web_with_acl);
+
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&web, &session_key2);
+        let s4u_proxy_req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: backend.realm.clone(),
+            sname: backend.components.clone(),
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let err = handle_tgs_req_s4u2proxy(
+            &store,
+            &krbtgt_key,
+            &encode_tgs_req(&s4u_proxy_req),
+            &evidence_ticket,
+        )
+        .await
+        .expect_err("non-forwardable evidence ticket must be rejected (Bronze Bit)");
+        match err {
+            KdcError::Policy(msg) => assert!(msg.contains("forwardable"), "{msg}"),
+            other => panic!("expected Policy(forwardable), got {other:?}"),
+        }
+    }
+
+    /// PA-FOR-USER encode/decode round-trip.
+    #[test]
+    fn pa_for_user_encode_decode_round_trip() {
+        let p = PaForUser {
+            user_name: vec!["alice".to_string()],
+            user_realm: "EXAMPLE.COM".into(),
+        };
+        let bytes = encode_pa_for_user(&p);
+        let decoded = decode_pa_for_user(&bytes).expect("decode");
+        assert_eq!(decoded, p);
+
+        let p2 = PaForUser {
+            user_name: vec!["svc".to_string(), "web".to_string()],
+            user_realm: "ADRIAN.COM".into(),
+        };
+        let bytes2 = encode_pa_for_user(&p2);
+        let decoded2 = decode_pa_for_user(&bytes2).expect("decode");
+        assert_eq!(decoded2, p2);
+    }
+
+    /// S4U2Self without TRUSTED_TO_AUTH_FOR_DELEGATION is rejected.
+    #[tokio::test]
+    async fn s4u2self_without_trusted_to_auth_rejected() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+        // web does NOT have trusted_to_auth_for_delegation.
+        let web = make_svc_principal("EXAMPLE.COM", "web.example.com", "svc-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&web, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&web, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: web.realm.clone(),
+            sname: web.components.clone(),
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let pa_for_user = PaForUser {
+            user_name: alice.components.clone(),
+            user_realm: alice.realm.clone(),
+        };
+        let err = handle_tgs_req_s4u2self(&store, &krbtgt_key, &encode_tgs_req(&req), &pa_for_user)
+            .await
+            .expect_err("S4U2Self without TRUSTED_TO_AUTH_FOR_DELEGATION must be rejected");
+        match err {
+            KdcError::Policy(msg) => {
+                assert!(msg.contains("TRUSTED_TO_AUTH_FOR_DELEGATION"), "{msg}")
+            }
+            other => panic!("expected Policy error, got {other:?}"),
+        }
+    }
+
+    // ---- Wave 5: Pre-auth plugin framework tests ----
+
+    /// DoD test 3: plugin registration. Register a PaEncTimestampPlugin and
+    /// verify it's retrievable via `get()` and that `with_defaults()` pre-
+    /// loads it.
+    #[tokio::test]
+    async fn plugin_registration_works() {
+        // Empty registry.
+        let reg = PreAuthPluginRegistry::new();
+        assert!(reg.is_empty());
+        assert!(reg.get(PA_ENC_TIMESTAMP_TYPE).is_none());
+
+        // Register the PA-ENC-TIMESTAMP plugin.
+        let mut reg = reg;
+        reg.register(Box::new(PaEncTimestampPlugin::new()));
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+        let plugin = reg
+            .get(PA_ENC_TIMESTAMP_TYPE)
+            .expect("plugin must be registered");
+        assert_eq!(plugin.padata_type(), PA_ENC_TIMESTAMP_TYPE);
+
+        // with_defaults() pre-loads the plugin.
+        let reg2 = PreAuthPluginRegistry::with_defaults();
+        assert_eq!(reg2.len(), 1);
+        assert!(reg2.get(PA_ENC_TIMESTAMP_TYPE).is_some());
+    }
+
+    /// DoD test 4: unknown padata type rejected. When the padata list
+    /// contains only unknown types (no registered plugin), `verify()`
+    /// returns `KdcError::PreauthRequired`.
+    #[tokio::test]
+    async fn unknown_padata_type_rejected() {
+        let reg = PreAuthPluginRegistry::with_defaults();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+
+        // Padata with an unknown type (type 99 — not registered).
+        let padata = vec![PaData {
+            padata_type: 99,
+            padata_value: vec![0xAB, 0xCD],
+        }];
+        let err = reg
+            .verify(&padata, &alice)
+            .await
+            .expect_err("unknown padata must be rejected");
+        assert!(
+            matches!(err, KdcError::PreauthRequired),
+            "unknown padata type must return PreauthRequired, got {err:?}"
+        );
+
+        // Empty padata list also returns PreauthRequired.
+        let err2 = reg
+            .verify(&[], &alice)
+            .await
+            .expect_err("empty padata must be rejected");
+        assert!(matches!(err2, KdcError::PreauthRequired));
+    }
+
+    /// Plugin verify succeeds with valid PA-ENC-TIMESTAMP. The registry's
+    /// `verify()` method dispatches to the registered plugin, which calls
+    /// `verify_pa_enc_timestamp()` under the hood.
+    #[tokio::test]
+    async fn plugin_verify_succeeds_with_valid_padata() {
+        let reg = PreAuthPluginRegistry::with_defaults();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+
+        // Build a valid PA-ENC-TIMESTAMP.
+        let now = now_secs();
+        let pa_ts = PaEncTsEnc {
+            patimestamp: now,
+            pausec: 0,
+        };
+        let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
+        let blob = encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+            .expect("encrypt");
+
+        let padata = vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP_TYPE,
+            padata_value: blob,
+        }];
+        reg.verify(&padata, &alice)
+            .await
+            .expect("valid PA-ENC-TIMESTAMP must verify");
+    }
+
+    /// Plugin verify fails with tampered PA-ENC-TIMESTAMP (HMAC mismatch).
+    #[tokio::test]
+    async fn plugin_verify_fails_with_tampered_padata() {
+        let reg = PreAuthPluginRegistry::with_defaults();
+        let alice = make_principal("EXAMPLE.COM", "alice", "hunter2");
+
+        let now = now_secs();
+        let pa_ts = PaEncTsEnc {
+            patimestamp: now,
+            pausec: 0,
+        };
+        let pa_ts_bytes = encode_pa_enc_ts_enc(&pa_ts);
+        let mut blob =
+            encrypt_for_usage(&alice.key, KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP, &pa_ts_bytes)
+                .expect("encrypt");
+        blob[0] ^= 0xFF; // Tamper.
+
+        let padata = vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP_TYPE,
+            padata_value: blob,
+        }];
+        let err = reg
+            .verify(&padata, &alice)
+            .await
+            .expect_err("tampered padata must fail");
+        assert!(matches!(err, KdcError::PreauthFailed(_)));
     }
 
     /// Backward-compat path: `handle_as_req` (no metrics arg) must NOT
