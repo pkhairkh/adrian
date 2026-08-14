@@ -23,9 +23,17 @@ sha2.workspace = true
 bytes = "1"
 base64 = "0.22"
 http-body-util = "0.1"
+# Domain-06 Wave 3: Real ACME challenge verification (http-01 HTTP GET +
+# dns-01 TXT lookup) and ARI (RFC 8823).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+hickory-resolver = "0.24"
+async-trait.workspace = true
+rasn.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 rasn.workspace = true
 rasn-pkix.workspace = true
 bitvec = "1"
+# For the http-01 challenge test server (mock client-side well-known endpoint).
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }

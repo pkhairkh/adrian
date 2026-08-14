@@ -807,6 +807,15 @@ impl CaService {
         &self.signer
     }
 
+    /// Look up an issued certificate by its serial number. Returns the
+    /// `IssuedCert` record (including `not_after` for ARI renewal window
+    /// computation) or `None` if the serial was never issued by this CA.
+    /// Used by the ARI endpoint (RFC 8823).
+    pub async fn issued_cert_by_serial(&self, serial: u64) -> Option<IssuedCert> {
+        let issued = self.issued.read().await;
+        issued.iter().find(|c| c.serial == serial).cloned()
+    }
+
     /// Look up a profile by name (built-in or loaded via `load_profiles`).
     pub async fn profile(&self, name: &str) -> Result<CertProfile, CaError> {
         let profiles = self.profiles.read().await;
