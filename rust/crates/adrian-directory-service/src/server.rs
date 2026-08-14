@@ -25,8 +25,8 @@
 
 use crate::ber::BerError;
 use crate::handler::{
-    handle_add, handle_bind, handle_delete, handle_modify, handle_search, handle_unbind,
-    search_done_from_error,
+    handle_add, handle_bind, handle_delete, handle_extended_request, handle_modify, handle_search,
+    handle_unbind, search_done_from_error,
 };
 use crate::types::{LdapMessage, ProtocolOp, SearchResultDone};
 use crate::{Dsa, DsaError};
@@ -38,6 +38,18 @@ use tokio::net::TcpListener;
 /// port 389"). Note: binding to port 389 requires root privileges on most
 /// systems; tests bind to ephemeral ports instead.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:389";
+
+/// The default LDAPS (LDAP-over-TLS) bind address (`127.0.0.1:636` — per
+/// RFC 4511 §9.2 "well-known port 636").
+pub const DEFAULT_LDAPS_BIND_ADDR: &str = "127.0.0.1:636";
+
+/// The default Global Catalog bind address (`127.0.0.1:3268` — per
+/// MS-ADTS §3.1.1.3.2 / ADR-072).
+pub const DEFAULT_GC_BIND_ADDR: &str = "127.0.0.1:3268";
+
+/// The default Global Catalog-over-SSL bind address (`127.0.0.1:3269` —
+/// per MS-ADTS §3.1.1.3.2 / ADR-072).
+pub const DEFAULT_GC_SSL_BIND_ADDR: &str = "127.0.0.1:3269";
 
 /// The LDAP server — binds a TCP listener and serves connections.
 pub struct LdapServer {
@@ -73,6 +85,76 @@ impl LdapServer {
                 Err(e) => {
                     tracing::error!("accept failed: {}", e);
                     return Err(DsaError::Backend(format!("accept failed: {}", e)));
+                }
+            }
+        }
+    }
+
+    /// Bind to `addr` as the Global Catalog listener and serve
+    /// connections. Per ADR-072, the GC uses the same RFC 4511 protocol
+    /// as the LDAP listener (only the search semantics differ — a GC
+    /// search crosses all naming contexts). The wire protocol is
+    /// identical, so this is a thin alias for [`serve`](Self::serve)
+    /// that logs at GC-specific info level.
+    pub async fn serve_gc(&self, addr: std::net::SocketAddr) -> Result<(), DsaError> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| DsaError::Backend(format!("GC bind failed: {}", e)))?;
+        tracing::info!("Global Catalog server listening on {}", addr);
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    tracing::debug!("GC accepted connection from {}", peer);
+                    let dsa = Arc::clone(&self.dsa);
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_connection(stream, &dsa).await {
+                            tracing::warn!("GC connection error from {}: {}", peer, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("GC accept failed: {}", e);
+                    return Err(DsaError::Backend(format!("GC accept failed: {}", e)));
+                }
+            }
+        }
+    }
+
+    /// Bind to `addr` and serve LDAPS (LDAP-over-TLS) connections. Each
+    /// accepted TCP connection is first wrapped in a TLS handshake using
+    /// the provided `rustls` acceptor; the resulting TLS stream is then
+    /// served as a regular LDAP connection.
+    pub async fn serve_tls(
+        &self,
+        addr: std::net::SocketAddr,
+        tls_acceptor: tokio_rustls::TlsAcceptor,
+    ) -> Result<(), DsaError> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| DsaError::Backend(format!("LDAPS bind failed: {}", e)))?;
+        tracing::info!("LDAPS server listening on {}", addr);
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    tracing::debug!("LDAPS accepted connection from {}", peer);
+                    let dsa = Arc::clone(&self.dsa);
+                    let acceptor = tls_acceptor.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                if let Err(e) = serve_connection(tls_stream, &dsa).await {
+                                    tracing::warn!("LDAPS connection error from {}: {}", peer, e);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("LDAPS TLS handshake failed from {}: {}", peer, e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("LDAPS accept failed: {}", e);
+                    return Err(DsaError::Backend(format!("LDAPS accept failed: {}", e)));
                 }
             }
         }
@@ -289,13 +371,27 @@ where
             // No response — close the connection.
             Ok(false)
         }
+        ProtocolOp::ExtendedRequest(req) => {
+            let resp = handle_extended_request(dsa, req.clone()).await;
+            write_message(
+                stream,
+                LdapMessage {
+                    message_id,
+                    protocol_op: ProtocolOp::ExtendedResponse(resp),
+                    controls: Vec::new(),
+                },
+            )
+            .await?;
+            Ok(true)
+        }
         // Responses and other ops are client→server only; ignore them.
         ProtocolOp::BindResponse(_)
         | ProtocolOp::SearchResultEntry(_)
         | ProtocolOp::SearchResultDone(_)
         | ProtocolOp::ModifyResponse(_)
         | ProtocolOp::AddResponse(_)
-        | ProtocolOp::DelResponse(_) => {
+        | ProtocolOp::DelResponse(_)
+        | ProtocolOp::ExtendedResponse(_) => {
             tracing::warn!(
                 "received unexpected response op (message_id={}); ignoring",
                 message_id
@@ -342,6 +438,94 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::io::duplex;
     use uuid::Uuid;
+
+    /// Build a self-signed certificate + key for LDAPS tests using
+    /// `rcgen`. Returns the DER-encoded certificate and PKCS#8 private
+    /// key suitable for building a `rustls::ServerConfig`.
+    fn test_self_signed_cert() -> (Vec<u8>, Vec<u8>) {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .expect("rcgen CertificateParams");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "adrian-test-ldap");
+        let key_pair = rcgen::KeyPair::generate().expect("rcgen KeyPair::generate");
+        let cert = params.self_signed(&key_pair).expect("rcgen self_signed");
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+        (cert_der, key_der)
+    }
+
+    /// Build a `rustls::ServerConfig` from a self-signed cert for tests.
+    fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let (cert_der, key_der) = test_self_signed_cert();
+        let cert = rustls::pki_types::CertificateDer::from(cert_der);
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(key_der).expect("PrivateKeyDer::try_from");
+        let server_cfg = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("ServerConfig");
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_cfg))
+    }
+
+    /// A `ServerCertVerifier` that accepts any certificate. For LDAPS
+    /// tests only — never use in production.
+    #[derive(Debug)]
+    struct AcceptAnyServerCertVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+            ]
+        }
+    }
+
+    /// Build a `rustls::ClientConfig` that accepts any server cert.
+    /// Suitable for LDAPS tests where the server presents a self-signed
+    /// cert that hasn't been added to a real root store.
+    fn test_tls_client_config() -> std::sync::Arc<rustls::ClientConfig> {
+        let client_cfg = rustls::client::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCertVerifier))
+            .with_no_client_auth();
+        std::sync::Arc::new(client_cfg)
+    }
 
     fn dummy_invocation_id() -> Uuid {
         Uuid::from_u128(0x_ABCD)
@@ -829,6 +1013,143 @@ mod tests {
         let (decoded, consumed) = result.unwrap();
         assert_eq!(decoded.message_id, 1);
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[tokio::test]
+    async fn gc_listener_serves_search_on_ephemeral_port() {
+        // Per ADR-072, the GC listener binds on port 3268 (in production)
+        // and serves RFC 4511 messages with the same wire protocol as the
+        // LDAP listener. Bind to an ephemeral port, accept one connection,
+        // and verify a SearchRequest for the RootDSE returns a
+        // SearchResultEntry + SearchResultDone.
+        let (dsa, _store) = build_test_dsa();
+        let server = LdapServer::new(Arc::clone(&dsa));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve_task = tokio::spawn(async move {
+            // Accept one connection and serve it.
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection(stream, &dsa).await.unwrap();
+        });
+        let _ = server; // suppress unused warning
+                        // Connect as a client.
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = LdapMessage {
+            message_id: 7,
+            protocol_op: ProtocolOp::SearchRequest(SearchRequest {
+                base_dn: String::new(),
+                scope: 0,
+                deref_aliases: 0,
+                size_limit: 0,
+                time_limit: 0,
+                filter: Filter::present("objectClass"),
+                attributes: Vec::new(),
+                types_only: false,
+            }),
+            controls: Vec::new(),
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let bytes = req.encode();
+        client.write_all(&bytes).await.unwrap();
+        client.flush().await.unwrap();
+        // The server should send SearchResultEntry + SearchResultDone.
+        // We use a larger buffer (8 KiB) and a defensive timeout.
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("no GC response within 5s")
+            .unwrap();
+        // Decode the first message (SearchResultEntry).
+        let (entry, rest) = match crate::ber::decode_tlv(&buf[..n]) {
+            Ok((tlv, rest)) => (tlv, rest),
+            Err(e) => panic!("failed to decode GC response TLV: {}", e),
+        };
+        let entry_msg = LdapMessage::decode(&buf[..buf.len() - rest.len()]).unwrap();
+        assert_eq!(entry_msg.message_id, 7);
+        assert!(
+            matches!(entry_msg.protocol_op, ProtocolOp::SearchResultEntry(_)),
+            "expected SearchResultEntry, got {:?}",
+            entry_msg.protocol_op
+        );
+        let _ = entry;
+        // Decode the second message (SearchResultDone) from `rest`.
+        let done_msg = LdapMessage::decode(rest).unwrap();
+        assert_eq!(done_msg.message_id, 7);
+        assert!(matches!(
+            done_msg.protocol_op,
+            ProtocolOp::SearchResultDone(_)
+        ));
+        // Close the client to let the serve task finish.
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+            .await
+            .expect("GC serve task did not finish within 5s of client close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ldaps_listener_handshake_and_bind_round_trip() {
+        // Per RFC 4511 §9.2, LDAPS is LDAP-over-TLS on port 636 (in
+        // production). The server accepts a TCP connection, performs a
+        // TLS handshake using its self-signed cert, then serves LDAP
+        // messages over the encrypted channel.
+        let (dsa, _store) = build_test_dsa();
+        let server = LdapServer::new(Arc::clone(&dsa));
+        let acceptor = test_tls_acceptor();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve_task = tokio::spawn(async move {
+            // Accept one connection, perform the TLS handshake, and
+            // serve a single LDAP message exchange.
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            serve_connection(tls_stream, &dsa).await.unwrap();
+        });
+        let _ = server;
+        // Connect as a client, wrap in TLS (test client accepts any
+        // server cert), and send a BindRequest.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_cfg = test_tls_client_config();
+        let tls_connector = tokio_rustls::TlsConnector::from(client_cfg);
+        let mut tls_client = tls_connector
+            .connect("127.0.0.1".try_into().unwrap(), tcp)
+            .await
+            .expect("TLS handshake");
+        let req = LdapMessage {
+            message_id: 1,
+            protocol_op: ProtocolOp::BindRequest(BindRequest {
+                version: 3,
+                name: String::new(),
+                authentication: AuthenticationChoice::Simple(Vec::new()),
+            }),
+            controls: Vec::new(),
+        };
+        let bytes = req.encode();
+        tls_client.write_all(&bytes).await.unwrap();
+        tls_client.flush().await.unwrap();
+        // Read the response with a defensive timeout.
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls_client.read(&mut buf))
+            .await
+            .expect("no LDAPS response within 5s")
+            .unwrap();
+        let resp = LdapMessage::decode(&buf[..n]).unwrap();
+        assert_eq!(resp.message_id, 1);
+        match resp.protocol_op {
+            ProtocolOp::BindResponse(BindResponse { result, .. }) => {
+                assert_eq!(result.result_code, ResultCode::Success);
+            }
+            other => panic!("expected BindResponse, got {:?}", other),
+        }
+        // Close the TLS stream cleanly (send close_notify) so the
+        // server's read returns EOF rather than an "unclean close"
+        // error.
+        use tokio::io::AsyncWriteExt;
+        let _ = tls_client.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+            .await
+            .expect("LDAPS serve task did not finish within 5s of client close")
+            .unwrap();
     }
 
     #[test]

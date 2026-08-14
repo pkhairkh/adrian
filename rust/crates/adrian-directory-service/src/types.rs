@@ -30,8 +30,9 @@ use crate::filter::Filter;
 // Re-export the application-tag constants for handlers and tests.
 pub use crate::ber::{
     APP_ADD_REQUEST, APP_ADD_RESPONSE, APP_BIND_REQUEST, APP_BIND_RESPONSE, APP_DEL_REQUEST,
-    APP_DEL_RESPONSE, APP_MODIFY_REQUEST, APP_MODIFY_RESPONSE, APP_SEARCH_REQUEST,
-    APP_SEARCH_RESULT_DONE, APP_SEARCH_RESULT_ENTRY, APP_UNBIND_REQUEST,
+    APP_DEL_RESPONSE, APP_EXTENDED_REQUEST, APP_EXTENDED_RESPONSE, APP_MODIFY_REQUEST,
+    APP_MODIFY_RESPONSE, APP_SEARCH_REQUEST, APP_SEARCH_RESULT_DONE, APP_SEARCH_RESULT_ENTRY,
+    APP_UNBIND_REQUEST,
 };
 
 /// An LDAP message ID (RFC 4511 §4.1.1.1). Positive integer; clients
@@ -989,6 +990,171 @@ impl DelResponse {
     }
 }
 
+/// An LDAP extended request (RFC 4511 §4.12).
+///
+/// Wire form: `[APPLICATION 23] SEQUENCE { requestName [0] LDAPOID,
+/// requestValue [1] OCTET STRING OPTIONAL }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedRequest {
+    /// The extended operation OID (`requestName`).
+    pub request_name: String,
+    /// The optional extended operation value (`requestValue`). Raw bytes
+    /// — the per-operation format is defined by the operation itself.
+    pub request_value: Option<Vec<u8>>,
+}
+
+impl ExtendedRequest {
+    /// Construct a new extended request with no value.
+    pub fn new(request_name: impl Into<String>) -> Self {
+        Self {
+            request_name: request_name.into(),
+            request_value: None,
+        }
+    }
+
+    /// Attach a `requestValue` to this extended request.
+    pub fn with_value(mut self, value: impl Into<Vec<u8>>) -> Self {
+        self.request_value = Some(value.into());
+        self
+    }
+
+    /// Encode as `[APPLICATION 23]`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let mut body = Vec::new();
+        ber::encode_tlv(
+            crate::ber::EXT_REQUEST_NAME,
+            self.request_name.as_bytes(),
+            &mut body,
+        );
+        if let Some(v) = &self.request_value {
+            ber::encode_tlv(crate::ber::EXT_REQUEST_VALUE, v, &mut body);
+        }
+        ber::encode_tlv(APP_EXTENDED_REQUEST, &body, out);
+    }
+
+    /// Decode from a TLV value.
+    pub fn decode_from_value(value: &[u8]) -> Result<ExtendedRequest, BerError> {
+        let (name_tlv, rest) = ber::decode_tlv(value)?;
+        if name_tlv.tag != crate::ber::EXT_REQUEST_NAME {
+            return Err(BerError::UnexpectedTag {
+                expected: crate::ber::EXT_REQUEST_NAME,
+                actual: name_tlv.tag,
+            });
+        }
+        let request_name = decode_string_value(name_tlv.value)?;
+        let request_value = if rest.is_empty() {
+            None
+        } else {
+            let (val_tlv, rest) = ber::decode_tlv(rest)?;
+            if val_tlv.tag != crate::ber::EXT_REQUEST_VALUE {
+                return Err(BerError::UnexpectedTag {
+                    expected: crate::ber::EXT_REQUEST_VALUE,
+                    actual: val_tlv.tag,
+                });
+            }
+            if !rest.is_empty() {
+                return Err(BerError::TrailingData(rest.len()));
+            }
+            Some(val_tlv.value.to_vec())
+        };
+        Ok(ExtendedRequest {
+            request_name,
+            request_value,
+        })
+    }
+}
+
+/// An LDAP extended response (RFC 4511 §4.12).
+///
+/// Wire form: `[APPLICATION 24] SEQUENCE { COMPONENTS OF LDAPResult,
+/// responseName [10] LDAPOID OPTIONAL, responseValue [11] OCTET STRING
+/// OPTIONAL }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedResponse {
+    /// The result.
+    pub result: LdapResult,
+    /// The optional `responseName` — typically echoes the `requestName`.
+    pub response_name: Option<String>,
+    /// The optional `responseValue` — per-operation format.
+    pub response_value: Option<Vec<u8>>,
+}
+
+impl ExtendedResponse {
+    /// Construct a successful extended response with no responseName/value.
+    pub fn success() -> Self {
+        Self {
+            result: LdapResult::success(),
+            response_name: None,
+            response_value: None,
+        }
+    }
+
+    /// Construct an error extended response.
+    pub fn error(code: ResultCode, diagnostic: impl Into<String>) -> Self {
+        Self {
+            result: LdapResult::error(code, diagnostic),
+            response_name: None,
+            response_value: None,
+        }
+    }
+
+    /// Attach a `responseName`.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.response_name = Some(name.into());
+        self
+    }
+
+    /// Attach a `responseValue`.
+    pub fn with_value(mut self, value: impl Into<Vec<u8>>) -> Self {
+        self.response_value = Some(value.into());
+        self
+    }
+
+    /// Encode as `[APPLICATION 24]`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let mut body = Vec::new();
+        self.result.encode_components(&mut body);
+        if let Some(name) = &self.response_name {
+            ber::encode_tlv(crate::ber::EXT_RESPONSE_NAME, name.as_bytes(), &mut body);
+        }
+        if let Some(v) = &self.response_value {
+            ber::encode_tlv(crate::ber::EXT_RESPONSE_VALUE, v, &mut body);
+        }
+        ber::encode_tlv(APP_EXTENDED_RESPONSE, &body, out);
+    }
+
+    /// Decode from a TLV value.
+    pub fn decode_from_value(value: &[u8]) -> Result<ExtendedResponse, BerError> {
+        let (result, rest) = LdapResult::decode_components(value)?;
+        let mut response_name = None;
+        let mut response_value = None;
+        let mut rest = rest;
+        while !rest.is_empty() {
+            let (tlv, r) = ber::decode_tlv(rest)?;
+            match tlv.tag {
+                crate::ber::EXT_RESPONSE_NAME => {
+                    response_name = Some(decode_string_value(tlv.value)?);
+                }
+                crate::ber::EXT_RESPONSE_VALUE => {
+                    response_value = Some(tlv.value.to_vec());
+                }
+                _ => {
+                    return Err(BerError::UnexpectedTag {
+                        expected: crate::ber::EXT_RESPONSE_NAME,
+                        actual: tlv.tag,
+                    });
+                }
+            }
+            rest = r;
+        }
+        Ok(ExtendedResponse {
+            result,
+            response_name,
+            response_value,
+        })
+    }
+}
+
 /// An LDAP control (RFC 4511 §4.1.11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Control {
@@ -1096,6 +1262,19 @@ pub const LDAP_SERVER_SD_FLAGS_OID: &str = "1.2.840.113556.1.4.801";
 /// `1.2.840.113556.1.4.529` — extended DN control OID
 /// (`LDAP_SERVER_EXTENDED_DN_OID` per MS-ADTS §3.1.1.3.4.2).
 pub const LDAP_SERVER_EXTENDED_DN_OID: &str = "1.2.840.113556.1.4.529";
+
+/// `1.3.6.1.4.1.4203.1.11.1` — modify-password extended operation OID
+/// (RFC 3062, `LDAP_PASSWORD_MODIFY_OID`).
+pub const LDAP_PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
+
+/// `1.2.840.113556.1.4.805` — `schemaModifyRequest` extended operation
+/// OID per MS-ADTS §3.1.1.3.4.10 (ADR-078 — hybrid schema model). The
+/// requestValue is an LDIF-encoded schema update.
+pub const SCHEMA_MODIFY_REQUEST_OID: &str = "1.2.840.113556.1.4.805";
+
+/// `1.3.6.1.4.1.1466.20037` — StartTLS extended operation OID (RFC 4511
+/// §4.14.5). Used to negotiate TLS within a plain-LDAP connection.
+pub const LDAP_START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 
 /// A paged-results control value (RFC 2696 §2).
 ///
@@ -1587,6 +1766,10 @@ pub enum ProtocolOp {
     DelRequest(DelRequest),
     /// `[APPLICATION 11]` DelResponse.
     DelResponse(DelResponse),
+    /// `[APPLICATION 23]` ExtendedRequest (RFC 4511 §4.12).
+    ExtendedRequest(ExtendedRequest),
+    /// `[APPLICATION 24]` ExtendedResponse (RFC 4511 §4.12).
+    ExtendedResponse(ExtendedResponse),
 }
 
 impl ProtocolOp {
@@ -1605,6 +1788,8 @@ impl ProtocolOp {
             ProtocolOp::AddResponse(r) => r.encode(out),
             ProtocolOp::DelRequest(r) => r.encode(out),
             ProtocolOp::DelResponse(r) => r.encode(out),
+            ProtocolOp::ExtendedRequest(r) => r.encode(out),
+            ProtocolOp::ExtendedResponse(r) => r.encode(out),
         }
     }
 
@@ -1647,6 +1832,12 @@ impl ProtocolOp {
             APP_DEL_RESPONSE => Ok(ProtocolOp::DelResponse(DelResponse::decode_from_value(
                 value,
             )?)),
+            APP_EXTENDED_REQUEST => Ok(ProtocolOp::ExtendedRequest(
+                ExtendedRequest::decode_from_value(value)?,
+            )),
+            APP_EXTENDED_RESPONSE => Ok(ProtocolOp::ExtendedResponse(
+                ExtendedResponse::decode_from_value(value)?,
+            )),
             t => Err(BerError::UnknownProtocolOp(t)),
         }
     }
@@ -2084,7 +2275,7 @@ mod tests {
         let (tlv, _) = ber::decode_tlv(&out).unwrap();
         let decoded = Control::decode_from_value(tlv.value).unwrap();
         assert_eq!(decoded.control_type, "1.2.3.4");
-        assert_eq!(decoded.criticality, false);
+        assert!(!decoded.criticality);
         assert_eq!(decoded.control_value, Some(vec![0xAA, 0xBB]));
     }
 

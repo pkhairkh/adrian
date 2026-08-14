@@ -92,6 +92,22 @@ pub const APP_ADD_RESPONSE: u8 = CLASS_APPLICATION | CONSTRUCTED | 9;
 pub const APP_DEL_REQUEST: u8 = CLASS_APPLICATION | 10;
 /// `0x6B` — DelResponse (`[APPLICATION 11]` constructed).
 pub const APP_DEL_RESPONSE: u8 = CLASS_APPLICATION | CONSTRUCTED | 11;
+/// `0x77` — ExtendedRequest (`[APPLICATION 23]` constructed, per RFC 4511 §4.12).
+pub const APP_EXTENDED_REQUEST: u8 = CLASS_APPLICATION | CONSTRUCTED | 23;
+/// `0x78` — ExtendedResponse (`[APPLICATION 24]` constructed, per RFC 4511 §4.12).
+pub const APP_EXTENDED_RESPONSE: u8 = CLASS_APPLICATION | CONSTRUCTED | 24;
+
+// ---- Context tag bytes for ExtendedRequest / ExtendedResponse fields
+// (RFC 4511 §4.12). ----
+
+/// `0x80` — `requestName [0] LDAPOID` (primitive).
+pub const EXT_REQUEST_NAME: u8 = CLASS_CONTEXT;
+/// `0x81` — `requestValue [1] OCTET STRING` (primitive).
+pub const EXT_REQUEST_VALUE: u8 = CLASS_CONTEXT | 1;
+/// `0x8A` — `responseName [10] LDAPOID` (primitive).
+pub const EXT_RESPONSE_NAME: u8 = CLASS_CONTEXT | 10;
+/// `0x8B` — `responseValue [11] OCTET STRING` (primitive).
+pub const EXT_RESPONSE_VALUE: u8 = CLASS_CONTEXT | 11;
 
 // ---- Context tag bytes for LDAP search filters (RFC 4511 §4.5.1). ----
 

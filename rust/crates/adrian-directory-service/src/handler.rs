@@ -589,6 +589,56 @@ pub async fn handle_delete(dsa: &Dsa, req: DelRequest) -> DelResponse {
     DelResponse::success()
 }
 
+/// Dispatch an LDAP extended request (RFC 4511 §4.12) to the
+/// appropriate per-OID handler.
+///
+/// Supported OIDs:
+/// - `SCHEMA_MODIFY_REQUEST_OID` (1.2.840.113556.1.4.805) —
+///   `schemaModifyRequest` per ADR-078. Delegates to
+///   [`crate::handle_schema_modify_request`].
+/// - `LDAP_START_TLS_OID` (1.3.6.1.4.1.1466.20037) — StartTLS. Returns
+///   `unwillingToPerform` because the actual TLS upgrade is performed by
+///   the LDAPS listener (`LdapServer::serve_tls`), not by an in-place
+///   upgrade of the plaintext connection.
+/// - Unknown OIDs return `protocolError`.
+pub async fn handle_extended_request(
+    dsa: &Dsa,
+    req: crate::types::ExtendedRequest,
+) -> crate::types::ExtendedResponse {
+    use crate::types::{ExtendedResponse, ResultCode};
+    match req.request_name.as_str() {
+        crate::types::SCHEMA_MODIFY_REQUEST_OID => {
+            let value = req.request_value.unwrap_or_default();
+            match crate::handle_schema_modify_request(dsa, &value).await {
+                Ok(()) => {
+                    ExtendedResponse::success().with_name(crate::types::SCHEMA_MODIFY_REQUEST_OID)
+                }
+                Err(e) => ExtendedResponse::error(ResultCode::UnwillingToPerform, e.to_string())
+                    .with_name(crate::types::SCHEMA_MODIFY_REQUEST_OID),
+            }
+        }
+        crate::types::LDAP_START_TLS_OID => {
+            // StartTLS is performed at the listener level by upgrading
+            // the connection; the in-process handler reports
+            // unwillingness so clients fall back to direct LDAPS.
+            ExtendedResponse::error(
+                ResultCode::UnwillingToPerform,
+                "StartTLS not supported — use the LDAPS port (636) directly",
+            )
+            .with_name(crate::types::LDAP_START_TLS_OID)
+        }
+        crate::types::LDAP_PASSWORD_MODIFY_OID => ExtendedResponse::error(
+            ResultCode::UnwillingToPerform,
+            "password modify not yet implemented (future wave)",
+        )
+        .with_name(crate::types::LDAP_PASSWORD_MODIFY_OID),
+        other => ExtendedResponse::error(
+            ResultCode::ProtocolError,
+            format!("unknown extended operation OID: {}", other),
+        ),
+    }
+}
+
 /// Build a `SearchResultDone` from a [`DsaError`] (used by the server
 /// when `handle_search` returns an error).
 pub fn search_done_from_error(err: &DsaError) -> SearchResultDone {
