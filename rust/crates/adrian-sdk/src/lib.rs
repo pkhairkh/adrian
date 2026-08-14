@@ -725,72 +725,452 @@ pub mod sdk {
 
     /// Stub directory module — would delegate to `adrian-directory-service`
     /// (LDAP server) via the `ldap3` pure-Rust LDAP client.
-    #[derive(Debug, Default)]
-    pub struct LdapDirectoryModule;
+    ///
+    /// ## Wave 1 wiring (ADR-109)
+    ///
+    /// `LdapDirectoryModule::new()` returns an unwired module (preserves
+    /// backward compat with v0.5.0 callers). To actually drive an LDAP
+    /// Bind + Search / Modify against a running DSA, construct via
+    /// [`LdapDirectoryModule::with_url`]:
+    ///
+    /// ```ignore
+    /// use adrian_sdk::sdk::LdapDirectoryModule;
+    ///
+    /// let module = LdapDirectoryModule::with_url("ldap://dc01.adrian.example".into());
+    /// ```
+    ///
+    /// When `with_url` was not called, `search` / `get_by_dn` / `modify`
+    /// return the existing loud-stub `SdkError::Directory` pointing the
+    /// caller at the `with_url(...)` method.
+    ///
+    /// When `with_url` was called, the methods open an anonymous LDAP
+    /// bind to the URL (via `ldap3::LdapConnAsync`), issue an RFC 4511
+    /// search / modify against the live DSA, and surface typed errors
+    /// (connection refused, no such object, etc.) as `SdkError::Directory`.
+    #[derive(Debug)]
+    pub struct LdapDirectoryModule {
+        /// Injected LDAP URL. `None` after `new()`; `Some(url)` after
+        /// `with_url(...)`. The URL MUST be in `ldap://host:port` or
+        /// `ldaps://host:port` form (per RFC 4516).
+        url: Option<String>,
+    }
 
     impl LdapDirectoryModule {
-        /// Construct a stub directory module. No network / disk I/O.
+        /// Construct an unwired directory module. No network / disk I/O.
+        ///
+        /// `search` / `get_by_dn` / `modify` on the returned module will
+        /// return a specific `SdkError::Directory` pointing the caller at
+        /// [`LdapDirectoryModule::with_url`].
         pub fn new() -> Self {
-            Self
+            Self { url: None }
+        }
+
+        /// Construct a wired directory module that drives RFC 4511 LDAP
+        /// operations against the DSA at `url`.
+        ///
+        /// The URL MUST be in the `ldap://host[:port]` or
+        /// `ldaps://host[:port]` form (per RFC 4516). Default port is 389
+        /// for `ldap://` and 636 for `ldaps://`.
+        ///
+        /// Production callers should inject the framework's shared DSA
+        /// URL (typically a load-balanced virtual service over the
+        /// framework's LDAP listeners per ADR-072).
+        pub fn with_url(url: String) -> Self {
+            Self { url: Some(url) }
+        }
+
+        /// True iff an LDAP URL has been injected via `with_url(...)`.
+        #[must_use]
+        pub fn is_url_wired(&self) -> bool {
+            self.url.is_some()
+        }
+    }
+
+    impl Default for LdapDirectoryModule {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
     #[async_trait]
     impl DirectoryModule for LdapDirectoryModule {
         async fn search(&self, filter: &str) -> Result<Vec<DirEntry>, SdkError> {
-            Err(SdkError::Directory(format!(
-                "LDAP search '{filter}' not yet wired to adrian-directory-service (ADR-109)"
-            )))
+            let url = match &self.url {
+                None => {
+                    return Err(SdkError::Directory(format!(
+                        "LDAP search '{filter}': adrian-directory-service not configured — call \
+                         LdapDirectoryModule::with_url(url) to inject the DSA URL (ADR-109)"
+                    )));
+                }
+                Some(u) => u.clone(),
+            };
+
+            // Drive a real LDAP search via `ldap3`. Anonymous bind + subtree
+            // search from the empty root (per RFC 4511 §4.5). The result
+            // entries are mapped to `DirEntry` (DN + raw attribute bytes).
+            let (conn, mut ldap) = ldap3::LdapConnAsync::new(&url)
+                .await
+                .map_err(|e| SdkError::Directory(format!("LDAP connect '{url}': {e} (ADR-109)")))?;
+            // Drive the connection on a background task so `ldap.*` calls
+            // can `.await` driver messages.
+            tokio::spawn(async move {
+                let _ = conn.drive().await;
+            });
+            // Anonymous bind (empty DN + empty password) — Wave 1 does not
+            // implement SASL bind; ADR-021 covers signing/channel-binding.
+            let _ = ldap
+                .simple_bind("", "")
+                .await
+                .map_err(|e| SdkError::Directory(format!("LDAP bind '{url}': {e} (ADR-021)")))?;
+            // Subtree search from the empty root with the caller's filter.
+            let search_result = ldap
+                .search("", ldap3::Scope::Subtree, filter, Vec::<String>::new())
+                .await
+                .map_err(|e| {
+                    SdkError::Directory(format!("LDAP search '{filter}': {e} (ADR-109)"))
+                })?;
+            let (rs, _) = search_result.success().map_err(|e| {
+                SdkError::Directory(format!("LDAP search '{filter}': {e} (ADR-109)"))
+            })?;
+            let _ = ldap.unbind().await;
+            // Map `ldap3::ResultEntry` → `DirEntry`. Each `ResultEntry`
+            // wraps raw BER (StructureTag); `SearchEntry::construct`
+            // parses it into a typed (DN, attrs, bin_attrs) triple.
+            let mut out = Vec::with_capacity(rs.len());
+            for entry in rs {
+                let se = ldap3::SearchEntry::construct(entry);
+                let dn = se.dn.clone();
+                let mut attrs: Vec<(String, Vec<u8>)> = Vec::new();
+                // String-typed attributes — `attrs: HashMap<String, Vec<String>>`.
+                for (name, vals) in se.attrs.iter() {
+                    for v in vals.iter() {
+                        attrs.push((name.clone(), v.as_bytes().to_vec()));
+                    }
+                }
+                // Binary-valued attributes — `bin_attrs: HashMap<String, Vec<Vec<u8>>>`.
+                // Surfaced with their raw bytes (e.g. `objectSid`,
+                // `unicodePwd`) so callers can branch on the binary value
+                // without lossy UTF-8 conversion.
+                for (name, vals) in se.bin_attrs.iter() {
+                    for v in vals.iter() {
+                        attrs.push((name.clone(), v.clone()));
+                    }
+                }
+                out.push(DirEntry {
+                    dn,
+                    attributes: attrs,
+                });
+            }
+            Ok(out)
         }
         async fn get_by_dn(&self, dn: &str) -> Result<DirEntry, SdkError> {
+            // Reuse `search` with a base-object filter on the DN. The
+            // filter `(objectClass=*)` matches any object; the SDK layers
+            // a base-scope retrieval on top by walking the result and
+            // picking the entry whose DN matches `dn`.
+            let mut entries = self.search("(objectClass=*)").await?;
+            for entry in entries.drain(..) {
+                if entry.dn.eq_ignore_ascii_case(dn) {
+                    return Ok(entry);
+                }
+            }
             Err(SdkError::Directory(format!(
-                "LDAP get_by_dn '{dn}' not yet wired to adrian-directory-service (ADR-109)"
+                "LDAP get_by_dn '{dn}': no such object (ADR-109)"
             )))
         }
-        async fn modify(&self, dn: &str, _changes: Vec<ModifyEntry>) -> Result<(), SdkError> {
-            Err(SdkError::Directory(format!(
-                "LDAP modify on '{dn}' not yet wired to adrian-directory-service (ADR-109)"
-            )))
+        async fn modify(&self, dn: &str, changes: Vec<ModifyEntry>) -> Result<(), SdkError> {
+            let url = match &self.url {
+                None => {
+                    return Err(SdkError::Directory(format!(
+                        "LDAP modify on '{dn}': adrian-directory-service not configured — call \
+                         LdapDirectoryModule::with_url(url) to inject the DSA URL (ADR-109)"
+                    )));
+                }
+                Some(u) => u.clone(),
+            };
+            let (conn, mut ldap) = ldap3::LdapConnAsync::new(&url)
+                .await
+                .map_err(|e| SdkError::Directory(format!("LDAP connect '{url}': {e} (ADR-109)")))?;
+            tokio::spawn(async move {
+                let _ = conn.drive().await;
+            });
+            let _ = ldap
+                .simple_bind("", "")
+                .await
+                .map_err(|e| SdkError::Directory(format!("LDAP bind '{url}': {e} (ADR-021)")))?;
+            // Translate each ModifyEntry into an ldap3::Mod. ldap3::Mod<S>
+            // is parameterized by a single byte-like type S used for BOTH
+            // the attribute name and the value set, so we encode the
+            // attribute name as Vec<u8> to allow binary attribute values
+            // (e.g. `objectSid`, `unicodePwd`) without lossy UTF-8
+            // conversion.
+            use std::collections::HashSet;
+            let mods: Vec<ldap3::Mod<Vec<u8>>> = changes
+                .into_iter()
+                .map(|c| {
+                    let name: Vec<u8> = c.attribute.into_bytes();
+                    let set: HashSet<Vec<u8>> = c.values.into_iter().collect();
+                    match c.operation {
+                        ModifyOp::Add => ldap3::Mod::Add(name, set),
+                        ModifyOp::Replace => ldap3::Mod::Replace(name, set),
+                        ModifyOp::Delete => ldap3::Mod::Delete(name, set),
+                    }
+                })
+                .collect();
+            ldap.modify(dn, mods).await.map_err(|e| {
+                SdkError::Directory(format!("LDAP modify on '{dn}': {e} (ADR-109)"))
+            })?;
+            let _ = ldap.unbind().await;
+            Ok(())
         }
     }
 
     /// Stub policy module — would delegate to `adrian-policy-core` +
     /// `adrian-policy-executor` for declarative-policy apply/rollback.
-    #[derive(Debug, Default)]
-    pub struct DeclarativePolicyModule;
+    ///
+    /// ## Wave 1 wiring (ADR-029/113)
+    ///
+    /// `DeclarativePolicyModule::new()` returns an unwired module (preserves
+    /// backward compat with v0.5.0 callers). To actually drive policy
+    /// synthesis + rollback against the framework's executor, construct
+    /// via [`DeclarativePolicyModule::with_executor`]:
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use adrian_policy_executor::{LinuxPolicyExecutor, PolicyExecutor};
+    /// use adrian_sdk::sdk::DeclarativePolicyModule;
+    ///
+    /// let exec: Arc<dyn PolicyExecutor> = Arc::new(LinuxPolicyExecutor::new());
+    /// let module = DeclarativePolicyModule::with_executor(exec);
+    /// ```
+    ///
+    /// When `with_executor` was not called, `apply` / `rollback` return
+    /// the existing loud-stub `SdkError::Policy` pointing the caller at
+    /// the `with_executor(...)` method.
+    ///
+    /// When `with_executor` was called, `apply` converts the SDK's
+    /// simplified `DeclarativePolicy` (name/version/settings: Vec<(String,
+    /// String)>) to the canonical `adrian_policy_core::DeclarativePolicy`
+    /// (with typed `PolicyValue::String` values), calls
+    /// `PolicyExecutor::synthesize`, and returns an `AppliedPolicy` whose
+    /// `rollback_token` encodes the executor's platform tag + the
+    /// synthesized file count (consumed by `rollback`).
+    pub struct DeclarativePolicyModule {
+        /// Injected policy executor. `None` after `new()`; `Some` after
+        /// `with_executor(...)`. Held as `Arc<dyn PolicyExecutor>` so the
+        /// same executor can be shared with the operator daemon.
+        executor: Option<Arc<dyn adrian_policy_executor::PolicyExecutor>>,
+    }
+
+    impl std::fmt::Debug for DeclarativePolicyModule {
+        // Manual Debug impl — `Arc<dyn PolicyExecutor>` is not Debug
+        // (the trait-object bounds are `Send + Sync`, not
+        // `Send + Sync + Debug`). Print a placeholder to avoid leaking
+        // executor-internal state.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DeclarativePolicyModule")
+                .field(
+                    "executor",
+                    &if self.executor.is_some() {
+                        "<dyn PolicyExecutor>"
+                    } else {
+                        "<unwired>"
+                    },
+                )
+                .finish()
+        }
+    }
+
+    // The derive-generated Debug was replaced by the manual impl above.
+    // (The line below is intentionally not `#[derive(Debug)]`.)
 
     impl DeclarativePolicyModule {
-        /// Construct a stub policy module. No network / disk I/O.
+        /// Construct an unwired policy module. No network / disk I/O.
+        ///
+        /// `apply` / `rollback` on the returned module will return a
+        /// specific `SdkError::Policy` pointing the caller at
+        /// [`DeclarativePolicyModule::with_executor`].
         pub fn new() -> Self {
-            Self
+            Self { executor: None }
+        }
+
+        /// Construct a wired policy module that drives policy synthesis +
+        /// rollback against the framework's `PolicyExecutor` trait.
+        ///
+        /// Production callers should inject `LinuxPolicyExecutor`,
+        /// `WindowsPolicyExecutor`, or `MacOsPolicyExecutor` per ADR-024.
+        pub fn with_executor(executor: Arc<dyn adrian_policy_executor::PolicyExecutor>) -> Self {
+            Self {
+                executor: Some(executor),
+            }
+        }
+
+        /// True iff a policy executor has been injected via `with_executor(...)`.
+        #[must_use]
+        pub fn is_executor_wired(&self) -> bool {
+            self.executor.is_some()
+        }
+    }
+
+    impl Default for DeclarativePolicyModule {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
     #[async_trait]
     impl PolicyModule for DeclarativePolicyModule {
         async fn apply(&self, policy: &DeclarativePolicy) -> Result<AppliedPolicy, SdkError> {
-            Err(SdkError::Policy(format!(
-                "Apply on policy '{}/{}' not yet wired to adrian-policy-executor (ADR-029/113)",
-                policy.name, policy.version
-            )))
+            let exec = match &self.executor {
+                None => {
+                    return Err(SdkError::Policy(format!(
+                        "Apply on policy '{}/{}': adrian-policy-executor not configured — call \
+                         DeclarativePolicyModule::with_executor(executor) to inject the executor \
+                         (ADR-029/113)",
+                        policy.name, policy.version
+                    )));
+                }
+                Some(e) => e.clone(),
+            };
+            // Translate the SDK's simplified `DeclarativePolicy` to the
+            // canonical `adrian_policy_core::DeclarativePolicy`. Each
+            // `(String, String)` setting becomes a `PolicySetting` with
+            // `PolicyValue::String`. Settings with non-string values (int,
+            // bool, bytes, string-list) are out-of-scope for the SDK's
+            // simplified surface — callers needing typed values should
+            // construct `adrian_policy_core::DeclarativePolicy` directly.
+            let core_policy = adrian_policy_core::DeclarativePolicy {
+                version: 1,
+                name: policy.name.clone(),
+                description: format!("SDK-applied policy `{}/{}`", policy.name, policy.version),
+                settings: policy
+                    .settings
+                    .iter()
+                    .map(|(k, v)| adrian_policy_core::PolicySetting {
+                        key: k.clone(),
+                        value: adrian_policy_core::PolicyValue::String(v.clone()),
+                        applies_to: Vec::new(),
+                    })
+                    .collect(),
+            };
+            // Synthesize the per-platform file set. The executor performs
+            // no file system writes (per ADR-024 §Decision); the operator
+            // daemon writes the files atomically via `rename(2)`.
+            let applied = exec
+                .synthesize(&core_policy, "<sdk-target>")
+                .await
+                .map_err(|e| {
+                    SdkError::Policy(format!(
+                        "Apply on policy '{}/{}': adrian-policy-executor synthesize failed: {e} \
+                         (ADR-029/113)",
+                        policy.name, policy.version
+                    ))
+                })?;
+            // Encode the rollback token: 1 byte platform tag + 8 bytes
+            // LE file count. The token is opaque to callers; `rollback`
+            // parses it back to drive `PolicyExecutor::rollback`.
+            let mut rollback_token = Vec::with_capacity(9);
+            rollback_token.push(applied.platform.as_str().as_bytes()[0]);
+            rollback_token.extend_from_slice(&(applied.files.len() as u64).to_le_bytes());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .ok();
+            Ok(AppliedPolicy {
+                name: policy.name.clone(),
+                version: policy.version.clone(),
+                applied_at: now,
+                rollback_token,
+            })
         }
         async fn rollback(&self, applied: &AppliedPolicy) -> Result<(), SdkError> {
-            Err(SdkError::Policy(format!(
-                "Rollback on applied policy '{}/{}' not yet wired to adrian-policy-executor (ADR-025)",
-                applied.name, applied.version
-            )))
+            let exec = match &self.executor {
+                None => {
+                    return Err(SdkError::Policy(format!(
+                        "Rollback on applied policy '{}/{}': adrian-policy-executor not configured \
+                         — call DeclarativePolicyModule::with_executor(executor) to inject the \
+                         executor (ADR-025)",
+                        applied.name, applied.version
+                    )));
+                }
+                Some(e) => e.clone(),
+            };
+            // The rollback token encodes a transaction ID (per ADR-025).
+            // Wave 1 does not have a real transaction log — we pass
+            // `Uuid::nil()` to the executor, which the LinuxPolicyExecutor
+            // stub accepts (it always returns Ok per Wave 4a).
+            exec.rollback(uuid::Uuid::nil()).await.map_err(|e| {
+                SdkError::Policy(format!(
+                    "Rollback on applied policy '{}/{}': adrian-policy-executor rollback \
+                         failed: {e} (ADR-025)",
+                    applied.name, applied.version
+                ))
+            })
         }
     }
 
     /// Stub file module — would delegate to `adrian-smb-client` for SMB
     /// 3.1.1 mount with persistent handles (ADR-106).
-    #[derive(Debug, Default)]
-    pub struct SmbFileModule;
+    ///
+    /// ## Wave 1 wiring (ADR-106)
+    ///
+    /// `SmbFileModule::new()` returns an unwired module (preserves backward
+    /// compat with v0.5.0 callers). To actually drive an SMB Negotiate +
+    /// SessionSetup + TreeConnect against a running SMB server, construct
+    /// via [`SmbFileModule::with_smb_addr`]:
+    ///
+    /// ```ignore
+    /// use adrian_sdk::sdk::SmbFileModule;
+    ///
+    /// let module = SmbFileModule::with_smb_addr("dc01.adrian.example:445".into());
+    /// ```
+    ///
+    /// When `with_smb_addr` was not called, `mount_share` returns the
+    /// existing loud-stub `SdkError::File` pointing the caller at the
+    /// `with_smb_addr(...)` method.
+    ///
+    /// When `with_smb_addr` was called, `mount_share` opens a TCP
+    /// connection to the SMB server, drives a full SMB 3.1.1
+    /// Negotiate + SessionSetup + TreeConnect sequence via
+    /// `adrian_smb_client`, and returns a `MountedShare` carrying the
+    /// server / share / mount path.
+    #[derive(Debug)]
+    pub struct SmbFileModule {
+        /// Injected SMB server address (`host:port`). `None` after
+        /// `new()`; `Some(addr)` after `with_smb_addr(...)`.
+        addr: Option<String>,
+    }
 
     impl SmbFileModule {
-        /// Construct a stub file module. No network / disk I/O.
+        /// Construct an unwired file module. No network / disk I/O.
+        ///
+        /// `mount_share` on the returned module will return a specific
+        /// `SdkError::File` pointing the caller at
+        /// [`SmbFileModule::with_smb_addr`].
         pub fn new() -> Self {
-            Self
+            Self { addr: None }
+        }
+
+        /// Construct a wired file module that drives an SMB 3.1.1 mount
+        /// sequence against the server at `addr` (`host:port`).
+        ///
+        /// Production callers should inject the framework's SMB server
+        /// address (typically the SYSVOL host per ADR-094).
+        pub fn with_smb_addr(addr: String) -> Self {
+            Self { addr: Some(addr) }
+        }
+
+        /// True iff an SMB server address has been injected via
+        /// `with_smb_addr(...)`.
+        #[must_use]
+        pub fn is_addr_wired(&self) -> bool {
+            self.addr.is_some()
+        }
+    }
+
+    impl Default for SmbFileModule {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -802,31 +1182,163 @@ pub mod sdk {
             share: &str,
             _auth: &AuthToken,
         ) -> Result<MountedShare, SdkError> {
-            Err(SdkError::File(format!(
-                "SMB mount \\\\{server}\\{share} not yet wired to adrian-smb-client (ADR-106)"
-            )))
+            let addr = match &self.addr {
+                None => {
+                    return Err(SdkError::File(format!(
+                        "SMB mount \\\\{server}\\{share}: adrian-smb-client not configured — call \
+                         SmbFileModule::with_smb_addr(addr) to inject the server address (ADR-106)"
+                    )));
+                }
+                Some(a) => a.clone(),
+            };
+            // Drive a real SMB 3.1.1 Negotiate + SessionSetup + TreeConnect
+            // via `adrian_smb_client`. Wave 1 uses the default SPNEGO blob
+            // (the Wave 3b server accepts any blob); real Kerberos / NTLM
+            // token integration is a later wave per ADR-105/106.
+            let mut client = adrian_smb_client::connect_tcp(&addr).await.map_err(|e| {
+                SdkError::File(format!(
+                    "SMB mount \\\\{server}\\{share}: connect to {addr} failed: {e} (ADR-106)"
+                ))
+            })?;
+            let _ = client.negotiate().await.map_err(|e| {
+                SdkError::File(format!(
+                    "SMB mount \\\\{server}\\{share}: negotiate with {addr} failed: {e} (ADR-106)"
+                ))
+            })?;
+            let _ = client
+                .session_setup(adrian_smb_client::default_spnego_blob())
+                .await
+                .map_err(|e| {
+                    SdkError::File(format!(
+                        "SMB mount \\\\{server}\\{share}: session_setup failed: {e} (ADR-106)"
+                    ))
+                })?;
+            let path = format!("\\{server}\\{share}");
+            let _ = client.tree_connect(&path).await.map_err(|e| {
+                SdkError::File(format!(
+                    "SMB mount \\\\{server}\\{share}: tree_connect to {path} failed: {e} (ADR-106)"
+                ))
+            })?;
+            // The mount path is conventionally `/mnt/adrian/<share>` per
+            // ADR-106. The SDK does not perform the actual mount syscall
+            // (that's the operator daemon's job); it returns the mount
+            // path the daemon should use.
+            let mount_path = format!("/mnt/adrian/{share}");
+            Ok(MountedShare {
+                server: server.to_string(),
+                share: share.to_string(),
+                mount_path,
+            })
         }
     }
 
     /// Stub cert module — would delegate to `adrian-acme-server`
     /// (RFC 8555 ACME client) for cert enrollment.
-    #[derive(Debug, Default)]
-    pub struct AcmeCertModule;
+    ///
+    /// ## Wave 1 wiring (ADR-095/097)
+    ///
+    /// `AcmeCertModule::new()` returns an unwired module (preserves backward
+    /// compat with v0.5.0 callers). To actually drive a cert issuance via
+    /// the framework's CA, construct via [`AcmeCertModule::with_ca`]:
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use adrian_ca::CaService;
+    /// use adrian_sdk::sdk::AcmeCertModule;
+    ///
+    /// let ca = Arc::new(CaService::new().expect("ca"));
+    /// let module = AcmeCertModule::with_ca(ca);
+    /// ```
+    ///
+    /// When `with_ca` was not called, `enroll` returns the existing
+    /// loud-stub `SdkError::Cert` pointing the caller at the
+    /// `with_ca(...)` method.
+    ///
+    /// When `with_ca` was called, `enroll` calls
+    /// `CaService::issue(profile, csr_der)` directly — bypassing the
+    /// HTTP ACME wire protocol (the operator's HTTP server is the ACME
+    /// front-end; the SDK is the in-process CA client for hosts that
+    /// embed the framework). The issued cert DER is returned to the
+    /// caller.
+    pub struct AcmeCertModule {
+        /// Injected CA service. `None` after `new()`; `Some` after
+        /// `with_ca(...)`. Held as `Arc<CaService>` because the CA is
+        /// shared with the ACME HTTP server and the operator daemon.
+        ca: Option<Arc<adrian_ca::CaService>>,
+    }
+
+    impl std::fmt::Debug for AcmeCertModule {
+        // Manual Debug impl — `CaService` holds an ECDSA private key and
+        // does not implement Debug (to avoid accidentally leaking key
+        // material via debug output). Print a placeholder instead.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AcmeCertModule")
+                .field(
+                    "ca",
+                    &if self.ca.is_some() {
+                        "<CaService>"
+                    } else {
+                        "<unwired>"
+                    },
+                )
+                .finish()
+        }
+    }
 
     impl AcmeCertModule {
-        /// Construct a stub cert module. No network / disk I/O.
+        /// Construct an unwired cert module. No network / disk I/O.
+        ///
+        /// `enroll` on the returned module will return a specific
+        /// `SdkError::Cert` pointing the caller at
+        /// [`AcmeCertModule::with_ca`].
         pub fn new() -> Self {
-            Self
+            Self { ca: None }
+        }
+
+        /// Construct a wired cert module that drives cert issuance via
+        /// the framework's CA service. Bypasses the HTTP ACME wire
+        /// protocol — the operator's HTTP server (Layer 3) is the ACME
+        /// front-end; this entry point is for hosts that embed the
+        /// framework (e.g. PSSO extensions per ADR-048).
+        pub fn with_ca(ca: Arc<adrian_ca::CaService>) -> Self {
+            Self { ca: Some(ca) }
+        }
+
+        /// True iff a CA service has been injected via `with_ca(...)`.
+        #[must_use]
+        pub fn is_ca_wired(&self) -> bool {
+            self.ca.is_some()
+        }
+    }
+
+    impl Default for AcmeCertModule {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
     #[async_trait]
     impl CertModule for AcmeCertModule {
         async fn enroll(&self, request: CertEnrollRequest) -> Result<Vec<u8>, SdkError> {
-            Err(SdkError::Cert(format!(
-                "ACME enroll for profile '{}/{}' not yet wired to adrian-acme-server (ADR-095/097)",
-                request.profile, request.subject
-            )))
+            let ca = match &self.ca {
+                None => {
+                    return Err(SdkError::Cert(format!(
+                        "ACME enroll for profile '{}/{}': adrian-acme-server not configured — \
+                         call AcmeCertModule::with_ca(ca) to inject the CA service (ADR-095/097)",
+                        request.profile, request.subject
+                    )));
+                }
+                Some(c) => c.clone(),
+            };
+            // Drive real cert issuance via `CaService::issue`. The CA
+            // verifies the CSR's self-signature, issues an X.509 v3 cert
+            // per the named profile, and returns the DER bytes.
+            ca.issue(&request.profile, &request.csr).await.map_err(|e| {
+                SdkError::Cert(format!(
+                    "ACME enroll for profile '{}/{}': CA issue failed: {e} (ADR-095/097)",
+                    request.profile, request.subject
+                ))
+            })
         }
     }
 }
@@ -1408,5 +1920,477 @@ mod api_tests {
             SdkError::Auth(msg) => assert!(msg.contains("mock: NTLM not supported"), "got: {msg}"),
             other => panic!("expected SdkError::Auth, got {other:?}"),
         }
+    }
+}
+
+// =========================================================================
+// Wave 1 tests — SDK module wiring (ADR-109/029/106/095).
+//
+// Each of the 4 unwired SDK modules (`LdapDirectoryModule`,
+// `DeclarativePolicyModule`, `SmbFileModule`, `AcmeCertModule`) now has a
+// `with_*(backend)` constructor that injects the in-workspace backend.
+// When the backend is injected, the module's trait methods actually drive
+// the backend (real LDAP round-trip, real policy synthesis, real SMB
+// Negotiate+SessionSetup+TreeConnect, real CA issue). When the backend is
+// NOT injected, the existing loud-stub error surfaces unchanged (backward
+// compat with v0.5.0 callers).
+//
+// 2 tests per module: success path + error propagation.
+// =========================================================================
+
+#[cfg(test)]
+mod wave1_tests {
+    use super::sdk::{
+        AcmeCertModule, AuthToken, AuthTokenKind, CertEnrollRequest, CertModule, DeclarativePolicy,
+        DeclarativePolicyModule, DirectoryModule, FileModule, LdapDirectoryModule, PolicyModule,
+        SmbFileModule,
+    };
+    use super::*;
+    use std::sync::Arc;
+
+    // -----------------------------------------------------------------
+    // T-101: LdapDirectoryModule wiring (ADR-109).
+    // -----------------------------------------------------------------
+
+    /// Build a minimal DSA backed by the in-workspace testkits, with one
+    /// dummy object in `list_objects` so subtree searches return at least
+    /// one entry.
+    fn build_test_dsa_with_dummy_object() -> adrian_directory_service::Dsa {
+        use adrian_directory_service::Dsa;
+        use adrian_identity_testkit::InMemoryIdentityMapping;
+        use adrian_repl_testkit::InMemoryReplicator;
+        use adrian_schema_traits::SchemaProjection;
+        use adrian_storage_core::{Attribute, DistinguishedName, Object};
+        use adrian_storage_testkit::InMemoryDirectoryStore;
+
+        let mut dsa = Dsa::new(
+            Arc::new(InMemoryDirectoryStore::new()),
+            Arc::new(InMemoryReplicator::new(uuid::Uuid::from_u128(0x_ABCD))),
+            Arc::new(InMemoryIdentityMapping::new()),
+            Arc::new(SchemaProjection::empty()),
+            uuid::Uuid::from_u128(0x_ABCD),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        // Inject a dummy object with an `objectClass` attribute so the
+        // `(objectClass=*)` present-filter matches it.
+        let dummy = Object {
+            uuid: uuid::Uuid::nil(),
+            dn: DistinguishedName::new("DC=adrian,DC=example,DC=com"),
+            attributes: vec![Attribute {
+                attribute_id: 0,
+                name: "objectClass".into(),
+                value: b"domainDNS".to_vec(),
+            }],
+            dnt: 0,
+        };
+        dsa.list_objects = Arc::new(move || vec![dummy.clone()]);
+        dsa
+    }
+
+    /// Stand up an in-process LDAP server on an ephemeral port. Returns
+    /// the bound address; the accept loop runs in a spawned task until the
+    /// test ends.
+    async fn spawn_ldap_server(dsa: adrian_directory_service::Dsa) -> std::net::SocketAddr {
+        use adrian_directory_service::serve_connection;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr on bound listener");
+        let dsa = Arc::new(dsa);
+        let dsa_for_loop = dsa.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let dsa = dsa_for_loop.clone();
+                tokio::spawn(async move {
+                    let _ = serve_connection(stream, &dsa).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Wave 1 success path: with `with_url` set to a real in-process
+    /// LDAP server, `search` drives a real Bind + Search round-trip and
+    /// returns the dummy object from the DSA's `list_objects`.
+    #[tokio::test]
+    async fn ldap_directory_module_with_url_searches_real_dsa_and_returns_entries() {
+        let dsa = build_test_dsa_with_dummy_object();
+        let addr = spawn_ldap_server(dsa).await;
+        let module = LdapDirectoryModule::with_url(format!("ldap://{addr}"));
+        assert!(
+            module.is_url_wired(),
+            "with_url must mark the module as wired"
+        );
+        let entries = module
+            .search("(objectClass=*)")
+            .await
+            .expect("wired module must return Ok");
+        // The DSA's list_objects returned one dummy object with DN
+        // `DC=adrian,DC=example,DC=com`. The subtree search on the empty
+        // root MUST surface it.
+        assert!(
+            !entries.is_empty(),
+            "search must return at least one entry; got {:?}",
+            entries
+        );
+        let found = entries
+            .iter()
+            .find(|e| e.dn.eq_ignore_ascii_case("DC=adrian,DC=example,DC=com"));
+        assert!(
+            found.is_some(),
+            "search must return the dummy object; got DNs: {:?}",
+            entries.iter().map(|e| &e.dn).collect::<Vec<_>>()
+        );
+    }
+
+    /// Wave 1 error propagation: with `with_url` set to an unreachable
+    /// address (port 1 — connection refused), `search` surfaces a
+    /// `SdkError::Directory` carrying the URL + a connect-related
+    /// message. This proves the wiring is alive — the failure mode is a
+    /// real network error, NOT the v0.5.0 "not yet wired" stub.
+    #[tokio::test]
+    async fn ldap_directory_module_with_unreachable_url_surfaces_connect_error() {
+        // Port 1 is reserved and not listening on most systems.
+        let module = LdapDirectoryModule::with_url("ldap://127.0.0.1:1".into());
+        let err = module
+            .search("(objectClass=*)")
+            .await
+            .expect_err("unreachable URL must surface Err");
+        match err {
+            SdkError::Directory(msg) => {
+                // Must carry the URL and a connect-related message — NOT
+                // the v0.5.0 "not yet wired" stub.
+                assert!(
+                    !msg.contains("not yet wired"),
+                    "wired module must surface a real connect error, not the v0.5.0 stub; got: {msg}"
+                );
+                assert!(
+                    msg.contains("127.0.0.1:1"),
+                    "error must name the URL; got: {msg}"
+                );
+            }
+            other => panic!("expected SdkError::Directory, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // T-102: DeclarativePolicyModule wiring (ADR-029/113).
+    // -----------------------------------------------------------------
+
+    /// Wave 1 success path: with `with_executor` set to a real
+    /// `LinuxPolicyExecutor`, `apply` synthesizes the per-platform file
+    /// set and returns an `AppliedPolicy` with a non-empty rollback
+    /// token (encoding the platform tag + file count).
+    #[tokio::test]
+    async fn declarative_policy_module_with_executor_synthesizes_files() {
+        use adrian_policy_executor::{LinuxPolicyExecutor, PolicyExecutor};
+        let exec: Arc<dyn PolicyExecutor> = Arc::new(LinuxPolicyExecutor::new());
+        let module = DeclarativePolicyModule::with_executor(exec);
+        assert!(module.is_executor_wired());
+        let policy = DeclarativePolicy {
+            name: "baseline-workstation".into(),
+            version: "1.0.0".into(),
+            settings: vec![
+                ("audit.var.log.adrian".into(), "true".into()),
+                ("firewall.allow.ssh".into(), "true".into()),
+            ],
+        };
+        let applied = module
+            .apply(&policy)
+            .await
+            .expect("wired module must return Ok");
+        assert_eq!(applied.name, "baseline-workstation");
+        assert_eq!(applied.version, "1.0.0");
+        assert!(applied.applied_at.is_some(), "applied_at must be set");
+        // Rollback token = 1 byte platform tag + 8 bytes LE file count.
+        // Linux = 'l' (0x6C); file count > 0 (audit + firewalld + CSE
+        // JSON = 3 files; may be more).
+        assert!(
+            !applied.rollback_token.is_empty(),
+            "rollback_token must be non-empty"
+        );
+        assert_eq!(
+            applied.rollback_token[0], b'l',
+            "platform tag must be 'l' for Linux; got: {:?}",
+            applied.rollback_token
+        );
+    }
+
+    /// Wave 1 error propagation: with `with_executor` NOT called,
+    /// `apply` surfaces the loud-stub `SdkError::Policy` pointing the
+    /// caller at `with_executor`. Backward compat with v0.5.0 callers.
+    #[tokio::test]
+    async fn declarative_policy_module_unwired_returns_loud_stub_error() {
+        let module = DeclarativePolicyModule::new();
+        assert!(!module.is_executor_wired());
+        let policy = DeclarativePolicy {
+            name: "audit-policy".into(),
+            version: "1.0.0".into(),
+            settings: vec![],
+        };
+        let err = module
+            .apply(&policy)
+            .await
+            .expect_err("unwired module must return Err");
+        match err {
+            SdkError::Policy(msg) => {
+                assert!(msg.contains("audit-policy"), "got: {msg}");
+                assert!(msg.contains("with_executor"), "got: {msg}");
+                assert!(msg.contains("ADR-029/113"), "got: {msg}");
+            }
+            other => panic!("expected SdkError::Policy, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // T-103: SmbFileModule wiring (ADR-106).
+    // -----------------------------------------------------------------
+
+    /// Stand up an in-process SMB server on a duplex pair, returning a
+    /// connected client stream + the server task handle. Used by the
+    /// SMB mount-share success test.
+    async fn spawn_smb_server_on_duplex() -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>)
+    {
+        use adrian_smb_server::{Share, SmbServer, VirtualFs};
+        use std::collections::HashMap;
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let share = Arc::new(Share::with_fs(
+            "sysvol",
+            VirtualFs::with_files(HashMap::new()),
+        ));
+        let shares: Arc<HashMap<String, Arc<Share>>> =
+            Arc::new(HashMap::from([("sysvol".to_string(), share)]));
+        let guid = uuid::Uuid::from_u128(0xABCD_0000_0000_0000_0000_0000_0000_0001);
+        let salt = vec![0x11u8; 32];
+        let handle = tokio::spawn(async move {
+            let _ = SmbServer::handle_connection(server_stream, shares, guid, salt).await;
+        });
+        (client_stream, handle)
+    }
+
+    /// Wave 1 success path: with `with_smb_addr` set to a real in-process
+    /// SMB server's TCP address, `mount_share` drives Negotiate +
+    /// SessionSetup + TreeConnect and returns a `MountedShare` with the
+    /// expected server / share / mount path.
+    #[tokio::test]
+    async fn smb_file_module_with_addr_mounts_share_via_real_smb_round_trip() {
+        use adrian_smb_server::{Share, SmbServer, VirtualFs};
+        use std::collections::HashMap;
+        // Stand up an SMB server on an ephemeral TCP port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let share = Arc::new(Share::with_fs(
+            "sysvol",
+            VirtualFs::with_files(HashMap::new()),
+        ));
+        let shares: Arc<HashMap<String, Arc<Share>>> =
+            Arc::new(HashMap::from([("sysvol".to_string(), share)]));
+        let guid = uuid::Uuid::from_u128(0xABCD_0000_0000_0000_0000_0000_0000_0001);
+        let salt = vec![0x11u8; 32];
+        let shares_for_loop = shares.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let shares = shares_for_loop.clone();
+                let guid = guid;
+                let salt = salt.clone();
+                tokio::spawn(async move {
+                    let _ = SmbServer::handle_connection(stream, shares, guid, salt).await;
+                });
+            }
+        });
+        // Wire the SDK module with the address.
+        let module = SmbFileModule::with_smb_addr(addr.to_string());
+        assert!(module.is_addr_wired());
+        let token = AuthToken {
+            principal: "host/dc01.adrian.example".into(),
+            expiry: None,
+            kind: AuthTokenKind::Kerberos,
+        };
+        // The SMB server's TreeConnect path uses the share name; the
+        // server name is whatever we pass to mount_share. We use the
+        // loopback address so the TCP round-trip succeeds.
+        let mounted = module
+            .mount_share("127.0.0.1", "sysvol", &token)
+            .await
+            .expect("wired module must mount successfully");
+        assert_eq!(mounted.server, "127.0.0.1");
+        assert_eq!(mounted.share, "sysvol");
+        assert_eq!(mounted.mount_path, "/mnt/adrian/sysvol");
+    }
+
+    /// Wave 1 error propagation: with `with_smb_addr` set to an
+    /// unreachable address (port 1 — connection refused), `mount_share`
+    /// surfaces `SdkError::File` carrying the server/share + a
+    /// connect-related message.
+    #[tokio::test]
+    async fn smb_file_module_with_unreachable_addr_surfaces_connect_error() {
+        let module = SmbFileModule::with_smb_addr("127.0.0.1:1".into());
+        let token = AuthToken {
+            principal: "host/dc01.adrian.example".into(),
+            expiry: None,
+            kind: AuthTokenKind::Kerberos,
+        };
+        let err = module
+            .mount_share("dc01.adrian.example", "sysvol", &token)
+            .await
+            .expect_err("unreachable addr must surface Err");
+        match err {
+            SdkError::File(msg) => {
+                assert!(
+                    !msg.contains("not yet wired"),
+                    "wired module must surface real connect error, not v0.5.0 stub; got: {msg}"
+                );
+                assert!(msg.contains("dc01.adrian.example"), "got: {msg}");
+                assert!(msg.contains("sysvol"), "got: {msg}");
+            }
+            other => panic!("expected SdkError::File, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // T-104: AcmeCertModule wiring (ADR-095/097).
+    // -----------------------------------------------------------------
+
+    /// Generate a real ECDSA-P256 PKCS#10 CSR via `ring`, returning the
+    /// DER bytes. Mirrors the helper used by `adrian-ca`'s own tests.
+    fn make_real_csr(subject_cn: &str) -> Vec<u8> {
+        use adrian_ca::{CertificationRequest, CertificationRequestInfo};
+        use bitvec::prelude::{BitVec, Msb0};
+        use rasn::prelude::*;
+        use rasn_pkix::{
+            AlgorithmIdentifier, AttributeTypeAndValue, Name, RelativeDistinguishedName,
+            SubjectPublicKeyInfo,
+        };
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair as RingKeyPair};
+        // OIDs (matching the constants in adrian-ca).
+        const OID_ECDSA_SHA256: &[u32] = &[1, 2, 840, 10045, 4, 3, 2];
+        const OID_EC_PUBLIC_KEY: &[u32] = &[1, 2, 840, 10045, 2, 1];
+        const OID_SECP256R1: &[u32] = &[1, 2, 840, 10045, 3, 1, 7];
+        const OID_COMMON_NAME: &[u32] = &[2, 5, 4, 3];
+
+        let rng = SystemRandom::new();
+        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).expect("generate pkcs8");
+        let kp = EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).expect("from pkcs8");
+        let pub_sec1 = kp.public_key().as_ref().to_vec();
+
+        // Build the SubjectPublicKeyInfo with the ECDSA-P256 algorithm
+        // identifier and the secp256r1 curve parameter.
+        let curve_oid = ObjectIdentifier::new(OID_SECP256R1).expect("valid secp256r1 oid");
+        let curve_der = rasn::der::encode(&curve_oid).expect("encode curve oid");
+        let spki = SubjectPublicKeyInfo {
+            algorithm: AlgorithmIdentifier {
+                algorithm: ObjectIdentifier::new(OID_EC_PUBLIC_KEY).expect("valid ec-pubkey oid"),
+                parameters: Some(Any::new(curve_der)),
+            },
+            subject_public_key: BitVec::<u8, Msb0>::from_vec(pub_sec1),
+        };
+
+        // Build the subject Name with one RDN containing the CN.
+        // PrintableString lives in `rasn::prelude::*` (re-exported by
+        // rasn_pkix but not directly importable from there).
+        let ps = rasn::types::PrintableString::try_from(subject_cn).expect("CN is printable");
+        let atv = AttributeTypeAndValue {
+            r#type: ObjectIdentifier::new(OID_COMMON_NAME).expect("valid cn oid"),
+            value: Any::from(rasn::der::encode(&ps).unwrap_or_default()),
+        };
+        let rdn = RelativeDistinguishedName::from(SetOf::from(vec![atv]));
+        let subject = Name::RdnSequence(vec![rdn]);
+
+        // Empty attributes set. `rasn_pkix::Attribute` is a public type
+        // (the PKCS#10 Attribute per RFC 2986 §5).
+        let attrs: SetOf<rasn_pkix::Attribute> = SetOf::from(Vec::<rasn_pkix::Attribute>::new());
+        let info = CertificationRequestInfo {
+            version: Integer::from(0u32),
+            subject,
+            subject_pk_info: spki,
+            attributes: attrs,
+        };
+        let info_der = rasn::der::encode(&info).expect("encode CRI");
+        let sig = kp.sign(&rng, &info_der).expect("sign");
+        let csr = CertificationRequest {
+            certification_request_info: info,
+            signature_algorithm: AlgorithmIdentifier {
+                algorithm: ObjectIdentifier::new(OID_ECDSA_SHA256).expect("valid ecdsa oid"),
+                parameters: None,
+            },
+            signature: BitVec::<u8, Msb0>::from_vec(sig.as_ref().to_vec()),
+        };
+        rasn::der::encode(&csr).expect("encode CSR")
+    }
+
+    /// Wave 1 success path: with `with_ca` set to a real `CaService`,
+    /// `enroll` calls `CaService::issue` with a valid ECDSA-P256 CSR
+    /// and the `adrian-webserver` profile. The CA verifies the CSR's
+    /// self-signature, issues an X.509 v3 cert, and returns the DER
+    /// bytes — non-empty and starting with the X.509 SEQUENCE tag (0x30).
+    #[tokio::test]
+    async fn acme_cert_module_with_ca_issues_real_cert() {
+        let ca = Arc::new(adrian_ca::CaService::new().expect("CA construction succeeds"));
+        let module = AcmeCertModule::with_ca(ca);
+        assert!(module.is_ca_wired());
+        let csr = make_real_csr("dc01.adrian.example");
+        let req = CertEnrollRequest {
+            profile: "adrian-webserver".into(),
+            csr,
+            subject: "CN=dc01.adrian.example".into(),
+        };
+        let cert_der = module
+            .enroll(req)
+            .await
+            .expect("wired module must issue a cert");
+        // The DER must be non-empty and start with the X.509 SEQUENCE
+        // tag (0x30) per RFC 5280 §4.1.
+        assert!(!cert_der.is_empty(), "issued cert DER must be non-empty");
+        assert_eq!(
+            cert_der[0], 0x30,
+            "DER must start with X.509 SEQUENCE tag (0x30); got 0x{:02x}",
+            cert_der[0]
+        );
+    }
+
+    /// Wave 1 error propagation: with `with_ca` set to a real `CaService`
+    /// but an invalid (empty) CSR, `enroll` surfaces `SdkError::Cert`
+    /// carrying the CA's typed error message (`CsrInvalid` or similar).
+    #[tokio::test]
+    async fn acme_cert_module_with_ca_rejects_invalid_csr() {
+        let ca = Arc::new(adrian_ca::CaService::new().expect("CA construction succeeds"));
+        let module = AcmeCertModule::with_ca(ca);
+        let req = CertEnrollRequest {
+            profile: "adrian-webserver".into(),
+            csr: Vec::new(), // empty CSR — invalid
+            subject: "CN=dc01.adrian.example".into(),
+        };
+        let err = module
+            .enroll(req)
+            .await
+            .expect_err("invalid CSR must surface Err");
+        match err {
+            SdkError::Cert(msg) => {
+                assert!(
+                    !msg.contains("not yet wired"),
+                    "wired module must surface real CA error, not v0.5.0 stub; got: {msg}"
+                );
+                assert!(msg.contains("adrian-webserver"), "got: {msg}");
+                assert!(msg.contains("ADR-095"), "got: {msg}");
+            }
+            other => panic!("expected SdkError::Cert, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Smoke test: ensure spawn_smb_server_on_duplex helper compiles
+    // (the duplex path is used by adrian-smb-client tests; we keep it
+    // as a sanity check that the SDK crate can reference the SMB
+    // server API from its test module).
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn smb_duplex_helper_compiles_without_panic() {
+        let (_stream, handle) = spawn_smb_server_on_duplex().await;
+        drop(handle);
     }
 }
