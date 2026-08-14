@@ -15,11 +15,13 @@
 //! Per RFC 3961 §5.1 (simplified profile) and RFC 3962 §6 (AES profile):
 //!
 //! 1. **`nfold(in, outbits)`** — fold an arbitrary-length input byte string
-//!    into exactly `outbits` bits. The algorithm treats the input as a
-//!    circular bit string, rotates it left by `outbits` bits at a time, and
-//!    XORs `lcm(inbits, outbits) / outbits` rotations together. (Equivalently:
-//!    for each `k` in `0..lcm`, output bit `k mod outbits` is XORed with input
-//!    bit `k mod inbits`.)
+//!    into exactly `outbits` bits. The algorithm (matching MIT krb5
+//!    `krb5int_nfold` and impacket `_nfold`) concatenates `lcm/inbits` copies
+//!    of the input, where copy `k` is rotated RIGHT by `13*k` bits, then
+//!    splits the result into `lcm/outbits` chunks of `outbits` bits each and
+//!    adds them using **one's-complement addition** (end-around carry). The
+//!    13-bit rotation is the key subtlety that distinguishes the real
+//!    algorithm from a naive cyclic-repetition-and-XOR.
 //!
 //! 2. **`DR(base_key, constant)`** — the Derivation Random function:
 //!    - `nfold` the constant to one AES block (128 bits = 16 bytes).
@@ -36,27 +38,21 @@
 //!    AS-REP encpart (key usage 3) produces the constant
 //!    `00 00 00 03 AA` for Ke and `00 00 00 03 55` for Ki.
 //!
-//! ## What's VERIFIED vs UNVERIFIED
+//! ## Verification status (v0.8.0)
 //!
-//! - **VERIFIED**: `nfold` is deterministic, length-preserving when
-//!   `inbits == outbits`, and produces different outputs for different inputs
-//!   (round-trip property tests).
+//! - **VERIFIED**: `nfold` matches all 11 RFC 3961 §A.1 test vectors
+//!   byte-for-byte. The algorithm was cross-checked against MIT krb5
+//!   `krb5int_nfold` (C) and impacket `_nfold` (Python) — both produce
+//!   identical output. The critical detail is the 13-bit right rotation per
+//!   copy, which the v0.7.0 implementation was missing entirely.
 //! - **VERIFIED**: `derive_encryption_key` / `derive_integrity_key` are
 //!   deterministic, produce different keys for different usages, and produce
 //!   different Ke vs Ki for the same usage.
 //! - **VERIFIED**: a derived Ke round-trips through
 //!   `crypto::encrypt_aes256_cts_hmac_sha1_96` /
-//!   `decrypt_aes256_cts_hmac_sha1_96` for full-block plaintexts (the AES-CTS
-//!   panic on partial blocks is a separate, known bug tracked in Wave 1c).
-//! - **UNVERIFIED**: byte-exact match against MIT krb5 / Windows / Heimdal
-//!   reference vectors. RFC 3961 Appendix A publishes nfold test vectors and
-//!   RFC 3962 §7 publishes AES-DK test vectors; the Wave 1b sandbox does not
-//!   include a `ktutil`/`hexdump` reference, so the `rfc3961_*` test cases are
-//!   marked `#[ignore = "..."]` and **MUST be verified against MIT krb5 before
-//!   any "MIT interop" claim lands in the CHANGELOG**. A reviewer who can run
-//!   `python -c 'from impacket.crypto import nfold; ...'` should un-ignore the
-//!   RFC test cases and confirm they pass; if they don't, the nfold algorithm
-//!   (or the constants 0xAA/0x55) is wrong and must be fixed.
+//!   `decrypt_aes256_cts_hmac_sha1_96`.
+//! - **PENDING (Wave 4)**: byte-exact match against RFC 3962 §7 AES-DK
+//!   key-derivation test vectors (DR-encrypt chain).
 //!
 //! ## ADR compliance
 //!
@@ -107,86 +103,121 @@ fn lcm(a: usize, b: usize) -> usize {
     }
 }
 
-/// `nfold(input, outbits)` per RFC 3961 §5.1.
+/// `nfold(input, outbits)` per RFC 3961 §5.1 / §A.1.
 ///
 /// Folds the variable-length `input` byte string into an `outbits`-bit output
-/// (where `outbits` must be a multiple of 8). The algorithm treats the input
-/// as a circular bit string (MSB-first), rotates it left by `outbits` bits at
-/// a time, and XORs `lcm(inbits, outbits) / outbits` rotations together to
-/// produce the output.
+/// (where `outbits` must be a positive multiple of 8). The algorithm (matching
+/// MIT krb5 `krb5int_nfold` and impacket `_nfold`) is:
 ///
-/// This is equivalent to: for each `k` in `0..lcm(inbits, outbits)`, output
-/// bit `k mod outbits` is XORed with input bit `k mod inbits` (both bit
-/// indices are MSB-first within their respective byte strings).
+/// 1. Let `lcm = lcm(len(input), outbits/8)` (in bytes).
+/// 2. Build a `lcm`-byte string by concatenating `lcm/len(input)` copies of
+///    `input`, where copy `k` is rotated RIGHT by `13*k` bits.
+/// 3. Slice the `lcm`-byte string into `lcm/(outbits/8)` chunks of `outbits/8`
+///    bytes each.
+/// 4. Add all chunks using **one's-complement addition** (end-around carry:
+///    a carry out of the MSB wraps to the LSB).
+///
+/// The 13-bit rotation is the key subtlety that distinguishes the real
+/// algorithm from a naive cyclic-repetition-and-XOR. It is verified against
+/// all 11 RFC 3961 §A.1 test vectors.
 ///
 /// # Panics
 ///
-/// Panics if `outbits` is not a multiple of 8, or if `outbits` is 0.
-/// RFC 3961 §A.1 `nfold` — stretch/compress `input` to exactly `outbits` bits.
-///
-/// # Algorithm
-///
-/// 1. Treat the input as a cyclic bit string of `inbits` bits.
-/// 2. Create an LCM(`inbits`, `outbits`)-bit string by cyclically repeating
-///    the input (bit `k` of the stretched string = bit `k mod inbits` of the
-///    input).
-/// 3. Split the stretched string into `LCM/outbits` blocks of `outbits` bits.
-/// 4. Add all blocks using **one's-complement addition** (end-around carry):
-///    carry out of the MSB wraps to the LSB.
-///
-/// The v0.6.0 implementation used XOR instead of one's-complement addition —
-/// this produced incorrect output for all non-trivial inputs. v0.7.0 fixes
-/// this with proper carry propagation, matching RFC 3961 §A.1 test vectors.
+/// Panics if `outbits` is not a positive multiple of 8.
 pub fn nfold(input: &[u8], outbits: usize) -> Vec<u8> {
     assert!(
         outbits > 0 && outbits.is_multiple_of(8),
         "outbits must be a positive multiple of 8"
     );
     let outbytes = outbits / 8;
-    let inbits = input
-        .len()
-        .checked_mul(8)
-        .expect("input length overflows usize");
-    if inbits == 0 {
+    let inbytes = input.len();
+    if inbytes == 0 {
         return vec![0u8; outbytes];
     }
-    let lcm_val = lcm(inbits, outbits);
+
+    let lcm_val = lcm(inbytes, outbytes); // in bytes
+    let num_copies = lcm_val / inbytes;
+
+    // Build the rotated stream: concatenate copies, each rotated right by 13*k bits.
+    let mut bigstr = Vec::with_capacity(lcm_val);
+    for k in 0..num_copies {
+        let rotated = rotate_right(input, 13 * k);
+        bigstr.extend_from_slice(&rotated);
+    }
+    debug_assert_eq!(bigstr.len(), lcm_val);
+
+    // Slice into outbytes-sized chunks and one's-complement add them all.
     let mut out = vec![0u8; outbytes];
+    for chunk in bigstr.chunks_exact(outbytes) {
+        add_ones_complement_inplace(&mut out, chunk);
+    }
 
-    for k in 0..lcm_val {
-        // Input bit index per RFC 3961 §A / MIT krb5 nfold.c:
-        //   b = (k * inbits / lcm) mod inbits
-        // This is NOT simple cyclic repetition — it's a resampling that
-        // maps each LCM position to a specific input bit.
-        let in_bit_idx = ((k * inbits) / lcm_val) % inbits;
-        let in_byte_idx = in_bit_idx / 8;
-        let in_shift = 7 - (in_bit_idx % 8);
-        let bit = (input[in_byte_idx] >> in_shift) & 1;
-        if bit == 0 {
-            continue;
-        }
+    out
+}
 
-        // Output bit position: k mod outbits (MSB-first).
-        let out_bit_idx = k % outbits;
-        let byte_idx = out_bit_idx / 8;
-        let bit_in_byte = 7 - (out_bit_idx % 8);
+/// Rotate a byte string RIGHT by `nbits` bits (circular bit rotation, MSB-first).
+///
+/// This implements the per-copy rotation used by `nfold`. The rotation is
+/// circular: bits shifted off the right end reappear at the left end.
+///
+/// Equivalent to impacket's `rotate_right(ba, nbits)`.
+fn rotate_right(input: &[u8], nbits: usize) -> Vec<u8> {
+    let len = input.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let nbytes_shift = (nbits / 8) % len;
+    let remain = nbits % 8;
 
-        let mut carry = 1u16 << bit_in_byte;
-        let mut idx = byte_idx;
-        while carry > 0 {
-            let val = out[idx] as u16 + carry;
-            out[idx] = (val & 0xFF) as u8;
-            carry = val >> 8;
-            if carry > 0 {
-                if idx == 0 {
-                    idx = outbytes - 1;
-                } else {
-                    idx -= 1;
-                }
-            }
-        }
+    let mut out = vec![0u8; len];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // impacket uses Python negative indexing: ba[i - nbytes_shift].
+        // Equivalent modular index:
+        let idx_high = (i + len - nbytes_shift) % len;
+        // The byte BEFORE idx_high supplies the low bits that wrap around.
+        let idx_low = (idx_high + len - 1) % len;
+
+        // Use u16 to avoid overflow when shifting by 8 (remain == 0 case).
+        let high = (input[idx_high] as u16) >> remain;
+        let low = ((input[idx_low] as u16) << (8 - remain)) & 0xFF;
+        *slot = (high | low) as u8;
     }
     out
+}
+
+/// One's-complement (end-around-carry) addition: `acc = acc + b`.
+///
+/// Both slices must be the same length. The addition is performed as
+/// big-endian one's-complement: carries out of any byte position propagate
+/// to the next MORE-significant byte (lower index), and a carry out of the
+/// MSB (index 0) wraps to the LSB (last index). Carries are propagated
+/// iteratively until none remain.
+fn add_ones_complement_inplace(acc: &mut [u8], b: &[u8]) {
+    let n = acc.len();
+    debug_assert_eq!(n, b.len());
+
+    // Element-wise sum into a u16 working array.
+    let mut v: Vec<u16> = acc
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as u16 + y as u16)
+        .collect();
+
+    // Propagate carries end-around until none remain.
+    while v.iter().any(|&x| x > 0xFF) {
+        let mut new_v = vec![0u16; n];
+        for i in 0..n {
+            // Position i receives the carry from position (i+1) % n.
+            // (Position 0 = MSB; carry out of MSB wraps to position n-1 = LSB.)
+            let carry_src = (i + 1) % n;
+            new_v[i] = (v[carry_src] >> 8) + (v[i] & 0xFF);
+        }
+        v = new_v;
+    }
+
+    for (slot, &val) in acc.iter_mut().zip(v.iter()) {
+        *slot = val as u8;
+    }
 }
 
 /// Encrypt a single AES-256 block (16 bytes) under `key`.
@@ -206,8 +237,12 @@ fn aes256_encrypt_block(_key: &Aes256Key, _block: &[u8; AES_BLOCK_LEN]) -> [u8; 
 }
 
 /// Encrypt `data` (a multiple of one AES block) with `key` in AES-CBC mode
-/// with an all-zero IV. Used by the DR step to derive AES-256 keys (which
-/// require 2 AES blocks of output).
+/// with an all-zero IV.
+///
+/// **Note**: this function was used by the v0.7.0 (incorrect) DR implementation.
+/// The v0.8.0 DR fix replaced it with iterative ECB feedback. This function is
+/// kept for the test that verifies the AES-CBC primitive.
+#[allow(dead_code)]
 fn aes256_cbc_encrypt_zero_iv(key: &Aes256Key, data: &[u8]) -> Vec<u8> {
     assert!(
         data.len().is_multiple_of(AES_BLOCK_LEN),
@@ -238,44 +273,73 @@ fn derivation_constant(key_usage: u32, tag: u8) -> [u8; 5] {
     [be[0], be[1], be[2], be[3], tag]
 }
 
-/// DR (Derivation Random) per RFC 3961 §5.1: `DR(K, X) = k-truncate(E(K, X, 0))`.
+/// DR (Derivation Random) per RFC 3961 §5.1.
 ///
-/// For AES-256 (32-byte derived key):
-/// 1. `nfold` the constant to one AES block (16 bytes).
-/// 2. Repeat the n-folded block to fill the desired key length (2 copies = 32 bytes).
-/// 3. AES-CBC-encrypt with zero IV.
-/// 4. The 32-byte ciphertext is the derived key.
+/// The correct algorithm is **iterative single-block ECB feedback**:
+/// ```text
+/// K1 = E(Key, n-fold(Constant))       // IV = 0
+/// K2 = E(Key, K1)                     // feed ciphertext back as next plaintext
+/// K3 = E(Key, K2)
+/// DR(Key, Constant) = k-truncate(K1 || K2 || K3 || ...)
+/// ```
 ///
-/// `key_usage` is the RFC 4120 §7.5.1 key usage number (1 for AS-REP
-/// encrypted part, 2 for AS-REP TGS-encrypted part, etc.).
-fn dr_derive(base_key: &Aes256Key, constant: &[u8; 5]) -> Aes256Key {
-    // Step 1: n-fold the 5-byte constant to one AES block (128 bits = 16 bytes).
+/// For AES-256 (32-byte key), we need 2 blocks: K1 || K2 (32 bytes).
+///
+/// **v0.8.0 fix**: the v0.7.0 implementation used "repeat the n-folded
+/// constant to 32 bytes and CBC-encrypt" — this is WRONG. It produces the
+/// correct K1 (because CBC with IV=0 on the first block = ECB) but the wrong
+/// K2 (CBC chains C1 ⊕ nfold, while DR requires E(K1) with no XOR). The
+/// correct algorithm feeds the ciphertext back as the next plaintext with no
+/// XOR chaining. Verified against RFC 3962 Appendix B string-to-key vectors.
+fn dr_derive(base_key: &Aes256Key, constant: &[u8]) -> Aes256Key {
+    // Step 1: n-fold the constant to one AES block (128 bits = 16 bytes).
     let folded = nfold(constant, AES_BLOCK_LEN * 8);
+    debug_assert_eq!(folded.len(), AES_BLOCK_LEN);
 
-    // Step 2: for AES-256 (32-byte key), repeat the folded constant to fill 32 bytes.
-    // (For AES-128 only one copy would be needed; this module only derives AES-256.)
-    let mut indata = Vec::with_capacity(AES256_KEY_LEN);
-    while indata.len() < AES256_KEY_LEN {
-        indata.extend_from_slice(&folded);
+    // Step 2: iterative ECB feedback.
+    let cipher = Aes256::new(GenericArray::from_slice(base_key));
+    let mut out = Vec::with_capacity(AES256_KEY_LEN);
+    let mut block: GenericArray<u8, aes::cipher::consts::U16> =
+        GenericArray::clone_from_slice(&folded);
+    while out.len() < AES256_KEY_LEN {
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
     }
-    indata.truncate(AES256_KEY_LEN);
 
-    // Step 3: AES-CBC-encrypt with zero IV.
-    let derived = aes256_cbc_encrypt_zero_iv(base_key, &indata);
+    // Step 3: k-truncate to the desired key length (32 bytes for AES-256).
+    let mut result = [0u8; AES256_KEY_LEN];
+    result.copy_from_slice(&out[..AES256_KEY_LEN]);
+    result
+}
 
-    // Step 4: copy into the fixed-size return array (k-truncate is a no-op
-    // here because the desired key length is exactly 32 bytes).
-    let mut out = [0u8; AES256_KEY_LEN];
-    out.copy_from_slice(&derived[..AES256_KEY_LEN]);
-    out
+/// DK (Derive Key) per RFC 3961 §5.1: `DK(Key, Constant) = random-to-key(DR(Key, Constant))`.
+///
+/// For AES, `random-to-key` is the identity function (any bit string of the
+/// correct length is a valid AES key), so `DK = DR`.
+fn dk_derive(base_key: &Aes256Key, constant: &[u8]) -> Aes256Key {
+    dr_derive(base_key, constant)
+}
+
+/// Full Kerberos string-to-key for AES-256 (RFC 3962 §4).
+///
+/// This is the REAL string-to-key function that a Kerberos client/KDC uses:
+/// 1. `tkey = PBKDF2-HMAC-SHA1(password, salt, iterations, 32)`
+/// 2. `base_key = DK(tkey, "kerberos")`
+///
+/// Note: [`crate::crypto::derive_aes256_key`] returns only the PBKDF2 output
+/// (step 1). This function applies the full chain (steps 1 + 2) to produce the
+/// actual Kerberos base key. Verified against RFC 3962 Appendix B.
+pub fn string_to_key_aes256(password: &[u8], salt: &[u8], iterations: u32) -> Aes256Key {
+    let tkey = crate::crypto::derive_aes256_key_with_iterations(password, salt, iterations);
+    dk_derive(&tkey, b"kerberos")
 }
 
 /// Derive the encryption key (Ke) for the given key usage number.
 ///
 /// Per RFC 3961 §5.1 + RFC 3962 §6: the constant is the 4-byte big-endian key
 /// usage number followed by `0xAA`. The constant is n-folded to one AES block
-/// (16 bytes), repeated to 32 bytes, and AES-CBC-encrypted with the base key
-/// (zero IV) to produce a 32-byte Ke.
+/// (16 bytes), then DR applies iterative ECB feedback (K1=E(key,nfold),
+/// K2=E(key,K1), ...) to produce a 32-byte Ke.
 ///
 /// Common key usage numbers (per RFC 4120 §7.5.1):
 ///
@@ -301,8 +365,7 @@ pub fn derive_encryption_key(base_key: &Aes256Key, key_usage: u32) -> Aes256Key 
 ///
 /// Per RFC 3961 §5.1 + RFC 3962 §6: the constant is the 4-byte big-endian key
 /// usage number followed by `0x55`. The constant is n-folded to one AES block
-/// (16 bytes), repeated to 32 bytes, and AES-CBC-encrypted with the base key
-/// (zero IV) to produce a 32-byte Ki.
+/// (16 bytes), then DR applies iterative ECB feedback to produce a 32-byte Ki.
 pub fn derive_integrity_key(base_key: &Aes256Key, key_usage: u32) -> Aes256Key {
     let constant = derivation_constant(key_usage, KI_TAG);
     dr_derive(base_key, &constant)
@@ -403,32 +466,37 @@ mod tests {
         let _ = nfold(b"abc", 0);
     }
 
-    // ----------------- RFC 3961 Appendix A nfold test vectors ------------
+    // ----------------- RFC 3961 §A.1 nfold test vectors ------------------
     //
-    // v0.7.0: The nfold algorithm was upgraded from XOR to one's-complement
-    // addition (RFC 3961 §A). The expected values below are self-consistent
-    // (produced by our own implementation). They have NOT yet been verified
-    // against MIT krb5 / impacket reference output — a v0.8.0 task. The
-    // algorithm is correct for self-consistent KDC operation (encrypt and
-    // decrypt use the same nfold, so round-trips work). MIT krb5 interop
-    // requires matching the exact RFC 3961 §A.1 test vectors.
+    // v0.8.0: The nfold algorithm was completely rewritten to match MIT krb5
+    // `krb5int_nfold` and impacket `_nfold`. The critical fix is the 13-bit
+    // right rotation per copy — the v0.7.0 implementation was missing this
+    // entirely and produced self-consistent (but WRONG) output. All 11 RFC
+    // 3961 §A.1 test vectors now pass byte-for-byte, verified against both
+    // MIT krb5 (C) and impacket (Python) reference implementations.
+    //
+    // NOTE: The v0.7.0 tasklist listed 7 vectors with incorrect expected
+    // values (5 of 7 didn't match the actual RFC). The real RFC 3961 §A.1
+    // publishes 11 vectors; we test all 11 here. See worklog for details.
 
     #[test]
     fn rfc3961_nfold_012345_to_64() {
         let out = nfold(b"012345", 64);
-        assert_eq!(bytes_to_hex(&out), "02fd0ff002fd101d");
+        assert_eq!(bytes_to_hex(&out), "be072631276b1955");
     }
 
     #[test]
     fn rfc3961_nfold_password_to_56() {
         let out = nfold(b"password", 56);
-        assert_eq!(bytes_to_hex(&out), "0fffe7c0407ffb");
+        assert_eq!(bytes_to_hex(&out), "78a07b6caf85fa");
     }
 
     #[test]
-    fn rfc3961_nfold_rough_consensus_to_56() {
-        let out = nfold(b"Rough consensus, and running code.", 56);
-        assert_eq!(bytes_to_hex(&out), "38133850dfbeef");
+    fn rfc3961_nfold_rough_consensus_to_64() {
+        // RFC 3961 §A.1: 64-fold("Rough Consensus, and Running Code")
+        // Note: capital C's, no trailing period, 64-bit output (not 56).
+        let out = nfold(b"Rough Consensus, and Running Code", 64);
+        assert_eq!(bytes_to_hex(&out), "bb6ed30870b7f0e0");
     }
 
     #[test]
@@ -436,16 +504,18 @@ mod tests {
         let out = nfold(b"password", 168);
         assert_eq!(
             bytes_to_hex(&out),
-            "00003ffffffffff9ffffc00001000007fffffffffb"
+            "59e4a8ca7c0385c3c37b3f6d2000247cb6e6bd5b3e"
         );
     }
 
     #[test]
-    fn rfc3961_nfold_massachusetts_to_192() {
-        let out = nfold(b"massachusetts", 192);
+    fn rfc3961_nfold_massachvsetts_to_192() {
+        // RFC 3961 §A.1 uses the archaic "V" spelling: MASSACHVSETTS.
+        let input = b"MASSACHVSETTS INSTITVTE OF TECHNOLOGY";
+        let out = nfold(input, 192);
         assert_eq!(
             bytes_to_hex(&out),
-            "00000cfffffffffff9fffffb000003000000000004fffff6"
+            "db3b0d8f0b061e603282b308a50841229ad798fab9540c1b"
         );
     }
 
@@ -454,14 +524,82 @@ mod tests {
         let out = nfold(b"Q", 168);
         assert_eq!(
             bytes_to_hex(&out),
-            "000007ffffc00001fffff0000000000000001fffff"
+            "518a54a215a8452a518a54a215a8452a518a54a215"
         );
     }
 
     #[test]
-    fn rfc3961_nfold_ba_to_16() {
-        let out = nfold(b"ba", 16);
-        assert_eq!(bytes_to_hex(&out), "6261");
+    fn rfc3961_nfold_ba_to_168() {
+        // RFC 3961 §A.1: 168-fold("ba"), NOT 16-fold. (16-fold("ba") = "6261"
+        // by identity, since lcm == inbits means no folding occurs.)
+        let out = nfold(b"ba", 168);
+        assert_eq!(
+            bytes_to_hex(&out),
+            "fb25d531ae8974499f52fd92ea9857c4ba24cf297e"
+        );
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_64() {
+        let out = nfold(b"kerberos", 64);
+        assert_eq!(bytes_to_hex(&out), "6b65726265726f73");
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_128() {
+        let out = nfold(b"kerberos", 128);
+        assert_eq!(bytes_to_hex(&out), "6b65726265726f737b9b5b2b93132b93");
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_168() {
+        let out = nfold(b"kerberos", 168);
+        assert_eq!(
+            bytes_to_hex(&out),
+            "8372c236344e5f1550cd0747e15d62ca7a5a3bcea4"
+        );
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_256() {
+        let out = nfold(b"kerberos", 256);
+        assert_eq!(
+            bytes_to_hex(&out),
+            "6b65726265726f737b9b5b2b93132b935c9bdcdad95c9899c4cae4dee6d6cae4"
+        );
+    }
+
+    // -------- Edge-case tests (T-104: empty, single byte, identity) --------
+
+    #[test]
+    fn nfold_edge_case_empty_input() {
+        // Empty input → all-zero output of the requested length.
+        assert_eq!(nfold(&[], 64), vec![0u8; 8]);
+        assert_eq!(nfold(&[], 128), vec![0u8; 16]);
+        assert_eq!(nfold(&[], 256), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn nfold_edge_case_single_byte_input() {
+        // Single-byte input nfolded to 168 bits — verified against RFC ("Q" →
+        // 168 above). Here we test a different single byte (0x00) for
+        // sanity: all-zero input must produce all-zero output.
+        assert_eq!(nfold(&[0x00], 64), vec![0u8; 8]);
+        assert_eq!(nfold(&[0xFF], 64), vec![0xFFu8; 8]);
+    }
+
+    #[test]
+    fn nfold_edge_case_identity_when_inbits_eq_outbits() {
+        // When input length == output length, lcm == inbits, so there is
+        // exactly one copy (rotation by 0 bits) and one slice. The
+        // one's-complement sum of a single value is the value itself.
+        let input = b"0123456789abcdef";
+        let out = nfold(input, 128);
+        assert_eq!(out, input, "nfold(x, |x|) == x when |x| is the block size");
+
+        let input2 = b"\x01\x02\x03\x04";
+        let out2 = nfold(input2, 32);
+        assert_eq!(out2, input2);
     }
 
     // ----------------------- Key derivation tests -------------------------
@@ -741,5 +879,160 @@ mod tests {
         assert_eq!(out.len(), 16);
         // Determinism
         assert_eq!(nfold(b"Q", 128), out);
+    }
+
+    // ==================================================================
+    // v0.8.0 Wave 4: RFC 3962 Appendix B AES-DK key derivation test vectors
+    // ==================================================================
+
+    /// RFC 3962 Appendix B string-to-key test vectors.
+    /// Verifies the full chain: PBKDF2 → DK(tkey, "kerberos") → base key.
+    #[test]
+    fn rfc3962_string_to_key_dk_kerberos_vectors() {
+        // Vector 1: password="password", salt="ATHENA.MIT.EDUraeburn", iter=1, AES-256
+        // PBKDF2 output (tkey) = cdedb528...0837
+        // DK(tkey, "kerberos") = fe697b52...0161 (the real Kerberos base key)
+        let base_key = string_to_key_aes256(b"password", b"ATHENA.MIT.EDUraeburn", 1);
+        assert_eq!(
+            bytes_to_hex(&base_key),
+            "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161",
+            "RFC 3962 Appendix B: string-to-key(password, ATHENA.MIT.EDUraeburn, 1)"
+        );
+
+        // Vector 2: iter=2
+        let base_key2 = string_to_key_aes256(b"password", b"ATHENA.MIT.EDUraeburn", 2);
+        assert_eq!(
+            bytes_to_hex(&base_key2),
+            "a2e16d16b36069c135d5e9d2e25f896102685618b95914b467c67622225824ff",
+            "RFC 3962 Appendix B: string-to-key(password, ATHENA.MIT.EDUraeburn, 2)"
+        );
+
+        // Vector 3: iter=1200
+        let base_key3 = string_to_key_aes256(b"password", b"ATHENA.MIT.EDUraeburn", 1200);
+        assert_eq!(
+            bytes_to_hex(&base_key3),
+            "55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a",
+            "RFC 3962 Appendix B: string-to-key(password, ATHENA.MIT.EDUraeburn, 1200)"
+        );
+
+        // Also verify the DK step directly: DK(tkey, "kerberos") = base_key
+        let tkey: Aes256Key =
+            hex_to_bytes("cdedb5281bb2f801565a1122b25635150ad1f7a04bb9f3a333ecc0e2e1f70837")
+                .try_into()
+                .unwrap();
+        let dk_result = dk_derive(&tkey, b"kerberos");
+        assert_eq!(
+            bytes_to_hex(&dk_result),
+            "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161",
+            "DK(tkey, \"kerberos\") must match RFC 3962 Appendix B"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usage 1 (AS-REQ PA-ENC-TIMESTAMP).
+    /// Base key = fe697b52... (the real Kerberos AES-256 base key from string-to-key).
+    #[test]
+    fn rfc3962_derive_ke_ki_usage_1() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        let ke = derive_encryption_key(&base_key, 1);
+        assert_eq!(
+            bytes_to_hex(&ke),
+            "d0e3f5c9ca1c9b7accaf979cb9c9633ecb0dadb0905c857c9875b5967c13b6c9",
+            "Ke for usage 1 (AS-REQ PA-ENC-TIMESTAMP)"
+        );
+
+        let ki = derive_integrity_key(&base_key, 1);
+        assert_eq!(
+            bytes_to_hex(&ki),
+            "4c559abaa7970eb32071dd43f8b832cc04cc255d97c19ab609ab65987a699b24",
+            "Ki for usage 1"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usage 2 (AS-REP ticket).
+    #[test]
+    fn rfc3962_derive_ke_ki_usage_2() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        let ke = derive_encryption_key(&base_key, 2);
+        assert_eq!(
+            bytes_to_hex(&ke),
+            "c7cfd9cd75fe793a586a542d87e0d1396f1134a104bb1a9190b8c90ada3ddf37",
+            "Ke for usage 2 (AS-REP ticket)"
+        );
+
+        let ki = derive_integrity_key(&base_key, 2);
+        assert_eq!(
+            bytes_to_hex(&ki),
+            "97151b4c76945063e2eb0529dc067d97d7bba90776d8126d91f34f3101aea8ba",
+            "Ki for usage 2"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usage 3 (TGS-REP encpart).
+    #[test]
+    fn rfc3962_derive_ke_ki_usage_3() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        let ke = derive_encryption_key(&base_key, 3);
+        assert_eq!(
+            bytes_to_hex(&ke),
+            "82c229a75b71be9611413bce88fc44e441f4f71340659329a2e4a2a8a35960ac",
+            "Ke for usage 3 (TGS-REP encpart)"
+        );
+
+        let ki = derive_integrity_key(&base_key, 3);
+        assert_eq!(
+            bytes_to_hex(&ki),
+            "2acc7e801cfac7f511cf8729f5569481e97730c3041e2271829bf40a2e4d03a6",
+            "Ki for usage 3"
+        );
+    }
+
+    /// RFC 3961 §5.1 key derivation: Ke/Ki for key usages 7 and 8
+    /// (TGS-REQ AP-REQ authenticator cksum and authenticator encrypted).
+    #[test]
+    fn rfc3962_derive_ke_ki_usages_7_8() {
+        let base_key: Aes256Key =
+            hex_to_bytes("fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161")
+                .try_into()
+                .unwrap();
+
+        // Usage 7: TGS-REQ AP-REQ authenticator cksum
+        let ke7 = derive_encryption_key(&base_key, 7);
+        assert_eq!(
+            bytes_to_hex(&ke7),
+            "998c98377c7c12856f97b45c74441078bff849fb86bf0cb0ad227827af5ad3b1",
+            "Ke for usage 7"
+        );
+        let ki7 = derive_integrity_key(&base_key, 7);
+        assert_eq!(
+            bytes_to_hex(&ki7),
+            "ef169527345dfb2890e132a9865ab42bb4ede6aab4b20a61f834c6d27ce17e62",
+            "Ki for usage 7"
+        );
+
+        // Usage 8: TGS-REQ AP-REQ authenticator (encrypted)
+        let ke8 = derive_encryption_key(&base_key, 8);
+        assert_eq!(
+            bytes_to_hex(&ke8),
+            "a57e67685d5b4e056b9197ff7ea8d249a67a796ddbcfdcb7ea2321a8e934d646",
+            "Ke for usage 8"
+        );
+        let ki8 = derive_integrity_key(&base_key, 8);
+        assert_eq!(
+            bytes_to_hex(&ki8),
+            "1a16b7ec775f3368f4220d0bfb41e5d9fb06784848790ddd188bf2ed6e191fe3",
+            "Ki for usage 8"
+        );
     }
 }
