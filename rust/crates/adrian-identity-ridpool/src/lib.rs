@@ -1218,10 +1218,71 @@ mod tests {
     // require a running FoundationDB cluster and the `fdb` feature flag. They
     // are intentionally omitted from this unit-test module — see
     // `adrian-test-harness` for integration tests.
+    //
+    // Wave 1 (T-105): real FDB integration test for the RID-pool allocator.
+    // Verifies the atomic-add `next_rid` counter advances correctly when
+    // backed by a real FoundationDB cluster.
+    #[cfg(feature = "fdb")]
     #[tokio::test]
-    #[ignore = "requires a running FDB cluster and the `fdb` feature flag"]
-    async fn fdb_integration_rid_pool_exhaustion_triggers_batch_request() {
-        // Placeholder — will be implemented in `adrian-test-harness` once the
-        // FDB integration testkit is added in Wave 4b.
+    async fn fdb_integration_rid_pool_allocate_advances_counter() {
+        // Serialize with the other FDB tests so concurrent test runners
+        // don't wipe each other's data via clear_range.
+        static RIDPOOL_FDB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = RIDPOOL_FDB_TEST_LOCK.lock().await;
+
+        let store = adrian_storage_fdb::FdbDirectoryStore::connect(None)
+            .await
+            .expect("connect to real FDB cluster");
+        // Clear all keys to ensure idempotency across repeated test runs.
+        {
+            let txn = store.begin_write().await.expect("begin_write");
+            txn.clear_range(b"\x00", b"\xff")
+                .await
+                .expect("clear_range");
+            let boxed: Box<dyn adrian_storage_core::WriteTxn> = txn;
+            boxed.commit().await.expect("commit");
+        }
+        let allocator = FdbRidPoolAllocator::new(store);
+        let domain_sid: Sid = "S-1-5-21-100-200-300".parse().unwrap();
+
+        // First allocation should dispense INITIAL_RID (1000).
+        let rid1 = allocator
+            .allocate(&domain_sid)
+            .await
+            .expect("first allocate");
+        assert_eq!(rid1, INITIAL_RID, "first RID must be INITIAL_RID (1000)");
+
+        // Second allocation should dispense INITIAL_RID+1 (1001).
+        let rid2 = allocator
+            .allocate(&domain_sid)
+            .await
+            .expect("second allocate");
+        assert_eq!(
+            rid2,
+            INITIAL_RID + 1,
+            "second RID must be INITIAL_RID+1 (1001)"
+        );
+
+        // State should reflect the advanced counter.
+        let state = allocator.state(&domain_sid).await.expect("state");
+        assert_eq!(
+            state.next_rid,
+            INITIAL_RID + 2,
+            "next_rid must have advanced by 2"
+        );
+
+        // Reclaim should wipe the pool.
+        allocator
+            .reclaim_domain(&domain_sid)
+            .await
+            .expect("reclaim");
+        let state_after = allocator
+            .state(&domain_sid)
+            .await
+            .expect("state after reclaim");
+        assert_eq!(
+            state_after.next_rid, INITIAL_RID,
+            "next_rid must reset to INITIAL_RID after reclaim"
+        );
     }
 }

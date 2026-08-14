@@ -373,6 +373,38 @@ impl WriteTxn for InMemoryWriteTxn {
         Ok(())
     }
 
+    async fn clear_range(&self, begin: &[u8], end: &[u8]) -> Result<(), StorageError> {
+        // Stage a clear of the half-open range `[begin, end)`. We do this
+        // by enumerating the snapshot's keys in range and adding `None`
+        // (delete) entries to the write-set for each. This matches FDB's
+        // `clear_range` semantics: a single atomic op that wipes the range
+        // at commit time.
+        //
+        // We also need to handle keys that were put (not yet committed) in
+        // this same transaction's write-set — those should also be deleted
+        // by the clear_range. We do this by removing any write-set keys
+        // that fall in range and replacing them with `None`.
+        let mut writes = self.writes.lock().unwrap();
+        // Delete snapshot keys in range.
+        for k in self
+            .snapshot
+            .range((begin.to_vec())..(end.to_vec()))
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
+        {
+            writes.insert(k, None);
+        }
+        // Also delete any staged writes (puts) in range.
+        let in_range_puts = writes
+            .range((begin.to_vec())..(end.to_vec()))
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>();
+        for k in in_range_puts {
+            writes.insert(k, None);
+        }
+        Ok(())
+    }
+
     async fn commit(self: Box<Self>) -> Result<(), StorageError> {
         // Single critical section: acquire the target write lock and apply
         // all staged writes + atomic-adds. This guarantees atomicity

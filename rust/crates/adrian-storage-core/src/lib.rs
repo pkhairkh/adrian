@@ -290,6 +290,15 @@ pub enum StorageError {
     /// SD-dedup reference-count corruption (per ADR-004).
     #[error("sdtable corruption: {0}")]
     SdCorruption(String),
+    /// Reject-repair mode is active (per ADR-034 §Decision 5 — "Reject hard
+    /// repair tools"). When the `BackupManager` has set the reject-repair flag,
+    /// all writes (put/delete/atomic_add/clear_range/commit) MUST fail with
+    /// this error. The only recovery procedure is to restore from backup +
+    /// WAL replay; there is no `eseutil /p` equivalent.
+    ///
+    /// Wave 2: implemented by `BackupManager::set_reject_repair(true)`.
+    #[error("reject-repair mode is active; restore from backup (per ADR-034)")]
+    RejectRepair,
     /// Backend error (FDB cluster unavailable, network, etc.).
     #[error("backend error: {0}")]
     Backend(String),
@@ -316,9 +325,19 @@ pub trait WriteTxn: ReadTxn {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError>;
     /// Delete a single key.
     async fn delete(&self, key: &[u8]) -> Result<(), StorageError>;
-    /// Atomic add (per Decision 2 — used for RID-pool allocation and DNT
-    /// counter).
+    /// Atomically add `value` to the existing i64 at `key` (treating absent
+    /// keys as 0). Used for RID-pool allocation and DNT counter increments.
     async fn atomic_add(&self, key: &[u8], value: i64) -> Result<(), StorageError>;
+    /// Clear (delete) all keys in the half-open range `[begin, end)`. Used
+    /// for backup/restore (Wave 2 — clears a subspace before restoring a
+    /// snapshot), tombstone GC (Wave 3 — clears expired tombstones in a
+    /// range), subspace migration (Wave 3 — clears the old prefix after the
+    /// swap), and integration tests (Wave 1 — wipes the cluster before each
+    /// test for idempotency).
+    ///
+    /// Implementations MUST be a single atomic operation w.r.t. other
+    /// concurrent transactions on the same backend.
+    async fn clear_range(&self, begin: &[u8], end: &[u8]) -> Result<(), StorageError>;
     /// Commit the transaction.
     async fn commit(self: Box<Self>) -> Result<(), StorageError>;
     /// Rollback the transaction (drop all writes).

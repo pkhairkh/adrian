@@ -56,6 +56,15 @@ const UID_INDEX_MARKER: u8 = 0x03;
 const UUID_TO_UID_MARKER: u8 = 0x04;
 /// UID atomic counter marker: `(0x0D, 0xFF, "next_uid")` (atomic-add).
 const UID_COUNTER_MARKER: u8 = 0xFF;
+/// Wave 4 (T-402): sIDHistory index marker:
+/// `(0x0D, 0x05, sid_bytes) → length-prefixed packed Vec<Sid>`.
+const SID_HISTORY_MARKER: u8 = 0x05;
+/// Wave 4 (T-403): UPN → UUID index marker:
+/// `(0x0D, 0x06, upn_str_bytes) → uuid_bytes`.
+const UPN_TO_UUID_MARKER: u8 = 0x06;
+/// Wave 4 (T-403): UUID → UPN forward index marker (for back-reference /
+/// rename support): `(0x0D, 0x07, uuid_bytes) → upn_str_bytes`.
+const UUID_TO_UPN_MARKER: u8 = 0x07;
 
 /// Encode the forward-index key `(0x0D, 0x01, uuid_bytes)`.
 fn forward_key(uuid: &Uuid) -> Vec<u8> {
@@ -101,6 +110,84 @@ fn uid_counter_key() -> Vec<u8> {
     out.push(UID_COUNTER_MARKER);
     out.extend_from_slice(b"next_uid");
     out
+}
+
+/// Encode the sIDHistory key `(0x0D, 0x05, sid_bytes)` (Wave 4 / T-402).
+fn sid_history_key(sid: &Sid) -> Result<Vec<u8>, IdentityError> {
+    let sid_bytes = sid.to_bytes()?;
+    let mut out = Vec::with_capacity(2 + sid_bytes.len());
+    out.push(IDENTITY_MAPPING_SUBSPACE);
+    out.push(SID_HISTORY_MARKER);
+    out.extend_from_slice(&sid_bytes);
+    Ok(out)
+}
+
+/// Encode the UPN→UUID index key `(0x0D, 0x06, upn_str_bytes)` (Wave 4 / T-403).
+fn upn_to_uuid_key(upn: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + upn.len());
+    out.push(IDENTITY_MAPPING_SUBSPACE);
+    out.push(UPN_TO_UUID_MARKER);
+    out.extend_from_slice(upn.as_bytes());
+    out
+}
+
+/// Encode the UUID→UPN forward-index key `(0x0D, 0x07, uuid_bytes)` (Wave 4 / T-403).
+fn uuid_to_upn_key(uuid: &Uuid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 16);
+    out.push(IDENTITY_MAPPING_SUBSPACE);
+    out.push(UUID_TO_UPN_MARKER);
+    out.extend_from_slice(uuid.as_bytes());
+    out
+}
+
+/// Encode a `Vec<Sid>` as a length-prefixed packed byte sequence:
+/// `[count: u32 BE]` followed by `[len: u32 BE][sid_bytes]` per SID.
+fn pack_sid_list(sids: &[Sid]) -> Result<Vec<u8>, IdentityError> {
+    let mut out = Vec::with_capacity(4 + sids.len() * 32);
+    out.extend_from_slice(&(sids.len() as u32).to_be_bytes());
+    for sid in sids {
+        let bytes = sid.to_bytes()?;
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+/// Decode a `Vec<Sid>` from the length-prefixed packed format. Returns
+/// `Err(IdentityError::Backend)` if the buffer is truncated or malformed.
+fn unpack_sid_list(buf: &[u8]) -> Result<Vec<Sid>, IdentityError> {
+    if buf.len() < 4 {
+        return Err(IdentityError::Backend(format!(
+            "sIDHistory value must be >= 4 bytes (count prefix), got {}",
+            buf.len()
+        )));
+    }
+    let count = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let mut cursor = 4;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor + 4 > buf.len() {
+            return Err(IdentityError::Backend(
+                "sIDHistory value: truncated length prefix".into(),
+            ));
+        }
+        let len = u32::from_be_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+        if cursor + len > buf.len() {
+            return Err(IdentityError::Backend(
+                "sIDHistory value: truncated SID bytes".into(),
+            ));
+        }
+        let sid = Sid::from_bytes(&buf[cursor..cursor + len])?;
+        cursor += len;
+        out.push(sid);
+    }
+    Ok(out)
 }
 
 /// Map a `StorageError` to an `IdentityError::Backend`.
@@ -208,6 +295,62 @@ impl FdbIdentityMapping {
                 c2.remove(&sid);
             }
         }
+    }
+
+    /// Wave 4 (T-402): Set the `sIDHistory` for a principal identified by
+    /// its current SID (per ADR-126). Replaces any existing sIDHistory
+    /// for this SID in a single FDB transaction (atomic).
+    pub async fn set_sid_history(&self, sid: &Sid, history: &[Sid]) -> Result<(), IdentityError> {
+        let key = sid_history_key(sid)?;
+        let packed = pack_sid_list(history)?;
+        let txn = self.store.begin_write().await.map_err(map_storage_err)?;
+        txn.put(&key, &packed).await.map_err(map_storage_err)?;
+        txn.commit().await.map_err(map_storage_err)?;
+        Ok(())
+    }
+
+    /// Wave 4 (T-403): Set the UPN for a principal identified by its UUID
+    /// (per ADR-017 — UPN uniqueness). Enforces uniqueness: if the UPN is
+    /// already registered to a different principal, returns
+    /// `IdentityError::MappingConflict`. Removes any previous UPN for
+    /// this UUID so we don't leave a stale reverse-index entry.
+    pub async fn set_upn(&self, uuid: PrincipalId, upn: &str) -> Result<(), IdentityError> {
+        let upn_key = upn_to_uuid_key(upn);
+        let uuid_upn_key = uuid_to_upn_key(&uuid);
+        let txn = self.store.begin_write().await.map_err(map_storage_err)?;
+        // Conflict check: is the UPN already mapped to a different UUID?
+        let existing = txn.get(&upn_key).await.map_err(map_storage_err)?;
+        if let Some(existing_bytes) = existing {
+            if existing_bytes.len() == 16 {
+                let existing_uuid =
+                    Uuid::from_bytes(existing_bytes[..16].try_into().expect("16-byte slice"));
+                if existing_uuid != uuid {
+                    return Err(IdentityError::MappingConflict(format!(
+                        "UPN {upn} is already mapped to UUID {existing_uuid} (requested {uuid})"
+                    )));
+                }
+            }
+        }
+        // Remove any existing UPN for this UUID (in case the principal
+        // is changing its UPN).
+        let old_upn_buf = txn.get(&uuid_upn_key).await.map_err(map_storage_err)?;
+        if let Some(old_upn_buf) = old_upn_buf {
+            let old_upn = String::from_utf8(old_upn_buf).map_err(|e| {
+                IdentityError::Backend(format!("UUID→UPN value is not valid UTF-8: {e}"))
+            })?;
+            // Only delete the old UPN→UUID entry if it actually points at
+            // this UUID (defensive against partial corruption).
+            let old_upn_key = upn_to_uuid_key(&old_upn);
+            txn.delete(&old_upn_key).await.map_err(map_storage_err)?;
+        }
+        txn.put(&upn_key, uuid.as_bytes())
+            .await
+            .map_err(map_storage_err)?;
+        txn.put(&uuid_upn_key, upn.as_bytes())
+            .await
+            .map_err(map_storage_err)?;
+        txn.commit().await.map_err(map_storage_err)?;
+        Ok(())
     }
 }
 
@@ -366,10 +509,70 @@ impl IdentityMapping for FdbIdentityMapping {
             }
             txn.delete(&uid_key).await.map_err(map_storage_err)?;
         }
+        // Wave 4 (T-402): also remove the sIDHistory index entry for this
+        // principal's SID (per ADR-126 — when a principal is deleted, its
+        // sIDHistory is no longer meaningful).
+        let history_key = sid_history_key(&sid)?;
+        txn.delete(&history_key).await.map_err(map_storage_err)?;
+        // Wave 4 (T-403): also remove the UPN→UUID and UUID→UPN entries
+        // for this principal (per ADR-017 — UPNs are released when the
+        // principal is deleted).
+        let uuid_upn_key = uuid_to_upn_key(&uuid);
+        let upn_buf = txn.get(&uuid_upn_key).await.map_err(map_storage_err)?;
+        if let Some(upn_buf) = upn_buf {
+            let upn = String::from_utf8(upn_buf).map_err(|e| {
+                IdentityError::Backend(format!("UUID→UPN value is not valid UTF-8: {e}"))
+            })?;
+            let upn_key = upn_to_uuid_key(&upn);
+            txn.delete(&upn_key).await.map_err(map_storage_err)?;
+        }
+        txn.delete(&uuid_upn_key).await.map_err(map_storage_err)?;
         txn.commit().await.map_err(map_storage_err)?;
         // Drop from the in-memory cache.
         self.cache_remove(&uuid);
         Ok(())
+    }
+
+    async fn resolve_sid_history(&self, sid: &Sid) -> Result<Vec<Sid>, IdentityError> {
+        // Wave 4 (T-402): read the sIDHistory index entry for this SID.
+        // Returns an empty Vec if no entry exists (the principal has never
+        // been migrated).
+        let key = sid_history_key(sid)?;
+        let txn = self.store.begin_read().await.map_err(map_storage_err)?;
+        let buf = txn.get(&key).await.map_err(map_storage_err)?;
+        let Some(buf) = buf else {
+            return Ok(Vec::new());
+        };
+        unpack_sid_list(&buf)
+    }
+
+    async fn lookup_by_upn(&self, upn: &str) -> Result<Option<(PrincipalId, Sid)>, IdentityError> {
+        // Wave 4 (T-403): look up the UPN→UUID index, then the UUID→SID
+        // forward index. Returns None if the UPN is not registered.
+        let upn_key = upn_to_uuid_key(upn);
+        let txn = self.store.begin_read().await.map_err(map_storage_err)?;
+        let buf = txn.get(&upn_key).await.map_err(map_storage_err)?;
+        let Some(buf) = buf else {
+            return Ok(None);
+        };
+        if buf.len() != 16 {
+            return Err(IdentityError::Backend(format!(
+                "UPN→UUID index value must be 16 bytes, got {}",
+                buf.len()
+            )));
+        }
+        let uuid = Uuid::from_bytes(buf[..16].try_into().expect("16-byte slice"));
+        // Now look up the SID.
+        let fkey = forward_key(&uuid);
+        let sid_buf = txn.get(&fkey).await.map_err(map_storage_err)?;
+        let Some(sid_buf) = sid_buf else {
+            // UPN exists but no SID — data corruption. Surface as Backend.
+            return Err(IdentityError::Backend(format!(
+                "UPN {upn} maps to UUID {uuid} but no SID is registered for that UUID"
+            )));
+        };
+        let sid = Sid::from_bytes(&sid_buf)?;
+        Ok(Some((uuid, sid)))
     }
 }
 

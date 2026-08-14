@@ -169,6 +169,29 @@ pub trait IdentityMapping: Send + Sync {
     /// Remove a mapping (per Decision 3 §Decision). Used by the principal-
     /// deletion path.
     async fn remove(&self, uuid: PrincipalId) -> Result<(), IdentityError>;
+
+    /// Resolve the `sIDHistory` for a principal identified by its current
+    /// SID (per ADR-126 — sIDHistory migration via DRSAddSidHistory). Returns
+    /// the list of historical SIDs that the principal was previously known
+    /// by. Empty for principals that have never been migrated.
+    ///
+    /// The returned list does NOT include the principal's current SID —
+    /// callers that need both should call `lookup_sid(uuid)` first, then
+    /// `resolve_sid_history(sid)`.
+    ///
+    /// Wave 4 (T-402).
+    async fn resolve_sid_history(&self, sid: &Sid) -> Result<Vec<Sid>, IdentityError>;
+
+    /// Look up a principal by its User Principal Name (UPN, per ADR-017 —
+    /// UPN uniqueness). The UPN is the user's login name in
+    /// `user@realm.example.com` format (per RFC 822).
+    ///
+    /// Returns `(uuid, sid)` if the UPN is registered to a principal, or
+    /// `None` if no principal has this UPN. Used by the KDC's AS-REQ
+    /// handler to translate `user@realm` → principal lookup.
+    ///
+    /// Wave 4 (T-403).
+    async fn lookup_by_upn(&self, upn: &str) -> Result<Option<(PrincipalId, Sid)>, IdentityError>;
 }
 
 /// The default algorithmic UUID → POSIX UID mapping (per Decision 3
