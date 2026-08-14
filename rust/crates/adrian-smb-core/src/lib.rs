@@ -2850,6 +2850,367 @@ pub fn decrypt_pdu(key: &SmbEncryptionKey, frame: &[u8]) -> Result<Vec<u8>, SmbE
 }
 
 // ============================================================================
+// GSS-API / SPNEGO — Kerberos session setup (MS-SMB2 §3.2.5.3, RFC 4178)
+// ============================================================================
+
+/// GSS-API / SPNEGO mechanism OIDs (DER-encoded, without the leading
+/// `06 LL` tag/length bytes — just the OID body). Used by [`gss_api`]
+/// to classify the offered mechanisms in a NegTokenInit.
+pub mod gss_api {
+    use super::SmbError;
+
+    /// SPNEGO OID body: `1.3.6.1.5.5.2` (RFC 4178).
+    pub const SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+
+    /// Kerberos5 OID body: `1.2.840.113554.1.2.2` (RFC 4121 / MS-KILE).
+    pub const KERBEROS5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+
+    /// NTLMSSP OID body: `1.3.6.1.4.1.311.2.2.10` (per ADR-085 — client-only).
+    pub const NTLMSSP: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+
+    /// Synthetic Kerberos AP-REQ marker — the first 7 bytes of every
+    /// mechToken produced by [`init_sec_context`] / accepted by
+    /// [`accept_sec_context`]. The marker spells `b"KRBAUTH"` and is
+    /// followed by the target SPN (UTF-8, length-prefixed) and a
+    /// 16-byte client nonce.
+    pub const KRB_AUTH_MARKER: &[u8] = b"KRBAUTH";
+
+    /// GSS-API acceptor result.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AcceptResult {
+        /// Session key derived from the Kerberos mechToken (16 bytes).
+        /// Used as the SMB2 SessionKey for signing/encryption key
+        /// derivation per MS-SMB2 §3.2.5.2.
+        pub session_key: [u8; 16],
+        /// SPNEGO response token to return to the client (empty on
+        /// completion — no further round-trips needed).
+        pub response_token: Vec<u8>,
+        /// True when the context is fully established; false when the
+        /// acceptor needs another token from the client (continued
+        /// authentication — not used in the synthetic implementation).
+        pub completed: bool,
+    }
+
+    /// A classification of the offered mechanism(s) in an SPNEGO
+    /// NegTokenInit blob.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum MechClass {
+        /// Kerberos5 was offered (and is accepted).
+        Kerberos,
+        /// Only NTLM was offered (refused per ADR-085).
+        NtlmOnly,
+        /// No recognised mechanisms were offered (anonymous / unknown).
+        Unknown,
+    }
+
+    /// Inspect a GSS-API initial token and classify the offered
+    /// mechanism(s). This is a minimal hand-rolled DER walker: it scans
+    /// the blob for the well-known OID bodies (Kerberos5, NTLMSSP) and
+    /// returns the strongest classification.
+    ///
+    /// The function does NOT verify the SPNEGO NegTokenInit structure
+    /// strictly — it looks for the OID bodies anywhere in the blob,
+    /// which is robust to DER length-encoding variations and to
+    /// non-canonical encoders (e.g. Samba's Heimdal-derived encoder).
+    #[must_use]
+    pub fn classify_mech(token: &[u8]) -> MechClass {
+        let mut has_krb = false;
+        let mut has_ntlm = false;
+        // Sliding-window search for the OID bodies. OIDs in DER are
+        // preceded by `06 LL` (tag 06, length LL) but we just look for
+        // the body to keep the walker trivial.
+        if contains_subslice(token, KERBEROS5) {
+            has_krb = true;
+        }
+        if contains_subslice(token, NTLMSSP) {
+            has_ntlm = true;
+        }
+        if has_krb {
+            MechClass::Kerberos
+        } else if has_ntlm {
+            MechClass::NtlmOnly
+        } else {
+            MechClass::Unknown
+        }
+    }
+
+    /// Accept a GSS-API security context (server-side SPNEGO acceptor).
+    ///
+    /// The function:
+    ///   1. Classifies the offered mechanisms via [`classify_mech`].
+    ///   2. Refuses NTLM-only tokens (per ADR-085) and unknown / empty
+    ///      tokens (anonymous — refused per MS-SMB2 §3.2.5.3).
+    ///   3. Extracts the Kerberos mechToken (looking for the
+    ///      [`KRB_AUTH_MARKER`] sentinel and parsing the SPN + client
+    ///      nonce that follows it).
+    ///   4. Derives a 16-byte session key from
+    ///      `HKDF-SHA-256(mechToken || server_secret, "SMBSessionKey")`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmbError::Encryption`] (re-used as the "auth" error
+    /// surface, since the SMB layer maps it to `STATUS_LOGON_FAILURE`)
+    /// when:
+    ///   - the token is empty (anonymous refused),
+    ///   - only NTLM is offered (ADR-085),
+    ///   - the mechanism is unknown,
+    ///   - the Kerberos mechToken cannot be parsed.
+    pub fn accept_sec_context(
+        input_token: &[u8],
+        server_secret: &[u8],
+    ) -> Result<AcceptResult, SmbError> {
+        if input_token.is_empty() {
+            return Err(SmbError::Encryption(
+                "anonymous session setup refused (token empty)".into(),
+            ));
+        }
+        let class = classify_mech(input_token);
+        match class {
+            MechClass::NtlmOnly => Err(SmbError::Encryption(
+                "NTLM session setup refused per ADR-085 (client-only)".into(),
+            )),
+            MechClass::Unknown => Err(SmbError::Encryption(
+                "unknown mechanism — anonymous session setup refused".into(),
+            )),
+            MechClass::Kerberos => {
+                // Extract the synthetic Kerberos mechToken (KRBAUTH || spn_len(u8) || spn || nonce[16]).
+                let mech_token = extract_mech_token(input_token)?;
+                if mech_token.len() < KRB_AUTH_MARKER.len() + 1 + 16 {
+                    return Err(SmbError::Encryption(format!(
+                        "Kerberos mechToken too short: {} bytes",
+                        mech_token.len()
+                    )));
+                }
+                if &mech_token[..KRB_AUTH_MARKER.len()] != KRB_AUTH_MARKER {
+                    return Err(SmbError::Encryption(
+                        "Kerberos mechToken marker missing".into(),
+                    ));
+                }
+                // Derive a deterministic 16-byte session key from the
+                // mechToken + server_secret using HKDF-SHA-256.
+                let mut ikm = Vec::with_capacity(mech_token.len() + server_secret.len());
+                ikm.extend_from_slice(&mech_token);
+                ikm.extend_from_slice(server_secret);
+                let session_key = derive_smb_session_key(&ikm, b"SMBSessionKey");
+                Ok(AcceptResult {
+                    session_key,
+                    response_token: Vec::new(),
+                    completed: true,
+                })
+            }
+        }
+    }
+
+    /// Initialize a GSS-API security context (client-side SPNEGO
+    /// initiator) for `target_spn`. Returns an SPNEGO NegTokenInit
+    /// blob suitable for the SessionSetup request's SecurityBuffer.
+    ///
+    /// The blob advertises Kerberos5 as the only mechanism (so the
+    /// server's [`accept_sec_context`] never falls back to NTLM) and
+    /// carries a synthetic AP-REQ containing the SPN and a 16-byte
+    /// client nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmbError::Encryption`] only if the SPN is empty.
+    pub fn init_sec_context(target_spn: &str, client_secret: &[u8]) -> Result<Vec<u8>, SmbError> {
+        if target_spn.is_empty() {
+            return Err(SmbError::Encryption(
+                "init_sec_context: target SPN must not be empty".into(),
+            ));
+        }
+        // Build the synthetic Kerberos mechToken:
+        //   KRBAUTH || spn_len(u8 LE) || spn_utf8 || client_nonce[16]
+        let spn_bytes = target_spn.as_bytes();
+        if spn_bytes.len() > 255 {
+            return Err(SmbError::Encryption(format!(
+                "target SPN too long ({} bytes > 255)",
+                spn_bytes.len()
+            )));
+        }
+        let mut mech_token = Vec::with_capacity(KRB_AUTH_MARKER.len() + 1 + spn_bytes.len() + 16);
+        mech_token.extend_from_slice(KRB_AUTH_MARKER);
+        mech_token.push(spn_bytes.len() as u8);
+        mech_token.extend_from_slice(spn_bytes);
+        // 16-byte deterministic client nonce derived from client_secret
+        // (production code would use a CSPRNG; the framework's KDC
+        // integration is wired in a later wave).
+        let mut client_nonce = [0u8; 16];
+        let secret_len = client_secret.len().min(16);
+        client_nonce[..secret_len].copy_from_slice(&client_secret[..secret_len]);
+        mech_token.extend_from_slice(&client_nonce);
+
+        // Build the SPNEGO NegTokenInit DER blob:
+        //   [APPLICATION 0] SEQUENCE {
+        //     SPNEGO_OID,
+        //     [0] NegTokenInit SEQUENCE {
+        //       [0] MechTypeList SEQUENCE OF { Kerberos5_OID },
+        //       [2] MechToken OCTET STRING { mech_token }
+        //     }
+        //   }
+        let krb_oid_tlv = der_oid(KERBEROS5);
+        let spnego_oid_tlv = der_oid(SPNEGO);
+        let mech_token_tlv = der_octet_string(&mech_token);
+
+        // MechTypeList = SEQUENCE OF { Kerberos5 }
+        let mech_type_list = der_sequence(&krb_oid_tlv);
+        // [0] mechTypes (context tag 0, constructed)
+        let mech_types_tlv = der_context_constructed(0, &mech_type_list);
+        // [2] mechToken (context tag 2, constructed)
+        let mech_token_ctx_tlv = der_context_constructed(2, &mech_token_tlv);
+        // NegTokenInit = SEQUENCE { mechTypes, mechToken }
+        let neg_token_init =
+            der_sequence(&[mech_types_tlv.as_slice(), mech_token_ctx_tlv.as_slice()].concat());
+        // [0] NegTokenInit wrapper (context tag 0, constructed)
+        let neg_token_init_ctx = der_context_constructed(0, &neg_token_init);
+        // InitialContextToken = [APPLICATION 0] SEQUENCE { SPNEGO_OID, NegTokenInit-wrapped }
+        let inner = [spnego_oid_tlv.as_slice(), neg_token_init_ctx.as_slice()].concat();
+        let initial_context_token = der_application_constructed(0, &inner);
+        Ok(initial_context_token)
+    }
+
+    /// Derive a 16-byte SMB session key from `ikm` using HKDF-SHA-256
+    /// (RFC 5869) with the given label as `info`.
+    fn derive_smb_session_key(ikm: &[u8], label: &[u8]) -> [u8; 16] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        // HKDF-Extract: PRK = HMAC-SHA-256(salt="", ikm)
+        let mut mac = HmacSha256::new_from_slice(&[]).expect("HMAC accepts empty salt");
+        mac.update(ikm);
+        let prk = mac.finalize().into_bytes();
+        // HKDF-Expand: T(1) = HMAC-SHA-256(PRK, info || 0x01)
+        let mut mac = HmacSha256::new_from_slice(&prk).expect("HMAC accepts PRK");
+        mac.update(label);
+        mac.update(&[0x01]);
+        let t1 = mac.finalize().into_bytes();
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&t1[..16]);
+        key
+    }
+
+    /// Extract the synthetic Kerberos mechToken from an SPNEGO
+    /// NegTokenInit blob. Walks the DER looking for an OCTET STRING
+    /// whose body starts with the [`KRB_AUTH_MARKER`].
+    fn extract_mech_token(blob: &[u8]) -> Result<Vec<u8>, SmbError> {
+        // Sliding-window search for the marker.
+        let marker_len = KRB_AUTH_MARKER.len();
+        for i in 0..blob.len().saturating_sub(marker_len) {
+            if &blob[i..i + marker_len] == KRB_AUTH_MARKER {
+                // Found the marker — the mechToken is the marker + the
+                // following spn_len + spn + nonce[16] bytes. We don't
+                // strictly know the length here (we'd need to parse the
+                // surrounding OCTET STRING TLV), so we conservatively
+                // return everything from the marker to the end of the
+                // blob. The caller validates the minimum length and
+                // only reads the SPN + 16-byte nonce prefix.
+                return Ok(blob[i..].to_vec());
+            }
+        }
+        Err(SmbError::Encryption(
+            "Kerberos mechToken marker not found in SPNEGO blob".into(),
+        ))
+    }
+
+    // ---- Minimal DER encoders (definite-length) ----
+
+    fn der_encode_len(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            vec![len as u8]
+        } else if len <= 0xFF {
+            vec![0x81, len as u8]
+        } else if len <= 0xFFFF {
+            vec![0x82, (len >> 8) as u8, (len & 0xFF) as u8]
+        } else {
+            // SPNEGO blobs are tiny; 3-byte length encoding is the
+            // most we ever need.
+            vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        }
+    }
+
+    fn der_oid(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + body.len());
+        out.push(0x06); // OBJECT IDENTIFIER
+        out.extend(der_encode_len(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn der_octet_string(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + body.len());
+        out.push(0x04); // OCTET STRING
+        out.extend(der_encode_len(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn der_sequence(contents: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + contents.len());
+        out.push(0x30); // SEQUENCE
+        out.extend(der_encode_len(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    fn der_context_constructed(tag: u8, contents: &[u8]) -> Vec<u8> {
+        debug_assert!(tag < 0x20, "context tag must fit in 5 bits");
+        let mut out = Vec::with_capacity(2 + contents.len());
+        out.push(0xA0 | tag); // context tag, constructed
+        out.extend(der_encode_len(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    fn der_application_constructed(tag: u8, contents: &[u8]) -> Vec<u8> {
+        debug_assert!(tag < 0x20, "application tag must fit in 5 bits");
+        let mut out = Vec::with_capacity(2 + contents.len());
+        out.push(0x60 | tag); // application tag, constructed
+        out.extend(der_encode_len(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // ---- Tests for the gss_api module ----
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn classify_mech_detects_kerberos_oid() {
+            let blob = init_sec_context("cifs/dc01.example.com", &[0xAB; 16]).expect("init ok");
+            assert_eq!(classify_mech(&blob), MechClass::Kerberos);
+        }
+
+        #[test]
+        fn classify_mech_detects_ntlm_only_blob() {
+            // Hand-craft an NTLM-only SPNEGO blob.
+            let ntlm_oid_tlv = der_oid(NTLMSSP);
+            let mech_list = der_sequence(&ntlm_oid_tlv);
+            let mech_types_tlv = der_context_constructed(0, &mech_list);
+            let neg_init = der_sequence(&mech_types_tlv);
+            let neg_init_ctx = der_context_constructed(0, &neg_init);
+            let spnego_oid_tlv = der_oid(SPNEGO);
+            let inner = [spnego_oid_tlv.as_slice(), neg_init_ctx.as_slice()].concat();
+            let blob = der_application_constructed(0, &inner);
+            assert_eq!(classify_mech(&blob), MechClass::NtlmOnly);
+        }
+
+        #[test]
+        fn classify_mech_returns_unknown_for_empty_blob() {
+            assert_eq!(classify_mech(&[]), MechClass::Unknown);
+        }
+    }
+}
+
+// ============================================================================
 // NetBIOS Session Service framing — used by the transport
 // ============================================================================
 

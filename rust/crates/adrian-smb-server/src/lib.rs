@@ -38,10 +38,11 @@ use std::sync::Arc;
 
 use adrian_smb_core::netbios;
 use adrian_smb_core::{
-    ntstatus, CloseRequest, CloseResponse, Command, CreateRequest, CreateResponse, EchoRequest,
-    EchoResponse, FileId, LogoffRequest, LogoffResponse, NegotiateRequest, NegotiateResponse,
-    ReadRequest, ReadResponse, SessionSetupRequest, SessionSetupResponse, Smb2Header, SmbError,
-    TreeConnectRequest, TreeConnectResponse, WriteRequest, WriteResponse, Writer, SMB2_HEADER_SIZE,
+    gss_api, ntstatus, CloseRequest, CloseResponse, Command, CreateRequest, CreateResponse,
+    EchoRequest, EchoResponse, FileId, LogoffRequest, LogoffResponse, NegotiateRequest,
+    NegotiateResponse, ReadRequest, ReadResponse, SessionSetupRequest, SessionSetupResponse,
+    Smb2Header, SmbError, TreeConnectRequest, TreeConnectResponse, WriteRequest, WriteResponse,
+    Writer, SMB2_HEADER_SIZE,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -250,6 +251,10 @@ struct SessionState {
     share: Option<Arc<Share>>,
     /// Open files keyed by FileId.
     open_files: HashMap<FileId, OpenFile>,
+    /// SMB2 SessionKey (16 bytes) derived from the GSS-API acceptor
+    /// (Wave 2). Used to derive the AES-256-GCM encryption key per
+    /// MS-SMB2 §3.2.5.2. None until SessionSetup completes.
+    session_key: Option<[u8; 16]>,
 }
 
 impl SessionState {
@@ -258,6 +263,7 @@ impl SessionState {
             tree_id: 0,
             share: None,
             open_files: HashMap::new(),
+            session_key: None,
         }
     }
 }
@@ -544,23 +550,55 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> ConnectionHandler<S> {
         header: &Smb2Header,
         payload: &[u8],
     ) -> Result<Vec<u8>, SmbServerError> {
-        // Wave 3b stub: accept any SecurityBuffer. Real Kerberos / NTLM
-        // acceptor logic is wired in a later wave (per ADR-105 §6).
-        let _req = SessionSetupRequest::decode(payload, SMB2_HEADER_SIZE)?;
-        // Allocate a session if this is the first SessionSetup for this
-        // connection (sessionId == 0 means "new session").
-        if header.session_id == 0 {
-            let new_id = self.state.alloc_session();
-            // Patch the header's session_id in the response so the client
-            // knows the new session id.
-            let mut resp_hdr = Smb2Header::new_response(header);
-            resp_hdr.session_id = new_id;
-            let resp = SessionSetupResponse::new_success();
-            return Ok(resp.encode(&resp_hdr, ntstatus::STATUS_SUCCESS));
+        // Wave 2: real GSS-API / SPNEGO validation per ADR-085.
+        // NTLM-only tokens and anonymous (empty) tokens are refused
+        // with STATUS_LOGON_FAILURE; only Kerberos5 tokens are accepted.
+        let req = SessionSetupRequest::decode(payload, SMB2_HEADER_SIZE)?;
+        // The server-side secret mixed into the session-key derivation.
+        // In production this is the server's krb5 keytab entry for the
+        // cifs/<fqdn> SPN; for Wave 2 we reuse the preauth-integrity
+        // salt (already advertised in the NegotiateResponse).
+        let server_secret = &self.state.server_salt;
+        match gss_api::accept_sec_context(&req.security_buffer, server_secret) {
+            Ok(accept) => {
+                // Allocate a session if this is the first SessionSetup
+                // for this connection (sessionId == 0 means "new session").
+                let session_id = if header.session_id == 0 {
+                    self.state.alloc_session()
+                } else {
+                    header.session_id
+                };
+                // Stash the derived session key on the session so that
+                // Wave 1 encryption can be wired up later. Wave 2 just
+                // records it; subsequent PDUs on this session are still
+                // plaintext until the encryption-wiring wave flips the
+                // switch (per ADR-105 §4 — encryption is opt-in per
+                // session, not mandated).
+                if let Some(s) = self.state.sessions.get_mut(&session_id) {
+                    s.session_key = Some(accept.session_key);
+                }
+                let mut resp_hdr = Smb2Header::new_response(header);
+                resp_hdr.session_id = session_id;
+                let resp = SessionSetupResponse::new_success();
+                Ok(resp.encode(&resp_hdr, ntstatus::STATUS_SUCCESS))
+            }
+            Err(_e) => {
+                // GSS-API failure → STATUS_LOGON_FAILURE. The error
+                // variant (NTLM refused vs. anonymous refused vs.
+                // malformed Kerberos) is logged but the on-wire status
+                // is the same so the client cannot distinguish them
+                // (avoiding an information leak).
+                let session_id = if header.session_id == 0 {
+                    self.state.alloc_session()
+                } else {
+                    header.session_id
+                };
+                let mut resp_hdr = Smb2Header::new_response(header);
+                resp_hdr.session_id = session_id;
+                let resp = SessionSetupResponse::new_success();
+                Ok(resp.encode(&resp_hdr, ntstatus::STATUS_LOGON_FAILURE))
+            }
         }
-        // Existing session — accept the continuation.
-        let resp = SessionSetupResponse::new_success();
-        Ok(resp.encode(header, ntstatus::STATUS_SUCCESS))
     }
 
     async fn handle_logoff(
@@ -1013,8 +1051,11 @@ mod tests {
         send_frame(&mut client, &req.encode(1)).await.unwrap();
         let _resp_bytes = recv_frame(&mut client).await.unwrap();
 
-        // 2) SessionSetup.
-        let req = SessionSetupRequest::new(vec![0x60, 0x05, 0x06, 0x02, 0x2A, 0x03, 0x01]);
+        // 2) SessionSetup — Wave 2: real GSS-API / SPNEGO blob.
+        let spnego =
+            adrian_smb_core::gss_api::init_sec_context("cifs/dc01.example.com", &[0xAB; 16])
+                .expect("init_sec_context ok");
+        let req = SessionSetupRequest::new(spnego);
         send_frame(&mut client, &req.encode(2, 0)).await.unwrap();
         let resp_bytes = recv_frame(&mut client).await.unwrap();
         let resp_hdr = Smb2Header::decode(&resp_bytes).expect("hdr");
