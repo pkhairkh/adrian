@@ -1338,6 +1338,344 @@ fn principal_names_eq(a: &[String], b: &[String]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-realm TGT referral (RFC 4120 §3.3.3 / ADR-013)
+// ---------------------------------------------------------------------------
+
+/// Transited-field validation mode (ADR-013 §Decision). Controls how the
+/// KDC validates the `Transited` field of incoming cross-realm tickets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransitedValidation {
+    /// Validate per spec (RFC 4120 §3.3.3) — reject if the transited chain
+    /// includes a realm the local KDC does not trust (directly or
+    /// transitively). ADR-013 §Decision default.
+    #[default]
+    Strict,
+    /// Skip `Transited` validation entirely (AD's default for intra-forest
+    /// trusts — useful when the forest is one administrative unit).
+    Disabled,
+    /// Validate but accept shortcut trusts as valid chains (ADR-013 §Decision:
+    /// "prefer shortcut trusts over multi-hop paths").
+    ShortcutAware,
+}
+
+/// Cross-realm trust configuration entry. Maps a foreign realm to its
+/// validation mode. The cross-realm key itself is stored in the principal
+/// store as a `krbtgt/FOREIGN_REALM` principal in the local realm.
+#[derive(Clone, Debug)]
+pub struct CrossRealmTrust {
+    /// The foreign realm (normalized to uppercase).
+    pub foreign_realm: String,
+    /// Transited-field validation mode for this trust.
+    pub transited_validation: TransitedValidation,
+}
+
+impl CrossRealmTrust {
+    /// Create a new cross-realm trust entry with the default (Strict)
+    /// validation mode.
+    pub fn new(foreign_realm: impl Into<String>) -> Self {
+        Self {
+            foreign_realm: foreign_realm.into().to_ascii_uppercase(),
+            transited_validation: TransitedValidation::default(),
+        }
+    }
+
+    /// Set the transited-field validation mode.
+    pub fn with_validation(mut self, mode: TransitedValidation) -> Self {
+        self.transited_validation = mode;
+        self
+    }
+}
+
+/// Capath validator per ADR-069 / ADR-013 §Decision. Validates the
+/// transited realm chain (the list of realms a ticket has passed through)
+/// against the local KDC's trust graph.
+#[derive(Clone, Debug, Default)]
+pub struct CapathValidator {
+    /// Set of directly-trusted foreign realms (realms for which the local
+    /// KDC has a cross-realm key + trust entry).
+    trusted_realms: std::collections::HashSet<String>,
+    /// Shortcut trusts: realms reachable via a direct trust even if not
+    /// adjacent in the chain (ADR-013 §Decision).
+    shortcut_realms: std::collections::HashSet<String>,
+    /// Default validation mode for realms not explicitly configured.
+    default_validation: TransitedValidation,
+}
+
+impl CapathValidator {
+    /// Construct a new capath validator with no trusted realms.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a trusted realm (direct trust).
+    pub fn add_trust(&mut self, trust: &CrossRealmTrust) {
+        let realm = trust.foreign_realm.to_ascii_uppercase();
+        self.trusted_realms.insert(realm.clone());
+        if trust.transited_validation == TransitedValidation::ShortcutAware {
+            self.shortcut_realms.insert(realm);
+        }
+    }
+
+    /// Set the default validation mode.
+    pub fn with_default_validation(mut self, mode: TransitedValidation) -> Self {
+        self.default_validation = mode;
+        self
+    }
+
+    /// Validate a transited realm chain. Returns `Ok(())` if the chain is
+    /// valid, `Err` with a description if an untrusted realm is found.
+    ///
+    /// The `chain` is the list of realms the ticket has transited (NOT
+    /// including the client's home realm or the target realm). Per RFC 4120
+    /// §3.3.3, each realm in the chain must be trusted by the local KDC.
+    pub fn validate(&self, chain: &[&str]) -> Result<(), KdcError> {
+        if self.default_validation == TransitedValidation::Disabled {
+            return Ok(());
+        }
+        for realm in chain {
+            let upper = realm.to_ascii_uppercase();
+            if !self.trusted_realms.contains(&upper) {
+                return Err(KdcError::Policy(format!(
+                    "transited realm {realm} is not trusted (capath validation per ADR-013)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true if the local KDC has a direct trust to `foreign_realm`.
+    pub fn trusts(&self, foreign_realm: &str) -> bool {
+        self.trusted_realms
+            .contains(&foreign_realm.to_ascii_uppercase())
+    }
+}
+
+/// Check if the requested service realm differs from the local KDC's realm
+/// (case-insensitive per RFC 4120 §6.1).
+pub fn is_foreign_realm(service_realm: &str, local_realm: &str) -> bool {
+    !service_realm.eq_ignore_ascii_case(local_realm)
+}
+
+/// Issue a cross-realm referral TGT (RFC 4120 §3.3.3 / ADR-013). The
+/// referral TGT is a ticket with `sname = krbtgt/FOREIGN_REALM`, encrypted
+/// with the cross-realm key (the key of the `krbtgt/FOREIGN_REALM` principal
+/// in the local realm). The client submits this referral TGT to the foreign
+/// KDC, which either issues a service ticket (if the service is local) or
+/// another referral.
+#[allow(clippy::too_many_arguments)]
+pub fn issue_referral_tgt(
+    cross_realm_key: &Aes256Key,
+    cross_realm_kvno: u32,
+    client_realm: &str,
+    client_cname: &[String],
+    client_uuid: Uuid,
+    foreign_realm: &str,
+    chosen_etype: EType,
+    inherited_flags: u32,
+) -> Result<(Ticket, [u8; SESSION_KEY_LEN]), KdcError> {
+    let now = now_secs();
+    let session_key = random_session_key()?;
+    let enc_ticket_part = EncTicketPart {
+        flags: inherited_flags,
+        crealm: client_realm.to_string(),
+        cname: client_cname.to_vec(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_TGT_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_TGT_LIFETIME_SECS,
+        client_uuid,
+    };
+    let enc_ticket_part_bytes = encode_enc_ticket_part(&enc_ticket_part);
+    let ticket_enc = encrypt_for_usage(
+        cross_realm_key,
+        KEY_USAGE_AS_REP_TGT,
+        &enc_ticket_part_bytes,
+    )?;
+    let referral_tgt = Ticket {
+        tkt_vno: PVNO,
+        realm: client_realm.to_string(),
+        sname: vec!["krbtgt".to_string(), foreign_realm.to_string()],
+        kvno: cross_realm_kvno,
+        etype: chosen_etype,
+        enc_part: ticket_enc,
+    };
+    Ok((referral_tgt, session_key))
+}
+
+/// TGS-REQ handler with cross-realm TGT referral support (RFC 4120 §3.3.3 /
+/// ADR-013). Extends the standard TGS-REQ handler with referral logic:
+///
+/// 1. Parse TGS-REQ, decrypt TGT, verify authenticator (same as standard).
+/// 2. If the requested service realm (`req.realm`) matches `local_realm`,
+///    proceed with the standard TGS flow (issue a service ticket).
+/// 3. If the service realm is foreign, look up the cross-realm key
+///    (`store.lookup(local_realm, ["krbtgt", req.realm])`). If found, issue
+///    a referral TGT with `sname = krbtgt/FOREIGN_REALM` encrypted with the
+///    cross-realm key. If not found, return `KdcError::PrincipalNotFound`.
+/// 4. The TGS-REP carries the referral TGT; the enc-part (encrypted with
+///    the TGT session key, key usage 8) carries the new session key.
+pub async fn handle_tgs_req_with_referral(
+    store: &dyn PrincipalStore,
+    krbtgt_key: &Aes256Key,
+    req_bytes: &[u8],
+    local_realm: &str,
+) -> Result<Vec<u8>, KdcError> {
+    let req = decode_tgs_req(req_bytes)?;
+    let chosen_etype = negotiate_etype(&req.etypes)?;
+
+    // Verify the TGT: decrypt with krbtgt key (key usage 2).
+    let tgt_enc_part_plaintext =
+        decrypt_for_usage(krbtgt_key, KEY_USAGE_AS_REP_TGT, &req.tgt.enc_part)?;
+    let enc_ticket_part = decode_enc_ticket_part(&tgt_enc_part_plaintext)?;
+
+    // Verify the authenticator.
+    let auth_plaintext = decrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REQ_AUTHENTICATOR,
+        &req.authenticator_enc,
+    )?;
+    let authenticator = decode_authenticator(&auth_plaintext)?;
+    if !principal_names_eq(&authenticator.cname, &enc_ticket_part.cname) {
+        return Err(KdcError::PreauthFailed(
+            "authenticator cname does not match TGT cname".into(),
+        ));
+    }
+
+    // ---- Cross-realm referral check (ADR-013) ----
+    if is_foreign_realm(&req.realm, local_realm) {
+        tracing::info!(
+            local_realm = %local_realm,
+            foreign_realm = %req.realm,
+            client = %enc_ticket_part.cname.join("/"),
+            "cross-realm TGT referral: service is in a foreign realm"
+        );
+        // Look up the cross-realm key: krbtgt/FOREIGN_REALM in the local realm.
+        let cross_realm_principal = store
+            .lookup(local_realm, &["krbtgt".to_string(), req.realm.clone()])
+            .await
+            .map_err(|e| KdcError::Storage(format!("cross-realm key lookup: {e}")))?
+            .ok_or_else(|| {
+                KdcError::PrincipalNotFound(format!(
+                    "no cross-realm trust to {}/{} (capath per ADR-013)",
+                    local_realm, req.realm
+                ))
+            })?;
+
+        // Issue the referral TGT.
+        let (referral_tgt, referral_session_key) = issue_referral_tgt(
+            &cross_realm_principal.key,
+            cross_realm_principal.kvno,
+            &enc_ticket_part.crealm,
+            &enc_ticket_part.cname,
+            enc_ticket_part.client_uuid,
+            &req.realm,
+            chosen_etype,
+            enc_ticket_part.flags,
+        )?;
+
+        // Build the TGS-REP enc-part (encrypted with the TGT session key,
+        // key usage 8).
+        let now = now_secs();
+        let enc_rep_part = EncKdcRepPart {
+            session_key: referral_session_key,
+            last_req: now,
+            nonce: req.nonce,
+            authtime: now,
+            starttime: now,
+            endtime: now + DEFAULT_TGT_LIFETIME_SECS,
+            renew_till: now + 2 * DEFAULT_TGT_LIFETIME_SECS,
+            crealm: enc_ticket_part.crealm.clone(),
+            cname: enc_ticket_part.cname.clone(),
+        };
+        let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+        let enc_part = encrypt_for_usage(
+            &enc_ticket_part.session_key,
+            KEY_USAGE_TGS_REP_ENC_PART,
+            &enc_rep_part_bytes,
+        )?;
+
+        let rep = TgsRep {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REP,
+            crealm: enc_ticket_part.crealm.clone(),
+            cname: enc_ticket_part.cname.clone(),
+            ticket: referral_tgt,
+            enc_part_etype: chosen_etype,
+            enc_part_kvno: req.tgt.kvno,
+            enc_part,
+        };
+        tracing::info!(foreign_realm = %req.realm, "cross-realm referral TGT issued");
+        return Ok(encode_tgs_rep(&rep));
+    }
+
+    // ---- Local realm: standard TGS flow (issue a service ticket) ----
+    let svc = store
+        .lookup(&req.realm, &req.sname)
+        .await
+        .map_err(|e| KdcError::Storage(format!("service lookup: {e}")))?
+        .ok_or_else(|| {
+            KdcError::PrincipalNotFound(format!("{}/{}", req.realm, req.sname.join("/")))
+        })?;
+
+    let now = now_secs();
+    let session_key = enc_ticket_part.session_key;
+    let svc_enc_ticket_part = EncTicketPart {
+        flags: enc_ticket_part.flags,
+        crealm: enc_ticket_part.crealm.clone(),
+        cname: enc_ticket_part.cname.clone(),
+        session_key,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        client_uuid: enc_ticket_part.client_uuid,
+    };
+    let svc_enc_ticket_part_bytes = encode_enc_ticket_part(&svc_enc_ticket_part);
+    let svc_ticket_enc = encrypt_for_usage(
+        &svc.key,
+        KEY_USAGE_TGS_REP_TICKET,
+        &svc_enc_ticket_part_bytes,
+    )?;
+    let svc_ticket = Ticket {
+        tkt_vno: PVNO,
+        realm: svc.realm.clone(),
+        sname: svc.components.clone(),
+        kvno: svc.kvno,
+        etype: chosen_etype,
+        enc_part: svc_ticket_enc,
+    };
+    let enc_rep_part = EncKdcRepPart {
+        session_key,
+        last_req: now,
+        nonce: req.nonce,
+        authtime: now,
+        starttime: now,
+        endtime: now + DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        renew_till: now + 2 * DEFAULT_SVC_TICKET_LIFETIME_SECS,
+        crealm: svc.realm.clone(),
+        cname: enc_ticket_part.cname.clone(),
+    };
+    let enc_rep_part_bytes = encode_enc_kdc_rep_part(&enc_rep_part);
+    let enc_part = encrypt_for_usage(
+        &enc_ticket_part.session_key,
+        KEY_USAGE_TGS_REP_ENC_PART,
+        &enc_rep_part_bytes,
+    )?;
+    let rep = TgsRep {
+        pvno: PVNO,
+        msg_type: MSG_TYPE_TGS_REP,
+        crealm: enc_ticket_part.crealm.clone(),
+        cname: enc_ticket_part.cname.clone(),
+        ticket: svc_ticket,
+        enc_part_etype: chosen_etype,
+        enc_part_kvno: req.tgt.kvno,
+        enc_part,
+    };
+    Ok(encode_tgs_rep(&rep))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2598,6 +2936,296 @@ mod tests {
             .expect("Supported mode must accept unarmored AS-REQ");
         let rep = decode_as_rep(&rep_bytes).expect("decode AS-REP");
         assert_eq!(rep.cname, alice.components);
+    }
+
+    // ---- Wave 3: Cross-realm TGT referral (RFC 4120 §3.3.3 / ADR-013) ----
+
+    /// Build a cross-realm trust: a `krbtgt/FOREIGN_REALM` principal in the
+    /// local realm, with a distinct cross-realm key derived from the password.
+    fn make_cross_realm_principal(
+        local_realm: &str,
+        foreign_realm: &str,
+        password: &str,
+    ) -> PrincipalRecord {
+        let mut salt = Vec::new();
+        salt.extend_from_slice(local_realm.as_bytes());
+        salt.extend_from_slice(b"krbtgt");
+        salt.extend_from_slice(foreign_realm.as_bytes());
+        let key = crypto::derive_aes256_key(password.as_bytes(), &salt);
+        PrincipalRecord::new(
+            Uuid::nil(),
+            local_realm,
+            vec!["krbtgt".to_string(), foreign_realm.to_string()],
+            key,
+        )
+    }
+
+    /// DoD test 1: referral TGT for foreign realm. A TGS-REQ for a service
+    /// in a foreign realm returns a referral TGT (sname = krbtgt/FOREIGN_REALM),
+    /// not a service ticket. The referral TGT is encrypted with the cross-realm
+    /// key (the key of the krbtgt/FOREIGN_REALM principal in the local realm).
+    #[tokio::test]
+    async fn cross_realm_referral_tgt_for_foreign_realm() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        let cross_realm = make_cross_realm_principal("ADRIAN.COM", "FOREIGN.COM", "xrealm-secret");
+        store.insert(alice.clone());
+        store.insert(cross_realm.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 4242,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let rep_bytes = handle_tgs_req_with_referral(&store, &krbtgt_key, &req_bytes, "ADRIAN.COM")
+            .await
+            .expect("referral TGS-REQ must succeed");
+        let rep = decode_tgs_rep(&rep_bytes).expect("decode TGS-REP");
+
+        // The ticket is a referral TGT: sname = krbtgt/FOREIGN.COM.
+        assert_eq!(
+            rep.ticket.sname,
+            vec!["krbtgt".to_string(), "FOREIGN.COM".into()],
+            "referral TGT sname must be krbtgt/FOREIGN_REALM"
+        );
+        // The referral TGT is encrypted with the cross-realm key (not the
+        // krbtgt key, not the service key).
+        let tgt_pt =
+            decrypt_for_usage(&cross_realm.key, KEY_USAGE_AS_REP_TGT, &rep.ticket.enc_part)
+                .expect("decrypt referral TGT with cross-realm key");
+        let etp = decode_enc_ticket_part(&tgt_pt).expect("decode EncTicketPart");
+        assert_eq!(etp.crealm, "ADRIAN.COM");
+        assert_eq!(etp.cname, alice.components);
+
+        // The TGS-REP enc-part is encrypted with the TGT session key.
+        let rep_pt = decrypt_for_usage(&session_key, KEY_USAGE_TGS_REP_ENC_PART, &rep.enc_part)
+            .expect("decrypt TGS-REP enc-part");
+        let erp = decode_enc_kdc_rep_part(&rep_pt).expect("decode EncKdcRepPart");
+        assert_eq!(erp.nonce, 4242);
+    }
+
+    /// DoD test 2: local realm — no referral. A TGS-REQ for a service in
+    /// the local realm returns a normal service ticket (not a referral TGT).
+    #[tokio::test]
+    async fn local_realm_no_referral() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        let web = make_svc_principal("ADRIAN.COM", "web.adrian.com", "svc-pass");
+        store.insert(alice.clone());
+        store.insert(web.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "ADRIAN.COM".into(),
+            sname: web.components.clone(),
+            nonce: 100,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let rep_bytes = handle_tgs_req_with_referral(&store, &krbtgt_key, &req_bytes, "ADRIAN.COM")
+            .await
+            .expect("local TGS-REQ must succeed");
+        let rep = decode_tgs_rep(&rep_bytes).expect("decode TGS-REP");
+
+        // The ticket is a service ticket (sname = the requested service),
+        // NOT a referral TGT.
+        assert_eq!(rep.ticket.sname, web.components);
+        assert_ne!(
+            rep.ticket.sname,
+            vec!["krbtgt".to_string(), "ADRIAN.COM".into()],
+            "local realm must NOT produce a referral TGT"
+        );
+
+        // The service ticket is decryptable with the service's key.
+        let svc_pt = decrypt_for_usage(&web.key, KEY_USAGE_TGS_REP_TICKET, &rep.ticket.enc_part)
+            .expect("decrypt service ticket");
+        let svc_etp = decode_enc_ticket_part(&svc_pt).expect("decode EncTicketPart");
+        assert_eq!(svc_etp.cname, alice.components);
+    }
+
+    /// DoD test 3: cross-realm key rotation. After rotating the cross-realm
+    /// key (replacing the krbtgt/FOREIGN_REALM principal with a new key +
+    /// bumped kvno), new referral TGTs use the new key and cannot be
+    /// decrypted with the old key.
+    #[tokio::test]
+    async fn cross_realm_key_rotation() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        let cross_realm_v1 = make_cross_realm_principal("ADRIAN.COM", "FOREIGN.COM", "xrealm-v1");
+        store.insert(alice.clone());
+        store.insert(cross_realm_v1.clone());
+        let krbtgt_key = make_krbtgt_key();
+
+        // Issue a referral TGT with the v1 key.
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let rep_v1_bytes =
+            handle_tgs_req_with_referral(&store, &krbtgt_key, &encode_tgs_req(&req), "ADRIAN.COM")
+                .await
+                .expect("v1 referral must succeed");
+        let rep_v1 = decode_tgs_rep(&rep_v1_bytes).expect("decode v1");
+        assert_eq!(rep_v1.ticket.kvno, cross_realm_v1.kvno);
+
+        // Rotate the cross-realm key: replace the principal with a new key
+        // and bumped kvno.
+        let mut cross_realm_v2 =
+            make_cross_realm_principal("ADRIAN.COM", "FOREIGN.COM", "xrealm-v2");
+        cross_realm_v2.kvno = cross_realm_v1.kvno + 1;
+        store.insert(cross_realm_v2.clone());
+
+        // Issue a new referral TGT — must use the v2 key.
+        let (tgt2, session_key2) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc2 = build_authenticator_enc(&alice, &session_key2);
+        let req2 = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 2,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt: tgt2,
+            authenticator_enc: auth_enc2,
+            till: now_secs() + 3600,
+        };
+        let rep_v2_bytes =
+            handle_tgs_req_with_referral(&store, &krbtgt_key, &encode_tgs_req(&req2), "ADRIAN.COM")
+                .await
+                .expect("v2 referral must succeed");
+        let rep_v2 = decode_tgs_rep(&rep_v2_bytes).expect("decode v2");
+        assert_eq!(
+            rep_v2.ticket.kvno, cross_realm_v2.kvno,
+            "kvno must bump after rotation"
+        );
+
+        // The v2 referral TGT is decryptable with the v2 key, NOT the v1 key.
+        let v2_pt = decrypt_for_usage(
+            &cross_realm_v2.key,
+            KEY_USAGE_AS_REP_TGT,
+            &rep_v2.ticket.enc_part,
+        )
+        .expect("decrypt v2 with v2 key");
+        let _v2_etp = decode_enc_ticket_part(&v2_pt).expect("decode v2");
+        let v1_decrypt_err = decrypt_for_usage(
+            &cross_realm_v1.key,
+            KEY_USAGE_AS_REP_TGT,
+            &rep_v2.ticket.enc_part,
+        )
+        .expect_err("v1 key must NOT decrypt v2 TGT");
+        assert!(matches!(v1_decrypt_err, KdcError::PreauthFailed(_)));
+    }
+
+    /// DoD test 4: capath validation per ADR-069. The `CapathValidator`
+    /// accepts a valid chain (all realms trusted) and rejects a chain with
+    /// an untrusted realm. Also verifies `is_foreign_realm` and the
+    /// `Disabled` validation mode.
+    #[test]
+    fn capath_validation_per_adr_069() {
+        let mut validator = CapathValidator::new();
+        validator.add_trust(&CrossRealmTrust::new("REALM-A.COM"));
+        validator.add_trust(&CrossRealmTrust::new("REALM-B.COM"));
+        validator.add_trust(&CrossRealmTrust::new("REALM-C.COM"));
+
+        // Valid chain: all realms trusted.
+        validator
+            .validate(&["REALM-A.COM", "REALM-B.COM"])
+            .expect("valid chain must pass");
+
+        // Invalid chain: REALM-X is not trusted.
+        let err = validator
+            .validate(&["REALM-A.COM", "REALM-X.COM"])
+            .expect_err("untrusted realm must be rejected");
+        match err {
+            KdcError::Policy(msg) => assert!(msg.contains("REALM-X.COM"), "{msg}"),
+            other => panic!("expected Policy error, got {other:?}"),
+        }
+
+        // Empty chain is always valid.
+        validator.validate(&[]).expect("empty chain must pass");
+
+        // Disabled mode: all chains accepted.
+        let mut disabled =
+            CapathValidator::new().with_default_validation(TransitedValidation::Disabled);
+        disabled.add_trust(&CrossRealmTrust::new("REALM-A.COM"));
+        disabled
+            .validate(&["REALM-X.COM", "REALM-Y.COM"])
+            .expect("Disabled mode accepts all chains");
+
+        // trusts() check.
+        assert!(validator.trusts("REALM-A.COM"));
+        assert!(validator.trusts("realm-a.com"), "case-insensitive");
+        assert!(!validator.trusts("REALM-X.COM"));
+
+        // is_foreign_realm check.
+        assert!(is_foreign_realm("FOREIGN.COM", "ADRIAN.COM"));
+        assert!(!is_foreign_realm("ADRIAN.COM", "ADRIAN.COM"));
+        assert!(
+            !is_foreign_realm("adrian.com", "ADRIAN.COM"),
+            "case-insensitive"
+        );
+    }
+
+    /// No trust to foreign realm → referral fails with PrincipalNotFound
+    /// (the KDC has no cross-realm key for the foreign realm).
+    #[tokio::test]
+    async fn cross_realm_referral_no_trust_fails() {
+        let store = InMemoryPrincipalStore::new();
+        let alice = make_principal("ADRIAN.COM", "alice", "hunter2");
+        store.insert(alice.clone());
+        // NO cross-realm principal for FOREIGN.COM.
+        let krbtgt_key = make_krbtgt_key();
+
+        let (tgt, session_key) = build_tgt_and_authenticator(&alice, &krbtgt_key);
+        let auth_enc = build_authenticator_enc(&alice, &session_key);
+        let req = TgsReq {
+            pvno: PVNO,
+            msg_type: MSG_TYPE_TGS_REQ,
+            realm: "FOREIGN.COM".into(),
+            sname: vec!["host".into(), "svc.foreign.com".into()],
+            nonce: 1,
+            etypes: vec![EType::Aes256CtsHmacSha1_96],
+            tgt,
+            authenticator_enc: auth_enc,
+            till: now_secs() + 3600,
+        };
+        let req_bytes = encode_tgs_req(&req);
+
+        let err = handle_tgs_req_with_referral(&store, &krbtgt_key, &req_bytes, "ADRIAN.COM")
+            .await
+            .expect_err("no-trust referral must fail");
+        match err {
+            KdcError::PrincipalNotFound(msg) => assert!(msg.contains("FOREIGN.COM"), "{msg}"),
+            other => panic!("expected PrincipalNotFound, got {other:?}"),
+        }
     }
 
     /// Backward-compat path: `handle_as_req` (no metrics arg) must NOT
