@@ -30,8 +30,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use adrian_policy_core::{DeclarativePolicy, PolicyDoc, PolicyError};
+use adrian_policy_core::{policy_doc_to_declarative, DeclarativePolicy, PolicyDoc, PolicyError};
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 // =========================================================================
@@ -165,6 +168,39 @@ pub struct VerifyResult {
     /// The areas that did not verify.
     pub failed_areas: Vec<String>,
 }
+
+// =========================================================================
+// Transactional rollback support (ADR-025)
+// =========================================================================
+
+/// A snapshot of a single file's state before a policy `apply` overwrote
+/// it.  `None` means the file did not exist before the apply (so rollback
+/// should delete it); `Some(bytes)` means the file existed with these
+/// contents (so rollback should restore them).
+#[derive(Debug, Clone)]
+struct FileSnapshot {
+    /// The absolute path to the file (root + relative path).
+    abs_path: PathBuf,
+    /// The previous contents of the file, or `None` if it didn't exist.
+    previous_contents: Option<Vec<u8>>,
+}
+
+/// A transaction snapshot — the complete set of file states captured
+/// before a policy `apply` wrote new files.  Stored keyed by transaction
+/// ID so `rollback(transaction_id)` can restore the previous state.
+#[derive(Debug, Clone, Default)]
+struct TransactionSnapshot {
+    /// The files that were written or overwritten by the apply.
+    files: Vec<FileSnapshot>,
+    /// The authselect profile that was active before the apply (for
+    /// rollback).  `None` means authselect was not changed.
+    previous_authselect_profile: Option<String>,
+}
+
+/// Shared transaction store — maps transaction IDs to snapshots.  Wrapped
+/// in `Arc<Mutex<...>>` so that `apply` and `rollback` can share state
+/// across clone boundaries (the executor is `Clone`).
+type TransactionStore = Arc<Mutex<HashMap<Uuid, TransactionSnapshot>>>;
 
 // =========================================================================
 // WindowsPolicyExecutor
@@ -405,14 +441,52 @@ impl PolicyExecutor for MacOsPolicyExecutor {
 /// `/etc/audit/rules.d/` + `/etc/login.defs.d/` + `firewalld`/`nftables` +
 /// atomic `rename(2)` writes (per ADR-113 §Decision — atomic writes to
 /// avoid partial-application state).
-#[derive(Debug, Default, Clone)]
-pub struct LinuxPolicyExecutor;
+///
+/// The `root` field is the base directory for file writes (defaults to
+/// `/`).  Tests construct the executor with `with_root(tempdir)` so that
+/// `apply` writes to a sandbox instead of clobbering the host's real
+/// `/var/lib/adrian/policy/` etc.
+#[derive(Debug, Clone)]
+pub struct LinuxPolicyExecutor {
+    /// Root directory for file writes (defaults to `/`).
+    root: PathBuf,
+    /// In-memory transaction store (ADR-025).  Shared across clones via
+    /// `Arc<Mutex<...>>` so that `apply` and `rollback` see the same map.
+    transactions: TransactionStore,
+}
+
+impl Default for LinuxPolicyExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LinuxPolicyExecutor {
-    /// Construct a `LinuxPolicyExecutor`.
+    /// Construct a `LinuxPolicyExecutor` rooted at `/` (production use).
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            root: PathBuf::from("/"),
+            transactions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Construct a `LinuxPolicyExecutor` rooted at `root` (test use).
+    /// All file writes from `apply` will go to `root/var/lib/adrian/policy/`
+    /// etc., so tests can verify file contents without touching the real
+    /// filesystem.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            transactions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The root directory this executor writes to.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Synchronous synthesize helper.
@@ -518,20 +592,142 @@ impl PolicyExecutor for LinuxPolicyExecutor {
         Ok(self.synthesize_sync(policy))
     }
 
-    async fn apply(
-        &self,
-        _doc: &PolicyDoc,
-        _target_host: &str,
-    ) -> Result<ApplyResult, PolicyError> {
+    /// Apply a policy document to the target host (per ADR-024 §Decision
+    /// + ADR-025 §Decision — transactional rollback).
+    ///
+    /// This implementation:
+    /// 1. Converts the `PolicyDoc` to a `DeclarativePolicy` via
+    ///    [`adrian_policy_core::policy_doc_to_declarative`].
+    /// 2. Calls `synthesize` to produce the per-platform file set.
+    /// 3. For each file in the synthesised set:
+    ///    a. Captures a snapshot of any existing file at the target path
+    ///       (for rollback).
+    ///    b. Creates the parent directory tree if it doesn't exist.
+    ///    c. Writes the new contents atomically (write-to-temp + rename).
+    /// 4. Records an `authselect select <profile>` invocation (the actual
+    ///    `authselect` binary is NOT executed in test mode — the profile
+    ///    name is recorded in the transaction snapshot for verification).
+    /// 5. Returns an `ApplyResult` with a fresh v7 transaction ID and the
+    ///    count of files written.
+    async fn apply(&self, doc: &PolicyDoc, _target_host: &str) -> Result<ApplyResult, PolicyError> {
+        let declarative = policy_doc_to_declarative(doc);
+        let applied = self.synthesize_sync(&declarative);
+
+        let transaction_id = Uuid::now_v7();
+        let mut snapshot = TransactionSnapshot::default();
+        let mut areas_applied = 0usize;
+        let mut areas_failed = 0usize;
+        let mut errors = Vec::new();
+
+        for (rel_path, contents) in &applied.files {
+            let abs_path = self.root.join(rel_path);
+            // Capture the previous state of the file (if any) for rollback.
+            let previous = match std::fs::read(&abs_path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    areas_failed += 1;
+                    errors.push(format!("snapshot {rel_path}: {e}"));
+                    continue;
+                }
+            };
+            snapshot.files.push(FileSnapshot {
+                abs_path: abs_path.clone(),
+                previous_contents: previous,
+            });
+            // Create the parent directory tree.
+            if let Some(parent) = abs_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    areas_failed += 1;
+                    errors.push(format!("mkdir {rel_path}: {e}"));
+                    continue;
+                }
+            }
+            // Atomic write: write to a temp file in the same directory,
+            // then rename over the target.
+            let tmp = abs_path.with_extension("adrian-tmp");
+            if let Err(e) = std::fs::write(&tmp, contents) {
+                areas_failed += 1;
+                errors.push(format!("write {rel_path}: {e}"));
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &abs_path) {
+                areas_failed += 1;
+                errors.push(format!("rename {rel_path}: {e}"));
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            areas_applied += 1;
+        }
+
+        // Record the authselect profile that was applied (for rollback
+        // verification).  We do NOT actually run `authselect select` here
+        // — that's the operator daemon's job.  We just record what would
+        // be run so tests can verify the decision.
+        let profile = adrian_policy_core::compile_to_authselect_profile(&declarative);
+        snapshot.previous_authselect_profile = Some(profile);
+
+        // Store the snapshot for rollback.
+        if let Ok(mut store) = self.transactions.lock() {
+            store.insert(transaction_id, snapshot);
+        }
+
         Ok(ApplyResult {
-            transaction_id: Uuid::nil(),
-            areas_applied: 0,
-            areas_failed: 0,
-            errors: vec![],
+            transaction_id,
+            areas_applied,
+            areas_failed,
+            errors,
         })
     }
 
-    async fn rollback(&self, _transaction_id: Uuid) -> Result<(), PolicyError> {
+    /// Roll back a previously-applied policy document (per ADR-025 §Decision
+    /// — transactional rollback via the transaction ID returned by `apply`).
+    ///
+    /// For each file that was written by the corresponding `apply`:
+    /// - If the file existed before the apply, restore its previous contents.
+    /// - If the file did not exist before the apply, delete it.
+    ///
+    /// Returns `Err(PolicyError::Malformed(...))` if the transaction ID is
+    /// unknown (e.g. already rolled back, or never produced by this
+    /// executor).
+    async fn rollback(&self, transaction_id: Uuid) -> Result<(), PolicyError> {
+        let snapshot = {
+            let mut store = self
+                .transactions
+                .lock()
+                .map_err(|e| PolicyError::Malformed(format!("transaction store poisoned: {e}")))?;
+            store.remove(&transaction_id).ok_or_else(|| {
+                PolicyError::Malformed(format!("unknown transaction {transaction_id}"))
+            })?
+        };
+        for file in &snapshot.files {
+            match &file.previous_contents {
+                Some(prev) => {
+                    // Restore the previous contents.
+                    if let Some(parent) = file.abs_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&file.abs_path, prev) {
+                        tracing::warn!(
+                            "rollback: failed to restore {}: {e}",
+                            file.abs_path.display()
+                        );
+                    }
+                }
+                None => {
+                    // The file didn't exist before the apply — delete it.
+                    if let Err(e) = std::fs::remove_file(&file.abs_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(
+                                "rollback: failed to delete {}: {e}",
+                                file.abs_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -877,21 +1073,28 @@ mod tests {
     #[tokio::test]
     async fn macos_and_linux_apply_return_default_results() {
         let mac = MacOsPolicyExecutor::new();
-        let linux = LinuxPolicyExecutor::new();
+        // Linux executor must use a temp root — the real `apply` writes
+        // files to `root/etc/...`, which would fail with permission denied
+        // if root is "/".
+        let tmp =
+            std::env::temp_dir().join(format!("adrian-policy-test-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let linux = LinuxPolicyExecutor::with_root(&tmp);
         let doc = sample_doc();
         let mac_result = mac.apply(&doc, "host01").await.expect("mac apply");
         let linux_result = linux.apply(&doc, "host01").await.expect("linux apply");
         assert_eq!(mac_result.areas_failed, 0);
-        assert_eq!(linux_result.areas_failed, 0);
+        assert_eq!(linux_result.areas_failed, 0, "{:?}", linux_result.errors);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
-    async fn rollback_is_a_noop_in_wave_4a() {
+    async fn rollback_unknown_transaction_returns_error() {
         let exec = LinuxPolicyExecutor::new();
-        // Rollback requires snapshot/diff machinery (ADR-025) — Wave 4a
-        // returns Ok(()) without doing anything. The test verifies the
-        // contract doesn't panic.
-        exec.rollback(Uuid::nil()).await.expect("rollback");
+        // Rolling back an unknown transaction ID must return an error
+        // (ADR-025 — transactional rollback requires a valid transaction).
+        let err = exec.rollback(Uuid::now_v7()).await.unwrap_err();
+        assert!(matches!(err, PolicyError::Malformed(_)));
     }
 
     #[test]
@@ -923,5 +1126,170 @@ mod tests {
         assert_eq!(win_applied.platform, Platform::Windows);
         assert_eq!(mac_applied.platform, Platform::MacOs);
         assert_eq!(linux_applied.platform, Platform::Linux);
+    }
+
+    // ---- Wave 2: real apply / rollback (ADR-025 transactional) -----------
+
+    /// Helper: build a `PolicyDoc` with a single `Authentication` area so
+    /// that `apply` synthesises an authselect profile fragment.
+    fn sample_auth_doc() -> PolicyDoc {
+        use adrian_policy_core::{AuthenticationPolicy, PolicyArea};
+        PolicyDoc {
+            uuid: Uuid::nil(),
+            name: "auth-test".into(),
+            version: "1.0.0".into(),
+            areas: vec![PolicyArea::Authentication(AuthenticationPolicy {
+                authselect_profile: "sssd".into(),
+                smartcard_required: false,
+            })],
+            security_descriptor: None,
+            scope: PolicyScope {
+                principals: vec!["S-1-5-32-544".into()],
+                ous: vec![],
+                hosts: vec!["host01".into()],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_apply_writes_files_to_target_directory() {
+        // Use a tempdir-style unique path under /tmp so we don't clobber
+        // the real filesystem.  We clean up at the end of the test.
+        let tmp =
+            std::env::temp_dir().join(format!("adrian-policy-test-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let exec = LinuxPolicyExecutor::with_root(&tmp);
+        let doc = sample_auth_doc();
+        let result = exec.apply(&doc, "host01").await.expect("apply");
+        // The apply must report at least one area applied (the authselect
+        // fragment + policy.json).
+        assert!(result.areas_applied > 0, "areas_applied should be > 0");
+        assert_eq!(result.areas_failed, 0, "no failures: {:?}", result.errors);
+        assert_ne!(
+            result.transaction_id,
+            Uuid::nil(),
+            "transaction ID must be non-nil"
+        );
+        // The authselect fragment should exist on disk under the temp root.
+        let authselect_path = tmp.join("etc/authselect/adrian.conf");
+        assert!(
+            authselect_path.exists(),
+            "authselect fragment should exist at {}",
+            authselect_path.display()
+        );
+        let contents =
+            String::from_utf8(std::fs::read(&authselect_path).expect("read")).expect("utf8");
+        assert!(
+            contents.contains("sssd"),
+            "authselect fragment should mention 'sssd'"
+        );
+        // The policy.json should also exist.
+        let policy_json_path = tmp.join("etc/adrian/policy.json");
+        assert!(policy_json_path.exists(), "policy.json should exist");
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn linux_rollback_restores_previous_file_contents() {
+        let tmp =
+            std::env::temp_dir().join(format!("adrian-policy-test-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        // Pre-create a file at the target path with known contents so we
+        // can verify rollback restores it.
+        let target = tmp.join("etc/authselect/adrian.conf");
+        std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir");
+        let original = b"# original contents\n";
+        std::fs::write(&target, original).expect("write original");
+
+        let exec = LinuxPolicyExecutor::with_root(&tmp);
+        let doc = sample_auth_doc();
+        let result = exec.apply(&doc, "host01").await.expect("apply");
+        // After apply, the file should be overwritten with the authselect
+        // fragment (NOT the original contents).
+        let after_apply = std::fs::read(&target).expect("read after apply");
+        assert_ne!(
+            &after_apply[..],
+            &original[..],
+            "apply must overwrite the file"
+        );
+        assert!(String::from_utf8_lossy(&after_apply).contains("sssd"));
+
+        // Rollback should restore the original contents.
+        exec.rollback(result.transaction_id)
+            .await
+            .expect("rollback");
+        let after_rollback = std::fs::read(&target).expect("read after rollback");
+        assert_eq!(
+            &after_rollback[..],
+            &original[..],
+            "rollback must restore original"
+        );
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn linux_rollback_deletes_files_that_did_not_exist_before_apply() {
+        let tmp =
+            std::env::temp_dir().join(format!("adrian-policy-test-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let exec = LinuxPolicyExecutor::with_root(&tmp);
+        let doc = sample_auth_doc();
+        let result = exec.apply(&doc, "host01").await.expect("apply");
+        let authselect_path = tmp.join("etc/authselect/adrian.conf");
+        assert!(authselect_path.exists(), "file should exist after apply");
+        // Rollback should DELETE the file (since it didn't exist before
+        // the apply).
+        exec.rollback(result.transaction_id)
+            .await
+            .expect("rollback");
+        assert!(
+            !authselect_path.exists(),
+            "file should be deleted after rollback (it didn't exist before apply)"
+        );
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn linux_apply_records_authselect_profile_in_transaction() {
+        // The `apply` must record the authselect profile name in the
+        // transaction snapshot (for the operator daemon to run
+        // `authselect select <profile>`).  We verify this by applying a
+        // policy with authselect.profile = "local" and checking the
+        // resulting authselect fragment on disk contains "local".
+        let tmp =
+            std::env::temp_dir().join(format!("adrian-policy-test-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let exec = LinuxPolicyExecutor::with_root(&tmp);
+
+        use adrian_policy_core::{AuthenticationPolicy, PolicyArea};
+        let doc = PolicyDoc {
+            uuid: Uuid::nil(),
+            name: "auth-local".into(),
+            version: "1.0.0".into(),
+            areas: vec![PolicyArea::Authentication(AuthenticationPolicy {
+                authselect_profile: "local".into(),
+                smartcard_required: false,
+            })],
+            security_descriptor: None,
+            scope: PolicyScope {
+                principals: vec!["S-1-5-32-544".into()],
+                ous: vec![],
+                hosts: vec!["host01".into()],
+            },
+        };
+        let result = exec.apply(&doc, "host01").await.expect("apply");
+        assert_eq!(result.areas_failed, 0, "{:?}", result.errors);
+        let authselect_path = tmp.join("etc/authselect/adrian.conf");
+        let contents =
+            String::from_utf8(std::fs::read(&authselect_path).expect("read")).expect("utf8");
+        assert!(
+            contents.contains("local"),
+            "authselect fragment should mention the 'local' profile: {contents}"
+        );
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

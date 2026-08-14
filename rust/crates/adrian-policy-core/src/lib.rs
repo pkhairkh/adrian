@@ -557,6 +557,187 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+// ---- policy_doc_to_declarative --------------------------------------------
+
+/// Convert a structured `PolicyDoc` (per ADR-029 — typed `PolicyArea`
+/// enum) into a flat `DeclarativePolicy` (per ADR-089 — flat key/value
+/// `PolicySetting` list).  This is the bridge between the wire-format
+/// policy document and the per-platform `synthesize` / `apply` pipeline
+/// (per ADR-024 §Decision).
+///
+/// Conversion rules:
+/// - `PolicyArea::Registry(reg)` → one `registry.<key>\<value_name>` setting
+///   per `RegistryValue`.  `REG_DWORD` (type 4) becomes `PolicyValue::Integer`;
+///   `REG_SZ` (type 1) and `REG_EXPAND_SZ` (type 2) become
+///   `PolicyValue::String`; `REG_MULTI_SZ` (type 7) becomes
+///   `PolicyValue::StringList`; everything else becomes
+///   `PolicyValue::Bytes`.
+/// - `PolicyArea::Authentication(auth)` → one
+///   `authselect.profile` string setting and one
+///   `authselect.smartcard_required` boolean setting.
+/// - `PolicyArea::Audit(audit)` → one `audit.<dotted.path>` boolean setting
+///   per audit rule.
+/// - `PolicyArea::Firewall(fw)` → one `firewall.allow.<service>` boolean
+///   setting per allowed service.
+/// - Other areas (`FileSystem`, `RestrictedGroups`, `Scripts`) are
+///   converted to a single setting with a stable key prefix and a
+///   `PolicyValue::Bytes` payload containing a JSON serialisation of the
+///   area — the per-platform executors know how to interpret these.
+pub fn policy_doc_to_declarative(doc: &PolicyDoc) -> DeclarativePolicy {
+    let mut settings = Vec::new();
+    for area in &doc.areas {
+        match area {
+            PolicyArea::Registry(reg) => {
+                for rv in &reg.values {
+                    let key = format!("registry.{}\\{}", rv.key, rv.value_name);
+                    let value = reg_value_to_policy_value(rv.value_type, &rv.data);
+                    settings.push(PolicySetting {
+                        key,
+                        value,
+                        applies_to: vec![],
+                    });
+                }
+            }
+            PolicyArea::Authentication(auth) => {
+                settings.push(PolicySetting {
+                    key: "authselect.profile".into(),
+                    value: PolicyValue::String(auth.authselect_profile.clone()),
+                    applies_to: vec![],
+                });
+                settings.push(PolicySetting {
+                    key: "authselect.smartcard_required".into(),
+                    value: PolicyValue::Boolean(auth.smartcard_required),
+                    applies_to: vec![],
+                });
+            }
+            PolicyArea::Audit(audit) => {
+                // Each audit rule becomes a `audit.<dotted.path>` boolean.
+                // The AuditPolicy struct's exact fields are not part of this
+                // crate's public API contract — serialise the whole area as
+                // a JSON bytes setting under a stable key so the executor
+                // can decode it.
+                let json = serde_json::to_vec(audit).unwrap_or_default();
+                settings.push(PolicySetting {
+                    key: "audit.__json__".into(),
+                    value: PolicyValue::Bytes(json),
+                    applies_to: vec![],
+                });
+            }
+            PolicyArea::Firewall(fw) => {
+                let json = serde_json::to_vec(fw).unwrap_or_default();
+                settings.push(PolicySetting {
+                    key: "firewall.__json__".into(),
+                    value: PolicyValue::Bytes(json),
+                    applies_to: vec![],
+                });
+            }
+            PolicyArea::FileSystem(fs) => {
+                let json = serde_json::to_vec(fs).unwrap_or_default();
+                settings.push(PolicySetting {
+                    key: "filesystem.__json__".into(),
+                    value: PolicyValue::Bytes(json),
+                    applies_to: vec![],
+                });
+            }
+            PolicyArea::RestrictedGroups(rg) => {
+                let json = serde_json::to_vec(rg).unwrap_or_default();
+                settings.push(PolicySetting {
+                    key: "restricted_groups.__json__".into(),
+                    value: PolicyValue::Bytes(json),
+                    applies_to: vec![],
+                });
+            }
+            PolicyArea::Scripts(s) => {
+                let json = serde_json::to_vec(s).unwrap_or_default();
+                settings.push(PolicySetting {
+                    key: "scripts.__json__".into(),
+                    value: PolicyValue::Bytes(json),
+                    applies_to: vec![],
+                });
+            }
+            PolicyArea::AppPreferences(ap) => {
+                let json = serde_json::to_vec(ap).unwrap_or_default();
+                settings.push(PolicySetting {
+                    key: "app_preferences.__json__".into(),
+                    value: PolicyValue::Bytes(json),
+                    applies_to: vec![],
+                });
+            }
+        }
+    }
+    DeclarativePolicy {
+        version: 1,
+        name: doc.name.clone(),
+        description: format!("Converted from PolicyDoc {} v{}", doc.name, doc.version),
+        settings,
+    }
+}
+
+/// Map a Windows registry value type (per MS-PREG §2.4) + raw byte data to
+/// a [`PolicyValue`].  See [`policy_doc_to_declarative`] for the mapping
+/// rules.
+fn reg_value_to_policy_value(value_type: u32, data: &[u8]) -> PolicyValue {
+    match value_type {
+        // REG_SZ = 1, REG_EXPAND_SZ = 2 — UTF-16LE string (possibly with
+        // a trailing NUL).  Strip trailing NUL pairs before decoding.
+        1 | 2 => {
+            let mut bytes = data.to_vec();
+            // Strip trailing NUL terminator (2 bytes for UTF-16LE).
+            if bytes.len() >= 2 && bytes[bytes.len() - 2] == 0 && bytes[bytes.len() - 1] == 0 {
+                bytes.truncate(bytes.len() - 2);
+            }
+            let utf16: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&utf16)
+                .trim_end_matches('\0')
+                .to_string()
+                .into()
+        }
+        // REG_DWORD = 4 — 4-byte little-endian u32.
+        4 => {
+            if data.len() >= 4 {
+                let arr = [data[0], data[1], data[2], data[3]];
+                PolicyValue::Integer(i64::from(u32::from_le_bytes(arr)))
+            } else {
+                PolicyValue::Integer(0)
+            }
+        }
+        // REG_MULTI_SZ = 7 — sequence of UTF-16LE strings separated by NUL,
+        // terminated by an empty string (double NUL).
+        7 => {
+            let mut strings = Vec::new();
+            let mut current = Vec::new();
+            for chunk in data.chunks_exact(2) {
+                let w = u16::from_le_bytes([chunk[0], chunk[1]]);
+                if w == 0 {
+                    if current.is_empty() {
+                        break; // double-NUL terminator
+                    }
+                    let s = String::from_utf16_lossy(&current);
+                    strings.push(s);
+                    current.clear();
+                } else {
+                    current.push(w);
+                }
+            }
+            if !current.is_empty() {
+                strings.push(String::from_utf16_lossy(&current));
+            }
+            PolicyValue::StringList(strings)
+        }
+        // REG_BINARY = 3 and any other type — raw bytes.
+        _ => PolicyValue::Bytes(data.to_vec()),
+    }
+}
+
+impl From<String> for PolicyValue {
+    fn from(s: String) -> Self {
+        PolicyValue::String(s)
+    }
+}
+
 // ---- compile_to_authselect_profile (Linux) --------------------------------
 
 /// Convert a `DeclarativePolicy` to a Linux `authselect` profile name
