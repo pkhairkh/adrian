@@ -24,6 +24,8 @@ tokio = { workspace = true }
 tracing.workspace = true
 bytes.workspace = true
 ldap3.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
@@ -31,3 +33,4 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 adrian-storage-testkit = { workspace = true }
 adrian-identity-testkit = { workspace = true }
 adrian-repl-testkit = { workspace = true }
+rcgen = "0.13"

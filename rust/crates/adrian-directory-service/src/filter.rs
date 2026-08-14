@@ -25,8 +25,9 @@
 
 use crate::ber::{
     self, decode_string_value, BerError, CONSTRUCTED, FILTER_AND, FILTER_APPROX, FILTER_EQUALITY,
-    FILTER_GE, FILTER_LE, FILTER_NOT, FILTER_OR, FILTER_PRESENT, FILTER_SUBSTRINGS, SUBSTRING_ANY,
-    SUBSTRING_FINAL, SUBSTRING_INITIAL, TAG_OCTET_STRING, TAG_SEQUENCE,
+    FILTER_EXTENSIBLE, FILTER_GE, FILTER_LE, FILTER_NOT, FILTER_OR, FILTER_PRESENT,
+    FILTER_SUBSTRINGS, SUBSTRING_ANY, SUBSTRING_FINAL, SUBSTRING_INITIAL, TAG_OCTET_STRING,
+    TAG_SEQUENCE,
 };
 use std::fmt;
 
@@ -77,6 +78,23 @@ pub enum Filter {
         attribute: String,
         /// The assertion value.
         value: Vec<u8>,
+    },
+    /// `extensibleMatch` — `(attr:rule:=value)` (`[9]` MatchingRuleAssertion,
+    /// per RFC 4511 §4.5.1). Allows the client to specify a matching rule
+    /// (e.g. `caseExactMatch`) and optionally include DN attributes in
+    /// the search.
+    ExtensibleMatch {
+        /// Optional matching rule OID (e.g. `caseExactMatch`). If `None`,
+        /// the server uses the attribute's default equality matching rule.
+        matching_rule: Option<String>,
+        /// Optional attribute description. If `None`, the rule applies to
+        /// all attributes (rarely used).
+        r#type: Option<String>,
+        /// The assertion value (raw bytes).
+        match_value: Vec<u8>,
+        /// If `true`, the server also matches against the DN components of
+        /// the entry (e.g. `CN=alice` in the DN itself). Default `false`.
+        dn_attributes: bool,
     },
 }
 
@@ -183,6 +201,27 @@ impl Filter {
                 ber::encode_tlv(TAG_SEQUENCE | CONSTRUCTED, &seq, &mut body);
                 ber::encode_tlv(FILTER_SUBSTRINGS, &body, out);
             }
+            Filter::ExtensibleMatch {
+                matching_rule,
+                r#type,
+                match_value,
+                dn_attributes,
+            } => {
+                let mut body = Vec::new();
+                if let Some(rule) = matching_rule {
+                    ber::encode_tlv(ber::EXT_MATCHING_RULE, rule.as_bytes(), &mut body);
+                }
+                if let Some(attr) = r#type {
+                    ber::encode_tlv(ber::EXT_TYPE, attr.as_bytes(), &mut body);
+                }
+                ber::encode_tlv(ber::EXT_MATCH_VALUE, match_value, &mut body);
+                if *dn_attributes {
+                    // dnAttributes is `[4] BOOLEAN DEFAULT FALSE` — emit
+                    // only when TRUE, wrapped in the [4] context tag.
+                    ber::encode_tlv(ber::EXT_DN_ATTRIBUTES, &[0xFF], &mut body);
+                }
+                ber::encode_tlv(FILTER_EXTENSIBLE, &body, out);
+            }
         }
     }
 
@@ -282,6 +321,43 @@ impl Filter {
                     substrings: subs,
                 })
             }
+            FILTER_EXTENSIBLE => {
+                // MatchingRuleAssertion ::= SEQUENCE {
+                //   matchingRule [1] OPTIONAL, type [2] OPTIONAL,
+                //   matchValue [3], dnAttributes [4] DEFAULT FALSE
+                // }
+                let mut matching_rule = None;
+                let mut ty = None;
+                let mut match_value = Vec::new();
+                let mut dn_attributes = false;
+                let mut rest = value;
+                while !rest.is_empty() {
+                    let (field_tlv, remaining) = ber::decode_tlv(rest)?;
+                    match field_tlv.tag {
+                        ber::EXT_MATCHING_RULE => {
+                            matching_rule = Some(decode_string_value(field_tlv.value)?);
+                        }
+                        ber::EXT_TYPE => {
+                            ty = Some(decode_string_value(field_tlv.value)?);
+                        }
+                        ber::EXT_MATCH_VALUE => {
+                            match_value = field_tlv.value.to_vec();
+                        }
+                        ber::EXT_DN_ATTRIBUTES => {
+                            dn_attributes =
+                                !field_tlv.value.is_empty() && field_tlv.value[0] != 0x00;
+                        }
+                        t => return Err(BerError::UnknownFilter(t)),
+                    }
+                    rest = remaining;
+                }
+                Ok(Filter::ExtensibleMatch {
+                    matching_rule,
+                    r#type: ty,
+                    match_value,
+                    dn_attributes,
+                })
+            }
             t => Err(BerError::UnknownFilter(t)),
         }
     }
@@ -331,6 +407,29 @@ impl fmt::Display for Filter {
             Filter::Present(attr) => write!(f, "({}=*)", attr),
             Filter::Approx { attribute, value } => {
                 write!(f, "({}~={})", attribute, escape_value(value))
+            }
+            Filter::ExtensibleMatch {
+                matching_rule,
+                r#type,
+                match_value,
+                dn_attributes,
+            } => {
+                // RFC 4515 §2: extensibleMatch has the form
+                // '(' attr [':dn'] [':' matchingRule] ':=' value ')'
+                // or '(' [':dn'] ':' matchingRule ':=' value ')'.
+                // The `:dn` modifier appears before the matchingRule.
+                f.write_str("(")?;
+                if let Some(attr) = r#type {
+                    f.write_str(attr)?;
+                }
+                if *dn_attributes {
+                    f.write_str(":dn")?;
+                }
+                if let Some(rule) = matching_rule {
+                    write!(f, ":{}", rule)?;
+                }
+                write!(f, ":={})", escape_value(match_value))?;
+                Ok(())
             }
         }
     }
@@ -463,15 +562,23 @@ fn parse_filter_inner(bytes: &[u8], pos: &mut usize) -> Result<Filter, FilterPar
 }
 
 /// Parse a simple filter `(attr=value)` / `(attr>=value)` / `(attr=*)` /
-/// `(attr=init*any*fin)` after the leading `(` has been consumed.
+/// `(attr=init*any*fin)` / `(attr:rule:=value)` after the leading `(` has
+/// been consumed.
 fn parse_simple_filter(bytes: &[u8], pos: &mut usize) -> Result<Filter, FilterParseError> {
-    // Read attribute name (up to =, <, >, ~, or ).
+    // Read attribute name (up to =, <, >, ~, :, or )). The `:` triggers
+    // the extensibleMatch branch.
     let attr_start = *pos;
-    while *pos < bytes.len() && !matches!(bytes[*pos], b'=' | b'<' | b'>' | b'~' | b')') {
+    while *pos < bytes.len() && !matches!(bytes[*pos], b'=' | b'<' | b'>' | b'~' | b':' | b')') {
         *pos += 1;
     }
     if *pos >= bytes.len() {
         return Err(FilterParseError::UnexpectedEof(*pos));
+    }
+    // Extensible match branch: `(attr [:rule] :=value [:dn])` — the `:`
+    // appears before any operator. The attr may also be empty (e.g.
+    // `(:rule:=value)`), in which case attr_start == *pos.
+    if bytes[*pos] == b':' {
+        return parse_extensible_filter(bytes, pos, attr_start);
     }
     let attr = std::str::from_utf8(&bytes[attr_start..*pos])
         .map_err(|_| FilterParseError::InvalidEscape(attr_start))?
@@ -613,6 +720,129 @@ fn parse_value(bytes: &[u8], pos: &mut usize) -> Result<ValueTokens, FilterParse
     } else {
         Ok(ValueTokens::Single(current))
     }
+}
+
+/// Parse an extensible-match filter `(attr:rule:=value[:dn])` /
+/// `(:rule:=value)` / `(attr:=value)` after the leading `(` and the
+/// attribute (possibly empty) have been consumed. `attr_start` is the
+/// byte position where the attribute (or `:` if empty) begins.
+///
+/// Per RFC 4515 §2:
+/// ```text
+/// extensible = ( attr [dnattrs]
+///                [':'] matchingRule [':='] value )
+///            | ( attr [':'] [dnattrs] ':=' value )
+///            | ( ':' [dnattrs] matchingRule [':='] value )
+/// ```
+/// The simplified grammar we accept is:
+/// `(attr? [:rule]? := value [:dn]?)`.
+fn parse_extensible_filter(
+    bytes: &[u8],
+    pos: &mut usize,
+    attr_start: usize,
+) -> Result<Filter, FilterParseError> {
+    // At entry, bytes[*pos] == b':'. The attribute (possibly empty)
+    // spans bytes[attr_start..*pos].
+    let attr = std::str::from_utf8(&bytes[attr_start..*pos])
+        .map_err(|_| FilterParseError::InvalidEscape(attr_start))?
+        .trim()
+        .to_string();
+    let r#type = if attr.is_empty() { None } else { Some(attr) };
+    // Consume the `:`.
+    *pos += 1;
+    // What follows is either:
+    //   `:=`            — no matchingRule; jump straight to value.
+    //   `rule :=`       — explicit matchingRule.
+    //   `dn :=`         — `:dn` modifier first, then `:=`.
+    //   `dn :rule :=`   — `:dn` modifier + rule + value.
+    let mut matching_rule = None;
+    let mut dn_attributes = false;
+    // Read tokens separated by `:` until we hit `:=`.
+    loop {
+        if *pos >= bytes.len() {
+            return Err(FilterParseError::UnexpectedEof(*pos));
+        }
+        // Read the token up to the next `:`.
+        let token_start = *pos;
+        while *pos < bytes.len() && bytes[*pos] != b':' && bytes[*pos] != b')' {
+            *pos += 1;
+        }
+        if *pos >= bytes.len() {
+            return Err(FilterParseError::UnexpectedEof(*pos));
+        }
+        let token = std::str::from_utf8(&bytes[token_start..*pos])
+            .map_err(|_| FilterParseError::InvalidEscape(token_start))?
+            .trim();
+        // Check for `:=` (value follows) or `:` (another token follows).
+        if *pos < bytes.len() && bytes[*pos] == b':' {
+            // Peek at the byte after `:` — if it's `=`, this is `:=`.
+            if *pos + 1 < bytes.len() && bytes[*pos + 1] == b'=' {
+                // The token so far is the matchingRule (or empty if we
+                // already saw `:dn`).
+                if !token.is_empty() {
+                    if token.eq_ignore_ascii_case("dn") {
+                        // `:dn := value` — dn_attributes set, no rule.
+                        dn_attributes = true;
+                    } else {
+                        matching_rule = Some(token.to_string());
+                    }
+                }
+                // Consume `:=`.
+                *pos += 2;
+                break;
+            }
+            // Otherwise, consume the `:` and continue. The token so far
+            // is either the matchingRule or `:dn`.
+            *pos += 1;
+            if token.eq_ignore_ascii_case("dn") {
+                dn_attributes = true;
+            } else if !token.is_empty() {
+                matching_rule = Some(token.to_string());
+            }
+        } else {
+            // We hit `)` or EOF without `:=` — malformed.
+            return Err(FilterParseError::UnsupportedOperator(':', token_start));
+        }
+    }
+    // Now read the value (until `)`), then optionally `:dn`.
+    let mut value = Vec::new();
+    while *pos < bytes.len() && bytes[*pos] != b')' && bytes[*pos] != b':' {
+        if bytes[*pos] == b'\\' {
+            *pos += 1;
+            if *pos + 1 >= bytes.len() {
+                return Err(FilterParseError::InvalidEscape(*pos));
+            }
+            let h1 = hex_digit(bytes[*pos])?;
+            let h2 = hex_digit(bytes[*pos + 1])?;
+            value.push((h1 << 4) | h2);
+            *pos += 2;
+        } else {
+            value.push(bytes[*pos]);
+            *pos += 1;
+        }
+    }
+    // Optional trailing `:dn` modifier.
+    if *pos < bytes.len() && bytes[*pos] == b':' {
+        let suffix_start = *pos;
+        *pos += 1;
+        let token_start = *pos;
+        while *pos < bytes.len() && bytes[*pos] != b')' {
+            *pos += 1;
+        }
+        let token = std::str::from_utf8(&bytes[token_start..*pos])
+            .map_err(|_| FilterParseError::InvalidEscape(token_start))?
+            .trim();
+        if !token.eq_ignore_ascii_case("dn") {
+            return Err(FilterParseError::UnsupportedOperator(':', suffix_start));
+        }
+        dn_attributes = true;
+    }
+    Ok(Filter::ExtensibleMatch {
+        matching_rule,
+        r#type,
+        match_value: value,
+        dn_attributes,
+    })
 }
 
 fn hex_digit(b: u8) -> Result<u8, FilterParseError> {
@@ -903,6 +1133,158 @@ mod tests {
         let (tlv, rest) = ber::decode_tlv(&out).unwrap();
         assert!(rest.is_empty());
         assert_eq!(tlv.tag, FILTER_SUBSTRINGS);
+        let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
+        assert_eq!(decoded, f);
+    }
+
+    // ---- Wave 4: GE/LE/Approx/Extensible BER round-trip tests ----
+
+    #[test]
+    fn ber_round_trip_ge() {
+        let f = Filter::GreaterOrEqual {
+            attribute: "uid".into(),
+            value: b"1000".to_vec(),
+        };
+        let mut out = Vec::new();
+        f.encode(&mut out);
+        let (tlv, rest) = ber::decode_tlv(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(tlv.tag, FILTER_GE);
+        let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
+        assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn ber_round_trip_le() {
+        let f = Filter::LessOrEqual {
+            attribute: "uid".into(),
+            value: b"2000".to_vec(),
+        };
+        let mut out = Vec::new();
+        f.encode(&mut out);
+        let (tlv, rest) = ber::decode_tlv(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(tlv.tag, FILTER_LE);
+        let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
+        assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn ber_round_trip_approx() {
+        let f = Filter::Approx {
+            attribute: "cn".into(),
+            value: b"alice".to_vec(),
+        };
+        let mut out = Vec::new();
+        f.encode(&mut out);
+        let (tlv, rest) = ber::decode_tlv(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(tlv.tag, FILTER_APPROX);
+        let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
+        assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn ber_round_trip_extensible_match() {
+        // extensibleMatch with all four fields: matchingRule + type +
+        // matchValue + dnAttributes.
+        let f = Filter::ExtensibleMatch {
+            matching_rule: Some("caseExactMatch".into()),
+            r#type: Some("cn".into()),
+            match_value: b"alice".to_vec(),
+            dn_attributes: true,
+        };
+        let mut out = Vec::new();
+        f.encode(&mut out);
+        let (tlv, rest) = ber::decode_tlv(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(tlv.tag, FILTER_EXTENSIBLE);
+        let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
+        assert_eq!(decoded, f);
+
+        // And the minimal variant: only matchValue (no rule, no type,
+        // dn_attributes = false).
+        let f_min = Filter::ExtensibleMatch {
+            matching_rule: None,
+            r#type: None,
+            match_value: b"x".to_vec(),
+            dn_attributes: false,
+        };
+        let mut out = Vec::new();
+        f_min.encode(&mut out);
+        let (tlv, _) = ber::decode_tlv(&out).unwrap();
+        let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
+        assert_eq!(decoded, f_min);
+    }
+
+    #[test]
+    fn parse_extensible_match_with_rule() {
+        // (cn:caseExactMatch:=alice) — attr + rule + value.
+        let f = parse_filter("(cn:caseExactMatch:=alice)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: Some("caseExactMatch".into()),
+                r#type: Some("cn".into()),
+                match_value: b"alice".to_vec(),
+                dn_attributes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_extensible_match_with_dn() {
+        // (cn:dn:caseExactMatch:=alice) — attr + dn + rule + value.
+        let f = parse_filter("(cn:dn:caseExactMatch:=alice)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: Some("caseExactMatch".into()),
+                r#type: Some("cn".into()),
+                match_value: b"alice".to_vec(),
+                dn_attributes: true,
+            }
+        );
+    }
+
+    #[test]
+    fn ber_round_trip_complex_nested() {
+        // A complex nested filter exercising every Wave-4 filter type:
+        //   (&(objectClass=user)(uid>=1000)(uid<=2000)(cn~=alice)
+        //     (!(cn=*admin*))(cn:caseExactMatch:=Alice))
+        let f = Filter::And(vec![
+            Filter::Equality {
+                attribute: "objectClass".into(),
+                value: b"user".to_vec(),
+            },
+            Filter::GreaterOrEqual {
+                attribute: "uid".into(),
+                value: b"1000".to_vec(),
+            },
+            Filter::LessOrEqual {
+                attribute: "uid".into(),
+                value: b"2000".to_vec(),
+            },
+            Filter::Approx {
+                attribute: "cn".into(),
+                value: b"alice".to_vec(),
+            },
+            Filter::Not(Box::new(Filter::Substrings {
+                attribute: "cn".into(),
+                substrings: vec![Substring::Any(b"admin".to_vec())],
+            })),
+            Filter::ExtensibleMatch {
+                matching_rule: Some("caseExactMatch".into()),
+                r#type: Some("cn".into()),
+                match_value: b"Alice".to_vec(),
+                dn_attributes: false,
+            },
+        ]);
+        let mut out = Vec::new();
+        f.encode(&mut out);
+        let (tlv, rest) = ber::decode_tlv(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(tlv.tag, FILTER_AND);
         let decoded = Filter::decode_from_tlv(tlv.tag, tlv.value).unwrap();
         assert_eq!(decoded, f);
     }

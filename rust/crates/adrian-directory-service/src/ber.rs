@@ -92,6 +92,22 @@ pub const APP_ADD_RESPONSE: u8 = CLASS_APPLICATION | CONSTRUCTED | 9;
 pub const APP_DEL_REQUEST: u8 = CLASS_APPLICATION | 10;
 /// `0x6B` — DelResponse (`[APPLICATION 11]` constructed).
 pub const APP_DEL_RESPONSE: u8 = CLASS_APPLICATION | CONSTRUCTED | 11;
+/// `0x77` — ExtendedRequest (`[APPLICATION 23]` constructed, per RFC 4511 §4.12).
+pub const APP_EXTENDED_REQUEST: u8 = CLASS_APPLICATION | CONSTRUCTED | 23;
+/// `0x78` — ExtendedResponse (`[APPLICATION 24]` constructed, per RFC 4511 §4.12).
+pub const APP_EXTENDED_RESPONSE: u8 = CLASS_APPLICATION | CONSTRUCTED | 24;
+
+// ---- Context tag bytes for ExtendedRequest / ExtendedResponse fields
+// (RFC 4511 §4.12). ----
+
+/// `0x80` — `requestName [0] LDAPOID` (primitive).
+pub const EXT_REQUEST_NAME: u8 = CLASS_CONTEXT;
+/// `0x81` — `requestValue [1] OCTET STRING` (primitive).
+pub const EXT_REQUEST_VALUE: u8 = CLASS_CONTEXT | 1;
+/// `0x8A` — `responseName [10] LDAPOID` (primitive).
+pub const EXT_RESPONSE_NAME: u8 = CLASS_CONTEXT | 10;
+/// `0x8B` — `responseValue [11] OCTET STRING` (primitive).
+pub const EXT_RESPONSE_VALUE: u8 = CLASS_CONTEXT | 11;
 
 // ---- Context tag bytes for LDAP search filters (RFC 4511 §4.5.1). ----
 
@@ -113,6 +129,19 @@ pub const FILTER_LE: u8 = CLASS_CONTEXT | CONSTRUCTED | 6;
 pub const FILTER_PRESENT: u8 = CLASS_CONTEXT | 7;
 /// `0xA8` — `approxMatch` filter (`[8]` constructed).
 pub const FILTER_APPROX: u8 = CLASS_CONTEXT | CONSTRUCTED | 8;
+/// `0xA9` — `extensibleMatch` filter (`[9]` constructed, per RFC 4511 §4.5.1).
+pub const FILTER_EXTENSIBLE: u8 = CLASS_CONTEXT | CONSTRUCTED | 9;
+
+// ---- Context tag bytes for extensibleMatch fields (RFC 4511 §4.5.1). ----
+
+/// `0x81` — `matchingRule [1]` field of `extensibleMatch` (primitive).
+pub const EXT_MATCHING_RULE: u8 = CLASS_CONTEXT | 1;
+/// `0x82` — `type [2]` field of `extensibleMatch` (primitive).
+pub const EXT_TYPE: u8 = CLASS_CONTEXT | 2;
+/// `0x83` — `matchValue [3]` field of `extensibleMatch` (primitive).
+pub const EXT_MATCH_VALUE: u8 = CLASS_CONTEXT | 3;
+/// `0x84` — `dnAttributes [4]` field of `extensibleMatch` (primitive).
+pub const EXT_DN_ATTRIBUTES: u8 = CLASS_CONTEXT | 4;
 
 // ---- Context tag bytes for authentication choices (RFC 4511 §4.2.1). ----
 
