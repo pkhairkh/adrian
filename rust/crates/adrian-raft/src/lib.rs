@@ -312,6 +312,21 @@ pub struct VoteResult {
     pub vote_granted: bool,
 }
 
+/// Leader-side per-peer replication state (per Ongaron & Ousterhout §5.2 —
+/// volatile state on the leader: `nextIndex[]` and `matchIndex[]` for each
+/// peer). Only meaningful when the local node is the leader; initialised by
+/// [`ManualRaftReplicator::start_election`] upon winning a term.
+#[derive(Debug, Clone, Default)]
+pub struct PeerReplicationState {
+    /// The index of the next log entry to send to this peer (per Raft §5.2
+    /// — initialised to `leader_last_log_index + 1` on election).
+    pub next_index: u64,
+    /// The highest log index known to be replicated on this peer (per Raft
+    /// §5.2 — initialised to 0 on election, advanced by
+    /// [`ManualRaftReplicator::record_peer_ack`]).
+    pub match_index: u64,
+}
+
 /// Per-node Raft state (per Ongaron & Ousterhout §5.2 — persistent +
 /// volatile state on each server).
 #[derive(Debug, Clone)]
@@ -489,6 +504,10 @@ pub struct ManualRaftReplicator {
     /// testing (a real Raft driver would not store peer state locally —
     /// peers store their own state).
     pub nodes: Arc<RwLock<HashMap<Uuid, RaftNodeState>>>,
+    /// Leader-side per-peer replication state (per Raft §5.2 — `nextIndex[]`
+    /// and `matchIndex[]`), keyed by peer node ID. Only meaningful when the
+    /// local node is the leader; initialised by [`Self::start_election`].
+    pub peer_state: Arc<RwLock<HashMap<Uuid, PeerReplicationState>>>,
 }
 
 impl ManualRaftReplicator {
@@ -501,13 +520,18 @@ impl ManualRaftReplicator {
         Self {
             local_node_id,
             nodes: Arc::new(RwLock::new(nodes)),
+            peer_state: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Add a peer node with fresh state (used by cluster setup and tests).
+    /// Also initialises the leader-side `peer_state` entry for this peer.
     pub async fn add_peer(&self, peer_id: Uuid) {
         let mut nodes = self.nodes.write().await;
         nodes.entry(peer_id).or_insert_with(RaftNodeState::new);
+        drop(nodes);
+        let mut ps = self.peer_state.write().await;
+        ps.entry(peer_id).or_default();
     }
 
     /// Read the local node's `current_term` (test/diagnostic helper).
@@ -549,6 +573,299 @@ impl ManualRaftReplicator {
         let nodes = self.nodes.read().await;
         nodes.get(&self.local_node_id).and_then(|s| s.leader_id)
     }
+
+    // -----------------------------------------------------------------
+    // Wave 2: quorum enforcement + leader election (per RFC §5.2)
+    // -----------------------------------------------------------------
+
+    /// Compute the cluster majority threshold: `(total_nodes / 2) + 1`
+    /// (per RFC §5.2 — "majority" means more than half). A single-node
+    /// cluster has majority = 1; a 3-node cluster has majority = 2; a
+    /// 5-node cluster has majority = 3.
+    async fn majority_threshold(&self) -> u64 {
+        let nodes = self.nodes.read().await;
+        let total = nodes.len() as u64;
+        (total / 2) + 1
+    }
+
+    /// Record that a peer has acknowledged log entries up to `match_index`
+    /// (per Raft §5.2 — leader updates `matchIndex[i]` and `nextIndex[i]`
+    /// on each successful `AppendEntries` response). This is the
+    /// bookkeeping side of quorum tracking; call this after every
+    /// successful `append_entries_to_peer`.
+    pub async fn record_peer_ack(&self, peer_id: Uuid, match_index: u64) {
+        let mut ps = self.peer_state.write().await;
+        let entry = ps.entry(peer_id).or_default();
+        entry.match_index = entry.match_index.max(match_index);
+        entry.next_index = match_index + 1;
+    }
+
+    /// Try to commit entries up to `index`. Returns `Ok(true)` if a
+    /// majority of nodes (self + peers) have `match_index >= index` and the
+    /// entry at `index` is from the current term (per RFC §5.4.2 — the
+    /// current-term restriction prevents committing stale-term entries via
+    /// a future leader). Returns `Ok(false)` if quorum is not yet reached.
+    ///
+    /// On success, advances `commit_index` to `index` (if it was lower).
+    pub async fn commit_entry(&self, index: u64) -> Result<bool, RaftError> {
+        let majority = self.majority_threshold().await;
+        // Count self as an ack (the leader holds the entry locally).
+        let mut acks = 1u64;
+        {
+            let ps = self.peer_state.read().await;
+            for p in ps.values() {
+                if p.match_index >= index {
+                    acks += 1;
+                }
+            }
+        }
+        if acks < majority {
+            return Ok(false);
+        }
+        // Per RFC §5.4.2 fig 8 — only commit entries from the current term.
+        let mut nodes = self.nodes.write().await;
+        let local = nodes
+            .get(&self.local_node_id)
+            .ok_or_else(|| RaftError::InvalidEntry("local node not found".into()))?;
+        let entry_term = local.term_at(index).unwrap_or(0);
+        if entry_term != local.current_term && index > 0 {
+            // Stale-term entry — cannot commit directly (per fig 8). A
+            // later current-term entry will commit these implicitly once it
+            // replicates.
+            return Ok(false);
+        }
+        let local = nodes
+            .get_mut(&self.local_node_id)
+            .expect("local node present above");
+        if index > local.commit_index {
+            local.commit_index = index;
+        }
+        Ok(true)
+    }
+
+    /// Send an `AppendEntries` RPC to a specific peer (in-process
+    /// simulation of a network call). The peer's receiver-side handler
+    /// (`append_entries_impl`) runs against `self.nodes[peer_id]`.
+    ///
+    /// On success, records the peer's `match_index` via
+    /// [`Self::record_peer_ack`] so [`Self::commit_entry`] can count it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_entries_to_peer(
+        &self,
+        peer_id: Uuid,
+        term: u64,
+        leader_id: Uuid,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<RaftLogEntry>,
+        leader_commit: u64,
+    ) -> Result<AppendResult, RaftError> {
+        let result = self
+            .append_entries_impl(
+                peer_id,
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            )
+            .await?;
+        if result.success {
+            self.record_peer_ack(peer_id, result.last_log_index).await;
+        }
+        Ok(result)
+    }
+
+    /// Send a `RequestVote` RPC to a specific peer (in-process simulation).
+    /// Returns the peer's `VoteResult`.
+    pub async fn request_vote_from_peer(
+        &self,
+        peer_id: Uuid,
+        term: u64,
+        candidate_id: Uuid,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> Result<VoteResult, RaftError> {
+        self.vote_impl(peer_id, term, candidate_id, last_log_index, last_log_term)
+            .await
+    }
+
+    /// Start a leader election (per RFC §5.2). Increments `current_term`,
+    /// votes for self, broadcasts `RequestVote` to all peers via
+    /// [`Self::request_vote_from_peer`]. Returns `Ok(true)` if a majority
+    /// of votes were granted (the local node becomes leader); `Ok(false)`
+    /// otherwise (split vote — the local node stays a candidate and will
+    /// retry on the next election timeout).
+    ///
+    /// Split-vote prevention (RFC §5.2): a candidate must receive a
+    /// majority before becoming leader. If two candidates split the vote,
+    /// neither wins and a new election is needed.
+    pub async fn start_election(&self) -> Result<bool, RaftError> {
+        // Step 1: increment term, vote for self (per RFC §5.2).
+        let (term, last_log_index, last_log_term) = {
+            let mut nodes = self.nodes.write().await;
+            let local = nodes
+                .get_mut(&self.local_node_id)
+                .ok_or_else(|| RaftError::InvalidEntry("local node not found".into()))?;
+            local.current_term += 1;
+            local.voted_for = Some(self.local_node_id);
+            local.leader_id = None; // candidate doesn't recognise a leader.
+            (
+                local.current_term,
+                local.last_log_index(),
+                local.last_log_term(),
+            )
+        };
+        // Step 2: request votes from all peers (self already counts as 1).
+        let peer_ids: Vec<Uuid> = {
+            let nodes = self.nodes.read().await;
+            nodes
+                .keys()
+                .filter(|&&k| k != self.local_node_id)
+                .copied()
+                .collect()
+        };
+        let mut votes = 1u64;
+        for peer_id in peer_ids {
+            let result = self
+                .request_vote_from_peer(
+                    peer_id,
+                    term,
+                    self.local_node_id,
+                    last_log_index,
+                    last_log_term,
+                )
+                .await?;
+            if result.vote_granted {
+                votes += 1;
+            }
+        }
+        // Step 3: quorum check (per RFC §5.2 — majority required).
+        let majority = self.majority_threshold().await;
+        if votes < majority {
+            return Ok(false);
+        }
+        // Step 4: become leader — set leader_id, init peer_state.
+        let last_idx = {
+            let mut nodes = self.nodes.write().await;
+            let local = nodes
+                .get_mut(&self.local_node_id)
+                .expect("local node present above");
+            local.leader_id = Some(self.local_node_id);
+            local.last_log_index()
+        };
+        let mut ps = self.peer_state.write().await;
+        for p in ps.values_mut() {
+            p.next_index = last_idx + 1;
+            p.match_index = 0;
+        }
+        Ok(true)
+    }
+
+    /// Append-entries receiver-side core logic, parameterised by `node_id`
+    /// (so the leader can call it on a peer via `append_entries_to_peer`).
+    /// Implements RFC §5.4.1 steps 1-6 exactly as the trait method does,
+    /// but operates on `self.nodes[node_id]` instead of `self.nodes[local]`.
+    #[allow(clippy::too_many_arguments)]
+    async fn append_entries_impl(
+        &self,
+        node_id: Uuid,
+        term: u64,
+        leader_id: Uuid,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<RaftLogEntry>,
+        leader_commit: u64,
+    ) -> Result<AppendResult, RaftError> {
+        let mut nodes = self.nodes.write().await;
+        let local = nodes.entry(node_id).or_insert_with(RaftNodeState::new);
+        if term < local.current_term {
+            return Ok(AppendResult {
+                term: local.current_term,
+                success: false,
+                last_log_index: local.last_log_index(),
+                commit_index: local.commit_index,
+            });
+        }
+        if term > local.current_term {
+            local.current_term = term;
+            local.voted_for = None;
+        }
+        local.leader_id = Some(leader_id);
+        let local_term_at_prev = local.term_at(prev_log_index);
+        if local_term_at_prev != Some(prev_log_term) {
+            return Ok(AppendResult {
+                term: local.current_term,
+                success: false,
+                last_log_index: local.last_log_index(),
+                commit_index: local.commit_index,
+            });
+        }
+        for entry in entries {
+            if let Some(existing_term) = local.term_at(entry.index) {
+                if existing_term != entry.term {
+                    local.truncate_from(entry.index);
+                    local.log.push(entry);
+                }
+            } else {
+                local.log.push(entry);
+            }
+        }
+        let last_idx = local.last_log_index();
+        if leader_commit > local.commit_index {
+            local.commit_index = leader_commit.min(last_idx);
+        }
+        Ok(AppendResult {
+            term: local.current_term,
+            success: true,
+            last_log_index: local.last_log_index(),
+            commit_index: local.commit_index,
+        })
+    }
+
+    /// Vote receiver-side core logic, parameterised by `node_id`.
+    async fn vote_impl(
+        &self,
+        node_id: Uuid,
+        term: u64,
+        candidate_id: Uuid,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> Result<VoteResult, RaftError> {
+        let mut nodes = self.nodes.write().await;
+        let local = nodes.entry(node_id).or_insert_with(RaftNodeState::new);
+        if term < local.current_term {
+            return Ok(VoteResult {
+                term: local.current_term,
+                vote_granted: false,
+            });
+        }
+        if term > local.current_term {
+            local.current_term = term;
+            local.voted_for = None;
+        }
+        let up_to_date = {
+            let local_last_term = local.last_log_term();
+            let local_last_idx = local.last_log_index();
+            if last_log_term != local_last_term {
+                last_log_term > local_last_term
+            } else {
+                last_log_index >= local_last_idx
+            }
+        };
+        let grant = match local.voted_for {
+            Some(v) if v != candidate_id => false,
+            _ => up_to_date,
+        };
+        if grant {
+            local.voted_for = Some(candidate_id);
+        }
+        Ok(VoteResult {
+            term: local.current_term,
+            vote_granted: grant,
+        })
+    }
 }
 
 #[async_trait]
@@ -562,73 +879,18 @@ impl RaftReplicator for ManualRaftReplicator {
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     ) -> Result<AppendResult, RaftError> {
-        let mut nodes = self.nodes.write().await;
-        let local = nodes
-            .entry(self.local_node_id)
-            .or_insert_with(RaftNodeState::new);
-
-        // §5.4.1 step 1: if term < currentTerm, reply false.
-        if term < local.current_term {
-            return Ok(AppendResult {
-                term: local.current_term,
-                success: false,
-                last_log_index: local.last_log_index(),
-                commit_index: local.commit_index,
-            });
-        }
-
-        // §5.4.1 step 2: if term > currentTerm, update currentTerm and
-        // reset voted_for (become follower of the new leader).
-        if term > local.current_term {
-            local.current_term = term;
-            local.voted_for = None;
-        }
-        local.leader_id = Some(leader_id);
-
-        // §5.4.1 step 3: if log doesn't contain an entry at prev_log_index
-        // whose term is prev_log_term, reply false.
-        let local_term_at_prev = local.term_at(prev_log_index);
-        if local_term_at_prev != Some(prev_log_term) {
-            return Ok(AppendResult {
-                term: local.current_term,
-                success: false,
-                last_log_index: local.last_log_index(),
-                commit_index: local.commit_index,
-            });
-        }
-
-        // §5.4.1 step 4-5: append new entries not already in the log,
-        // truncating any conflicting entries (same index, different term).
-        for entry in entries {
-            if let Some(existing_term) = local.term_at(entry.index) {
-                if existing_term != entry.term {
-                    // Conflict — truncate this entry and all that follow,
-                    // then append the new entry.
-                    local.truncate_from(entry.index);
-                    local.log.push(entry);
-                }
-                // else: same entry already in log (idempotent re-send), skip.
-            } else {
-                // New entry — append (real impl would assert contiguous
-                // indices; we accept any index ≥ last_log_index + 1 for
-                // robustness against truncated re-sends).
-                local.log.push(entry);
-            }
-        }
-
-        // §5.4.1 step 6: if leader_commit > commit_index, set
-        // commit_index = min(leader_commit, last_new_index).
-        let last_idx = local.last_log_index();
-        if leader_commit > local.commit_index {
-            local.commit_index = leader_commit.min(last_idx);
-        }
-
-        Ok(AppendResult {
-            term: local.current_term,
-            success: true,
-            last_log_index: local.last_log_index(),
-            commit_index: local.commit_index,
-        })
+        // Delegate to the parameterised `_impl` so the same receiver-side
+        // logic is reused by `append_entries_to_peer` (leader -> peer RPC).
+        self.append_entries_impl(
+            self.local_node_id,
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        )
+        .await
     }
 
     async fn vote(
@@ -638,67 +900,34 @@ impl RaftReplicator for ManualRaftReplicator {
         last_log_index: u64,
         last_log_term: u64,
     ) -> Result<VoteResult, RaftError> {
-        let mut nodes = self.nodes.write().await;
-        let local = nodes
-            .entry(self.local_node_id)
-            .or_insert_with(RaftNodeState::new);
-
-        // §5.4.1 step 1: if term < currentTerm, reply false.
-        if term < local.current_term {
-            return Ok(VoteResult {
-                term: local.current_term,
-                vote_granted: false,
-            });
-        }
-
-        // §5.4.1 step 2: if term > currentTerm, update currentTerm and
-        // reset voted_for.
-        if term > local.current_term {
-            local.current_term = term;
-            local.voted_for = None;
-        }
-
-        // §5.4.1 step 3: if voted_for is None or candidate_id, and
-        // candidate's log is at least as up-to-date as receiver's log,
-        // grant vote.
-        let up_to_date = {
-            let local_last_term = local.last_log_term();
-            let local_last_idx = local.last_log_index();
-            if last_log_term != local_last_term {
-                last_log_term > local_last_term
-            } else {
-                last_log_index >= local_last_idx
-            }
-        };
-
-        let grant = match local.voted_for {
-            Some(v) if v != candidate_id => false,
-            _ => up_to_date,
-        };
-
-        if grant {
-            local.voted_for = Some(candidate_id);
-        }
-
-        Ok(VoteResult {
-            term: local.current_term,
-            vote_granted: grant,
-        })
+        // Delegate to the parameterised `_impl` so the same receiver-side
+        // logic is reused by `request_vote_from_peer` (candidate -> peer
+        // RPC).
+        self.vote_impl(
+            self.local_node_id,
+            term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+        )
+        .await
     }
 
     async fn install_snapshot(
         &self,
         term: u64,
-        _leader_id: Uuid,
-        _last_included_index: u64,
-        _last_included_term: u64,
+        leader_id: Uuid,
+        last_included_index: u64,
+        last_included_term: u64,
         offset: u64,
-        _data: Vec<u8>,
+        data: Vec<u8>,
         done: bool,
     ) -> Result<(), RaftError> {
-        // Stub: accept the term update so a leader at a higher term forces
-        // the local node to step down. Reject term regressions per Raft
-        // §5.4.2.
+        // Wave 2 (T-203): real InstallSnapshot handler per RFC §7. Accepts
+        // the term update (stepping down if the caller's term is higher),
+        // rejects term regressions, and on `done=true` applies the snapshot:
+        // truncates the log up to `last_included_index`, advances
+        // `commit_index` and `last_applied` to `last_included_index`.
         let mut nodes = self.nodes.write().await;
         let local = nodes
             .entry(self.local_node_id)
@@ -713,19 +942,37 @@ impl RaftReplicator for ManualRaftReplicator {
             local.current_term = term;
             local.voted_for = None;
         }
-        // A real InstallSnapshot handler would:
-        // 1. Stream the snapshot bytes to disk at `offset`.
-        // 2. On `done=true`, discard the log up to `last_included_index`.
-        // 3. Apply the snapshot to the state machine.
-        // Out-of-scope for v1 — we just record the offset for diagnostics
-        // via `tracing` so callers can see that the RPC was received.
-        if offset != 0 || done {
+        local.leader_id = Some(leader_id);
+        // RFC §7: on the final chunk, discard any conflicting entries and
+        // apply the snapshot. We don't persist `data` (in-memory v1), but
+        // we do truncate the log and advance commit/apply cursors so the
+        // follower's state matches the leader's post-compaction state.
+        if done {
+            // Truncate entries with index <= last_included_index (they are
+            // now captured by the snapshot). Keep entries after
+            // last_included_index if they exist (RFC §7 allows the log to
+            // contain entries after the snapshot).
+            local.log.retain(|e| e.index > last_included_index);
+            if local.commit_index < last_included_index {
+                local.commit_index = last_included_index;
+            }
+            if local.last_applied < last_included_index {
+                local.last_applied = last_included_index;
+            }
+            tracing::debug!(
+                target: "adrian_raft::install_snapshot",
+                last_included_index,
+                last_included_term,
+                data_len = data.len(),
+                offset,
+                "snapshot applied: log truncated, commit_index/last_applied advanced"
+            );
+        } else if offset != 0 {
             tracing::debug!(
                 target: "adrian_raft::install_snapshot",
                 offset,
-                done,
-                last_included_index = _last_included_index,
-                "snapshot chunk accepted (stub: not applied to state machine)"
+                chunk_len = data.len(),
+                "snapshot chunk received (awaiting final chunk)"
             );
         }
         Ok(())
@@ -821,45 +1068,49 @@ impl Replicator for RaftDirectoryReplicator {
         &self,
         batch: ReplicationPayload,
     ) -> Result<Vec<Resolution>, ReplicationError> {
-        // Per Decision 1 §Decision — apply Raft log entries in commit order
-        // via the state machine. In v1 we just append to the in-memory log;
-        // FDB's strict serializable transactions would make log-apply atomic
-        // in a real FDB-backed RaftLogStore (per Decision 1
-        // §Cross-capability dependencies — "no replication-apply lock
-        // needed"). Conflict resolution is a no-op in Raft mode (Raft
-        // serialises writes — per ADR-071 §Decision — so every entry
-        // "applies" without conflict).
-        let mut nodes = self.raft.nodes.write().await;
-        let local = nodes
-            .entry(self.raft.local_node_id)
-            .or_insert_with(RaftNodeState::new);
-
-        // Use the leader's invocation ID from the batch (per MS-ADTS — the
-        // origin DSA's invocation ID). For Raft-mode entries authored
-        // locally by this DC, that's `self.invocation_id`.
+        // Per Decision 1 §Decision — append Raft log entries, then commit
+        // via quorum-gated `commit_entry` (Wave 2 fix). Previously this
+        // method advanced `commit_index` unconditionally — a data-loss risk
+        // on network partition (per tasklist gap #2). Now the local node
+        // appends uncommitted entries and `commit_entry` only commits when
+        // a majority of peers have acked (or when this is a single-node
+        // cluster, where majority = 1 = self).
+        //
+        // Conflict resolution is a no-op in Raft mode (Raft serialises
+        // writes — per ADR-071 §Decision — so every entry "applies" without
+        // conflict).
         let leader_invocation_id = batch.origin_invocation_id;
-        let start_index = local.last_log_index() + 1;
-        let term = local.current_term.max(1);
-        let mut resolutions = Vec::with_capacity(batch.operations.len());
-        for (offset, op) in batch.operations.into_iter().enumerate() {
-            let next_index = start_index + offset as u64;
-            local.log.push(RaftLogEntry {
-                term,
-                index: next_index,
-                origin_invocation_id: leader_invocation_id,
-                origin_usn: next_index,
-                payload: op,
-            });
-            // Every entry applies without conflict in Raft mode (per
-            // ADR-071 §Decision — Raft serialises writes; conflicts indicate
-            // split-brain and surface via `resolve_conflict`, not here).
-            resolutions.push(Resolution::IncomingWins);
+        let (term, start_index, new_last_index) = {
+            let mut nodes = self.raft.nodes.write().await;
+            let local = nodes
+                .entry(self.raft.local_node_id)
+                .or_insert_with(RaftNodeState::new);
+            let start_index = local.last_log_index() + 1;
+            let term = local.current_term.max(1);
+            for (offset, op) in batch.operations.into_iter().enumerate() {
+                let next_index = start_index + offset as u64;
+                local.log.push(RaftLogEntry {
+                    term,
+                    index: next_index,
+                    origin_invocation_id: leader_invocation_id,
+                    origin_usn: next_index,
+                    payload: op,
+                });
+            }
+            (term, start_index, local.last_log_index())
+        };
+        // Wave 2: commit via quorum-gated `commit_entry`. For a single-node
+        // cluster (no peers), majority = 1 = self, so this commits
+        // immediately. For a multi-node cluster, the leader must replicate
+        // to peers (via `append_entries_to_peer`) and record acks (via
+        // `record_peer_ack`) before `commit_entry` will advance
+        // `commit_index`.
+        if new_last_index >= start_index {
+            let _ = self.raft.commit_entry(new_last_index).await;
         }
-        // Advance commit_index to the new last log index (per Raft §5.4.2 —
-        // once entries are applied, commit_index advances; in a real impl
-        // this is gated on quorum acks, but in the in-memory v1 test path
-        // we treat the local apply as a one-node quorum).
-        local.commit_index = local.last_log_index();
+        let _ = term; // used for log entry creation above
+        let resolutions =
+            vec![Resolution::IncomingWins; (new_last_index - start_index + 1) as usize];
         Ok(resolutions)
     }
 
@@ -1598,5 +1849,219 @@ mod tests {
         let bind = dummy_socket_addr(389);
         let transport = RaftNetworkTransport::new(bind, vec![]);
         assert!(transport.peers.is_empty());
+    }
+
+    // =================================================================
+    // NEW (Wave 2) — quorum enforcement + leader election + install_snapshot
+    // =================================================================
+
+    #[tokio::test]
+    async fn wave2_commit_entry_succeeds_with_quorum() {
+        // T-201 positive: `commit_entry` commits when a majority of peers
+        // have acked. 3-node cluster (majority = 2): self + 1 peer ack = 2.
+        let node_a = Uuid::from_u128(0xA1);
+        let node_b = Uuid::from_u128(0xA2);
+        let node_c = Uuid::from_u128(0xA3);
+        let raft = ManualRaftReplicator::new(node_a);
+        raft.add_peer(node_b).await;
+        raft.add_peer(node_c).await;
+        // Append one entry at term 1, index 1 on the leader.
+        {
+            let mut nodes = raft.nodes.write().await;
+            let local = nodes.get_mut(&node_a).unwrap();
+            local.current_term = 1;
+            local.log.push(RaftLogEntry::new(
+                1,
+                1,
+                node_a,
+                ReplOperation::DeleteObject {
+                    uuid: Uuid::nil(),
+                    metadata: dummy_metadata(node_a, 1),
+                },
+            ));
+        }
+        // Peer B acks up to index 1.
+        raft.record_peer_ack(node_b, 1).await;
+        let committed = raft.commit_entry(1).await.expect("commit_entry");
+        assert!(committed, "quorum reached (self + B = 2 >= 2)");
+        assert_eq!(raft.commit_index().await, 1);
+    }
+
+    #[tokio::test]
+    async fn wave2_commit_entry_rejected_without_quorum() {
+        // T-201 negative: `commit_entry` returns false when majority is not
+        // reached. 5-node cluster (majority = 3): self + 1 peer ack = 2 < 3.
+        let node_a = Uuid::from_u128(0xB1);
+        let raft = ManualRaftReplicator::new(node_a);
+        for i in 2..=5 {
+            raft.add_peer(Uuid::from_u128(0xB0 + i as u128)).await;
+        }
+        {
+            let mut nodes = raft.nodes.write().await;
+            let local = nodes.get_mut(&node_a).unwrap();
+            local.current_term = 1;
+            local.log.push(RaftLogEntry::new(
+                1,
+                1,
+                node_a,
+                ReplOperation::DeleteObject {
+                    uuid: Uuid::nil(),
+                    metadata: dummy_metadata(node_a, 1),
+                },
+            ));
+        }
+        // Only one peer acks.
+        raft.record_peer_ack(Uuid::from_u128(0xB2), 1).await;
+        let committed = raft.commit_entry(1).await.expect("commit_entry");
+        assert!(!committed, "quorum NOT reached (self + 1 peer = 2 < 3)");
+        assert_eq!(
+            raft.commit_index().await,
+            0,
+            "commit_index must NOT advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_leader_election_3_nodes() {
+        // T-202: 3-node cluster, node A calls `start_election`, wins with
+        // 2/3 votes (self + one peer). Per RFC §5.2 split-vote prevention,
+        // A must receive a majority before becoming leader.
+        let node_a = Uuid::from_u128(0xC1);
+        let node_b = Uuid::from_u128(0xC2);
+        let node_c = Uuid::from_u128(0xC3);
+        let raft = ManualRaftReplicator::new(node_a);
+        raft.add_peer(node_b).await;
+        raft.add_peer(node_c).await;
+        let won = raft.start_election().await.expect("start_election");
+        assert!(won, "node A should win with 2/3 votes (self + B or C)");
+        assert_eq!(raft.current_term().await, 1);
+        assert_eq!(raft.leader_id().await, Some(node_a));
+        assert_eq!(raft.voted_for().await, Some(node_a));
+        // After winning, peer_state should be initialised.
+        let ps = raft.peer_state.read().await;
+        for p in ps.values() {
+            assert_eq!(p.match_index, 0);
+            assert_eq!(p.next_index, 1, "next_index = last_log_index + 1 = 0 + 1");
+        }
+    }
+
+    #[tokio::test]
+    async fn wave2_leader_election_5_nodes() {
+        // T-202: 5-node cluster, node A calls `start_election`, wins with
+        // 3/5 votes (self + 2 peers). Majority = 3.
+        let node_a = Uuid::from_u128(0xD1);
+        let raft = ManualRaftReplicator::new(node_a);
+        for i in 2..=5 {
+            raft.add_peer(Uuid::from_u128(0xD0 + i as u128)).await;
+        }
+        let won = raft.start_election().await.expect("start_election");
+        assert!(won, "node A should win with 3/5 votes (self + 2 peers)");
+        assert_eq!(raft.current_term().await, 1);
+        assert_eq!(raft.leader_id().await, Some(node_a));
+    }
+
+    #[tokio::test]
+    async fn wave2_partition_recovery() {
+        // T-204 partition recovery: simulate a 3-node cluster where node A
+        // is leader, then a partition isolates node C. Node A can still
+        // commit with B (2/3 majority). After the partition heals, C
+        // rejoins and catches up via AppendEntries.
+        let node_a = Uuid::from_u128(0xE1);
+        let node_b = Uuid::from_u128(0xE2);
+        let node_c = Uuid::from_u128(0xE3);
+        let raft = ManualRaftReplicator::new(node_a);
+        raft.add_peer(node_b).await;
+        raft.add_peer(node_c).await;
+        // Phase 1: A wins election (2/3 votes).
+        let won = raft.start_election().await.expect("election");
+        assert!(won);
+        let term = raft.current_term().await;
+        // Phase 2: A appends an entry and replicates to B only (C is
+        // "partitioned" — we skip calling append_entries_to_peer on C).
+        let entry = RaftLogEntry::new(
+            term,
+            1,
+            node_a,
+            ReplOperation::DeleteObject {
+                uuid: Uuid::nil(),
+                metadata: dummy_metadata(node_a, 1),
+            },
+        );
+        {
+            let mut nodes = raft.nodes.write().await;
+            nodes.get_mut(&node_a).unwrap().log.push(entry.clone());
+        }
+        let result = raft
+            .append_entries_to_peer(node_b, term, node_a, 0, 0, vec![entry.clone()], 0)
+            .await
+            .expect("append_entries to B");
+        assert!(result.success);
+        // Phase 3: A commits with B's ack (2/3 majority).
+        let committed = raft.commit_entry(1).await.expect("commit_entry");
+        assert!(committed, "A+B = 2/3 majority, should commit");
+        assert_eq!(raft.commit_index().await, 1);
+        // Phase 4: partition heals — A replicates to C.
+        let result = raft
+            .append_entries_to_peer(
+                node_c,
+                term,
+                node_a,
+                0,
+                0,
+                vec![entry],
+                raft.commit_index().await,
+            )
+            .await
+            .expect("append_entries to C");
+        assert!(
+            result.success,
+            "C should accept entries after partition heals"
+        );
+        // Verify C's log matches A's.
+        let nodes = raft.nodes.read().await;
+        let c_log = &nodes.get(&node_c).unwrap().log;
+        assert_eq!(c_log.len(), 1);
+        assert_eq!(c_log[0].index, 1);
+        assert_eq!(nodes.get(&node_c).unwrap().commit_index, 1);
+    }
+
+    #[tokio::test]
+    async fn wave2_install_snapshot_applies_snapshot() {
+        // T-203: InstallSnapshot with `done=true` truncates the log up to
+        // `last_included_index` and advances `commit_index` / `last_applied`.
+        let node_a = Uuid::from_u128(0xF1);
+        let raft = ManualRaftReplicator::new(node_a);
+        // Seed the log with 5 entries at term 1.
+        {
+            let mut nodes = raft.nodes.write().await;
+            let local = nodes.get_mut(&node_a).unwrap();
+            local.current_term = 2;
+            for i in 1..=5 {
+                local.log.push(RaftLogEntry::new(
+                    1,
+                    i,
+                    node_a,
+                    ReplOperation::DeleteObject {
+                        uuid: Uuid::nil(),
+                        metadata: dummy_metadata(node_a, i),
+                    },
+                ));
+            }
+        }
+        // Install a snapshot covering entries 1-3.
+        raft.install_snapshot(2, node_a, 3, 1, 0, vec![0xAB; 64], true)
+            .await
+            .expect("install_snapshot");
+        let nodes = raft.nodes.read().await;
+        let local = nodes.get(&node_a).unwrap();
+        assert_eq!(
+            local.log.len(),
+            2,
+            "entries 1-3 truncated, entries 4-5 remain"
+        );
+        assert_eq!(local.log[0].index, 4);
+        assert_eq!(local.log[1].index, 5);
+        assert_eq!(local.commit_index, 3);
+        assert_eq!(local.last_applied, 3);
     }
 }
