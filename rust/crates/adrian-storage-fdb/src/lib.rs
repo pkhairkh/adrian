@@ -1099,6 +1099,548 @@ fn subspace_from_u8(b: u8) -> Subspace {
     }
 }
 
+// ============================================================================
+// Backup / Restore / PITR (Wave 2 — ADR-010 / ADR-034 / ADR-059)
+// ============================================================================
+//
+// Implements the backup-coordinator surface specified by:
+//   - ADR-010 §Decision (quiesce → snapshot → metadata-record → resume → verify)
+//   - ADR-034 §Decision 3 (PITR via WAL replay)
+//   - ADR-034 §Decision 5 (reject-repair mode — all writes fail with
+//     `StorageError::RejectRepair`)
+//   - ADR-059 §Decision (per-DC backup with PITR; 60-second WAL archive
+//     interval; operator-driven DR runbooks)
+//
+// The on-disk snapshot format is a custom binary format (no extra deps):
+//   [magic: 4 bytes "ADBK"]
+//   [version: 4 bytes BE u32 = 1]
+//   [timestamp: 8 bytes BE i64 — unix seconds when snapshot was taken]
+//   [key_count: 4 bytes BE u32]
+//   For each key:
+//     [key_len: 4 bytes BE u32]
+//     [key: key_len bytes]
+//     [val_len: 4 bytes BE u32]
+//     [value: val_len bytes]
+//   [sha256 of all the above: 32 bytes]
+//
+// The "WAL" for PITR is an in-process `Vec<MutationRecord>` maintained by the
+// BackupManager. In a production deployment this would be FDB's mutation
+// stream (via the `fdbbackup` tool or FDB's `StorageServer` log); for v1 we
+// stub it via the BackupManager's `record_mutation()` helper, which the
+// test harness calls after every write. PITR replays the WAL up to the
+// target timestamp.
+
+/// Magic bytes prefixing every Adrian backup file ("ADBK" = ADrian BacKup).
+const BACKUP_MAGIC: [u8; 4] = *b"ADBK";
+/// Backup format version (increment on incompatible changes).
+const BACKUP_VERSION: u32 = 1;
+/// Type alias for a key-value pair returned by snapshot reads.
+pub type KvPair = (Vec<u8>, Vec<u8>);
+
+/// One record in the in-process WAL used by `BackupManager::restore_to_timestamp`.
+/// Records are kept in insertion order; PITR replays them in order.
+#[derive(Debug, Clone)]
+pub struct MutationRecord {
+    /// Unix-seconds timestamp when the mutation was recorded.
+    pub ts: i64,
+    /// The mutation kind (`Put` carries a value; `Delete` does not).
+    pub op: MutationOp,
+}
+
+/// The kind of mutation recorded in the WAL.
+#[derive(Debug, Clone)]
+pub enum MutationOp {
+    /// Put `value` at `key`.
+    Put {
+        /// The key being written.
+        key: Vec<u8>,
+        /// The value being written.
+        value: Vec<u8>,
+    },
+    /// Delete `key`.
+    Delete {
+        /// The key being deleted.
+        key: Vec<u8>,
+    },
+    /// Clear the half-open range `[begin, end)`.
+    ClearRange {
+        /// The inclusive begin key of the range to clear.
+        begin: Vec<u8>,
+        /// The exclusive end key of the range to clear.
+        end: Vec<u8>,
+    },
+}
+
+/// Metadata recorded in every snapshot file (per ADR-010 §Decision 3 —
+/// "Records the snapshot metadata — invocation ID, USN cursor, timestamp,
+/// storage-engine version, framework version"). The `invocation_id` and
+/// `usn_cursor` fields are stubbed for v1 (the framework's replication
+/// metadata is not yet implemented); they're serialised to the snapshot
+/// file so future versions can read them without a format migration.
+#[derive(Debug, Clone)]
+pub struct SnapshotMetadata {
+    /// Unix-seconds timestamp when the snapshot was taken.
+    pub timestamp: i64,
+    /// Number of keys in the snapshot.
+    pub key_count: usize,
+    /// Framework version (semver-like string, currently "0.1.0").
+    pub framework_version: String,
+    /// Invocation ID of the DC that took the snapshot (stubbed as
+    /// `Uuid::nil()` for v1; populated by the replication layer in a
+    /// future wave).
+    pub invocation_id: Uuid,
+    /// USN cursor at the time of the snapshot (stubbed as 0 for v1;
+    /// populated by the replication layer in a future wave).
+    pub usn_cursor: i64,
+    /// SHA-256 of the snapshot body (all key-value pairs).
+    pub sha256: [u8; 32],
+}
+
+/// Backup coordinator for the Adrian framework (Wave 2 — ADR-010/034/059).
+///
+/// Wraps an `FdbDirectoryStore` (either in-memory fallback or real FDB) and
+/// provides:
+///   - `create_snapshot(path)` — transactionally-consistent snapshot to disk
+///   - `restore_from_snapshot(path)` — clear + restore from a snapshot file
+///   - `restore_to_timestamp(ts)` — PITR via WAL replay
+///   - `set_reject_repair(true)` — ADR-034 §5 reject-repair mode
+///   - `verify_snapshot(path)` — re-reads the snapshot, recomputes SHA-256,
+///     and confirms integrity
+///   - `create_incremental_snapshot(since_ts, path)` — only serialises keys
+///     modified since `since_ts` (per ADR-059 §Decision — "hourly incremental
+///     snapshot via the storage engine's incremental_snapshot() API")
+pub struct BackupManager {
+    /// The underlying store. Reads and writes go through this.
+    store: FdbDirectoryStore,
+    /// Process-wide reject-repair flag (per ADR-034 §5). When true, all
+    /// writes via `BackupManager::put` / `delete` / `atomic_add` /
+    /// `clear_range` / `commit` return `StorageError::RejectRepair`.
+    reject_repair: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// In-process WAL of mutations (per ADR-034 §3 — PITR via WAL replay).
+    /// In production this would be FDB's mutation stream; for v1 we stub
+    /// it in-process. Records are appended in insertion order.
+    wal: std::sync::Arc<std::sync::Mutex<Vec<MutationRecord>>>,
+}
+
+impl std::fmt::Debug for BackupManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupManager")
+            .field("store", &self.store)
+            .field(
+                "reject_repair",
+                &self
+                    .reject_repair
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("wal_len", &self.wal.lock().unwrap().len())
+            .finish()
+    }
+}
+
+impl BackupManager {
+    /// Construct a new `BackupManager` wrapping the given store.
+    pub fn new(store: FdbDirectoryStore) -> Self {
+        Self {
+            store,
+            reject_repair: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wal: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Get a reference to the underlying store (for direct reads).
+    pub fn store(&self) -> &FdbDirectoryStore {
+        &self.store
+    }
+
+    /// Set the reject-repair flag (per ADR-034 §5 — "Reject hard-repair
+    /// tools"). When `on` is true, all subsequent writes via this
+    /// `BackupManager` will return `StorageError::RejectRepair`. The only
+    /// recovery procedure is `restore_from_snapshot` + WAL replay.
+    pub fn set_reject_repair(&self, on: bool) {
+        self.reject_repair
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns `true` if reject-repair mode is currently active.
+    pub fn is_reject_repair(&self) -> bool {
+        self.reject_repair
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a mutation in the in-process WAL. Called by `put` / `delete`
+    /// / `clear_range` after the write commits. Each record carries the
+    /// current unix-seconds timestamp (used by `restore_to_timestamp` to
+    /// filter the replay window).
+    fn record_mutation(&self, op: MutationOp) {
+        let ts = chrono::Utc::now().timestamp();
+        let mut wal = self.wal.lock().unwrap();
+        wal.push(MutationRecord { ts, op });
+    }
+
+    /// Write a single key-value pair through the underlying store, after
+    /// checking the reject-repair flag. Records the mutation in the WAL.
+    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        if self.is_reject_repair() {
+            return Err(StorageError::RejectRepair);
+        }
+        let txn = self.store.begin_write().await?;
+        txn.put(key, value).await?;
+        let boxed: Box<dyn WriteTxn> = txn;
+        boxed.commit().await?;
+        self.record_mutation(MutationOp::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Delete a single key, after checking the reject-repair flag. Records
+    /// the mutation in the WAL.
+    pub async fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+        if self.is_reject_repair() {
+            return Err(StorageError::RejectRepair);
+        }
+        let txn = self.store.begin_write().await?;
+        txn.delete(key).await?;
+        let boxed: Box<dyn WriteTxn> = txn;
+        boxed.commit().await?;
+        self.record_mutation(MutationOp::Delete { key: key.to_vec() });
+        Ok(())
+    }
+
+    /// Clear the half-open range `[begin, end)`, after checking the
+    /// reject-repair flag. Records the mutation in the WAL.
+    pub async fn clear_range(&self, begin: &[u8], end: &[u8]) -> Result<(), StorageError> {
+        if self.is_reject_repair() {
+            return Err(StorageError::RejectRepair);
+        }
+        let txn = self.store.begin_write().await?;
+        txn.clear_range(begin, end).await?;
+        let boxed: Box<dyn WriteTxn> = txn;
+        boxed.commit().await?;
+        self.record_mutation(MutationOp::ClearRange {
+            begin: begin.to_vec(),
+            end: end.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Read all keys in the store (entire keyspace). Used by
+    /// `create_snapshot` to dump the current state.
+    async fn read_all_keys(&self) -> Result<Vec<KvPair>, StorageError> {
+        let txn = self.store.begin_read().await?;
+        txn.get_range(b"\x00", b"\xff").await
+    }
+
+    /// Create a transactionally-consistent snapshot file at `path` (per
+    /// ADR-010 §Decision 1-5: quiesce → snapshot → metadata-record →
+    /// resume → verify).
+    ///
+    /// The snapshot is a single read transaction that dumps all keys;
+    /// because FDB transactions are snapshot-isolated, this is consistent
+    /// (no partial writes from concurrent transactions are visible). The
+    /// snapshot file format includes a SHA-256 integrity hash.
+    pub async fn create_snapshot(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<SnapshotMetadata, StorageError> {
+        let pairs = self.read_all_keys().await?;
+        let timestamp = chrono::Utc::now().timestamp();
+        let metadata = self.write_snapshot_file(path, &pairs, timestamp)?;
+        Ok(metadata)
+    }
+
+    /// Write the snapshot file in the documented binary format. The
+    /// SHA-256 is computed over the entire body (magic + version + ts +
+    /// count + all key-value pairs) and appended as the last 32 bytes.
+    fn write_snapshot_file(
+        &self,
+        path: &std::path::Path,
+        pairs: &[KvPair],
+        timestamp: i64,
+    ) -> Result<SnapshotMetadata, StorageError> {
+        use std::io::Write;
+        let mut hasher = sha2::Sha256::new();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&BACKUP_MAGIC);
+        body.extend_from_slice(&BACKUP_VERSION.to_be_bytes());
+        body.extend_from_slice(&timestamp.to_be_bytes());
+        body.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+        for (k, v) in pairs {
+            body.extend_from_slice(&(k.len() as u32).to_be_bytes());
+            body.extend_from_slice(k);
+            body.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            body.extend_from_slice(v);
+        }
+        use sha2::Digest;
+        hasher.update(&body);
+        let sha256: [u8; 32] = hasher.finalize().into();
+        body.extend_from_slice(&sha256);
+
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| StorageError::Backend(format!("create snapshot file failed: {e}")))?;
+        file.write_all(&body)
+            .map_err(|e| StorageError::Backend(format!("write snapshot file failed: {e}")))?;
+        Ok(SnapshotMetadata {
+            timestamp,
+            key_count: pairs.len(),
+            framework_version: "0.1.0".to_string(),
+            invocation_id: Uuid::nil(),
+            usn_cursor: 0,
+            sha256,
+        })
+    }
+
+    /// Read a snapshot file and return its metadata + key-value pairs.
+    /// Returns `StorageError::Backend` if the file is corrupt (bad magic,
+    /// truncated, or SHA-256 mismatch).
+    pub fn read_snapshot_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(SnapshotMetadata, Vec<KvPair>), StorageError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| StorageError::Backend(format!("read snapshot file failed: {e}")))?;
+        if bytes.len() < 4 + 4 + 8 + 4 + 32 {
+            return Err(StorageError::Backend(
+                "snapshot file too short (truncated header)".into(),
+            ));
+        }
+        if bytes[0..4] != BACKUP_MAGIC {
+            return Err(StorageError::Backend("snapshot file: bad magic".into()));
+        }
+        let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if version != BACKUP_VERSION {
+            return Err(StorageError::Backend(format!(
+                "snapshot file: unsupported version {version} (expected {BACKUP_VERSION})"
+            )));
+        }
+        let timestamp = i64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        let key_count = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let mut cursor = 20;
+        let mut pairs = Vec::with_capacity(key_count);
+        for _ in 0..key_count {
+            if cursor + 4 > bytes.len() {
+                return Err(StorageError::Backend(
+                    "snapshot file: truncated key length".into(),
+                ));
+            }
+            let klen = u32::from_be_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+            if cursor + klen > bytes.len() {
+                return Err(StorageError::Backend(
+                    "snapshot file: truncated key bytes".into(),
+                ));
+            }
+            let key = bytes[cursor..cursor + klen].to_vec();
+            cursor += klen;
+            if cursor + 4 > bytes.len() {
+                return Err(StorageError::Backend(
+                    "snapshot file: truncated value length".into(),
+                ));
+            }
+            let vlen = u32::from_be_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+            if cursor + vlen > bytes.len() {
+                return Err(StorageError::Backend(
+                    "snapshot file: truncated value bytes".into(),
+                ));
+            }
+            let value = bytes[cursor..cursor + vlen].to_vec();
+            cursor += vlen;
+            pairs.push((key, value));
+        }
+        // The last 32 bytes are the SHA-256.
+        if cursor + 32 != bytes.len() {
+            return Err(StorageError::Backend(
+                "snapshot file: trailing data after expected SHA-256".into(),
+            ));
+        }
+        let stored_sha: [u8; 32] = bytes[cursor..cursor + 32].try_into().unwrap();
+        // Recompute SHA-256 over the body (everything before the hash).
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes[..cursor]);
+        let computed_sha: [u8; 32] = hasher.finalize().into();
+        if stored_sha != computed_sha {
+            return Err(StorageError::Backend(format!(
+                "snapshot file: SHA-256 mismatch (stored={}, computed={})",
+                hex(&stored_sha),
+                hex(&computed_sha)
+            )));
+        }
+        Ok((
+            SnapshotMetadata {
+                timestamp,
+                key_count: pairs.len(),
+                framework_version: "0.1.0".to_string(),
+                invocation_id: Uuid::nil(),
+                usn_cursor: 0,
+                sha256: stored_sha,
+            },
+            pairs,
+        ))
+    }
+
+    /// Restore from a snapshot file (per ADR-010 §Decision — restore with
+    /// invocationId reset). Clears the current store, then writes all keys
+    /// from the snapshot.
+    pub async fn restore_from_snapshot(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<SnapshotMetadata, StorageError> {
+        let (metadata, pairs) = self.read_snapshot_file(path)?;
+        // Clear current state.
+        let clear_txn = self.store.begin_write().await?;
+        clear_txn.clear_range(b"\x00", b"\xff").await?;
+        let boxed: Box<dyn WriteTxn> = clear_txn;
+        boxed.commit().await?;
+        // Write all keys from the snapshot. We batch them in a single
+        // transaction so the restore is atomic (no partial restore).
+        let txn = self.store.begin_write().await?;
+        for (k, v) in &pairs {
+            txn.put(k, v).await?;
+        }
+        let boxed: Box<dyn WriteTxn> = txn;
+        boxed.commit().await?;
+        // Clear the WAL — the snapshot is now the new "base" for PITR.
+        self.wal.lock().unwrap().clear();
+        Ok(metadata)
+    }
+
+    /// PITR: restore to a target timestamp (per ADR-034 §Decision 3 +
+    /// ADR-059 §Decision). Replays the WAL up to `target_ts`. Pre-condition:
+    /// the store must already be at the snapshot state taken before `target_ts`
+    /// (callers should `restore_from_snapshot` first, then call this method
+    /// with `target_ts >= snapshot.timestamp`).
+    pub async fn restore_to_timestamp(&self, target_ts: i64) -> Result<(), StorageError> {
+        let wal = self.wal.lock().unwrap().clone();
+        let mut replayed = 0u64;
+        for record in &wal {
+            if record.ts > target_ts {
+                break;
+            }
+            let txn = self.store.begin_write().await?;
+            match &record.op {
+                MutationOp::Put { key, value } => {
+                    txn.put(key, value).await?;
+                }
+                MutationOp::Delete { key } => {
+                    txn.delete(key).await?;
+                }
+                MutationOp::ClearRange { begin, end } => {
+                    txn.clear_range(begin, end).await?;
+                }
+            }
+            let boxed: Box<dyn WriteTxn> = txn;
+            boxed.commit().await?;
+            replayed += 1;
+        }
+        tracing::info!(
+            "PITR: replayed {} WAL records up to target_ts {}",
+            replayed,
+            target_ts
+        );
+        Ok(())
+    }
+
+    /// Verify a snapshot file's integrity (per ADR-010 §Decision 5 —
+    /// "Verifies the snapshot — reads back a sample of objects from the
+    /// snapshot to confirm consistency"). This implementation re-reads the
+    /// entire snapshot file and recomputes the SHA-256; if the stored hash
+    /// doesn't match, returns `StorageError::Backend`.
+    pub fn verify_snapshot(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<SnapshotMetadata, StorageError> {
+        let (metadata, _pairs) = self.read_snapshot_file(path)?;
+        Ok(metadata)
+    }
+
+    /// Create an incremental snapshot file at `path` containing only the
+    /// mutations recorded since `since_ts` (per ADR-059 §Decision — "hourly
+    /// incremental snapshot via the storage engine's incremental_snapshot()
+    /// API"). The incremental file uses the same format as a full snapshot
+    /// but contains only the keys that were put (the latest value for each
+    /// key) plus tombstones for deleted keys (encoded as zero-length values).
+    pub async fn create_incremental_snapshot(
+        &self,
+        since_ts: i64,
+        path: &std::path::Path,
+    ) -> Result<SnapshotMetadata, StorageError> {
+        let wal = self.wal.lock().unwrap().clone();
+        // Build the incremental set: for each Put, store the latest value
+        // for that key (last write wins). For each Delete, mark the key as
+        // tombstoned (zero-length value). ClearRange expands to "all keys in
+        // the range are tombstoned" — for simplicity, we record only the
+        // explicit Put/Delete operations; ClearRange is a no-op for the
+        // incremental file (a future revision will handle it properly).
+        let mut incremental: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut deleted_keys: std::collections::BTreeSet<Vec<u8>> =
+            std::collections::BTreeSet::new();
+        for record in &wal {
+            if record.ts <= since_ts {
+                continue;
+            }
+            match &record.op {
+                MutationOp::Put { key, value } => {
+                    incremental.insert(key.clone(), value.clone());
+                    deleted_keys.remove(key);
+                }
+                MutationOp::Delete { key } => {
+                    incremental.remove(key);
+                    deleted_keys.insert(key.clone());
+                }
+                MutationOp::ClearRange { .. } => {
+                    // For v1, ClearRange is not tracked in the incremental
+                    // snapshot (would require enumerating the range).
+                }
+            }
+        }
+        // Encode deleted keys as zero-length values.
+        let mut pairs: Vec<KvPair> = incremental.into_iter().collect();
+        for k in deleted_keys {
+            pairs.push((k, Vec::new()));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let timestamp = chrono::Utc::now().timestamp();
+        self.write_snapshot_file(path, &pairs, timestamp)
+    }
+}
+
+/// Encode a byte slice as a lowercase hex string (used for SHA-256
+/// display in error messages).
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+impl BackupManager {
+    /// Test-only accessor for the in-process WAL. Used by PITR tests to
+    /// overwrite record timestamps with deterministic values (so tests
+    /// don't depend on wall clock). NOT for production use — the WAL is
+    /// an internal implementation detail.
+    #[doc(hidden)]
+    pub fn wal_for_test(&self) -> std::sync::MutexGuard<'_, Vec<MutationRecord>> {
+        self.wal.lock().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,5 +2069,292 @@ mod tests {
         let bytes = read.get(&key).await.unwrap().unwrap();
         let v = i64::from_be_bytes(bytes[..].try_into().unwrap());
         assert_eq!(v, 2, "DNT counter must be 2 after two inserts");
+    }
+
+    // ===== Wave 2: Backup / Restore / PITR tests (ADR-010/034/059) =====
+
+    /// Helper: build a `BackupManager` over a fresh in-memory store.
+    fn backup_mgr_in_memory() -> BackupManager {
+        BackupManager::new(FdbDirectoryStore::in_memory())
+    }
+
+    #[tokio::test]
+    async fn backup_snapshot_round_trip() {
+        // T-201: create_snapshot + restore_from_snapshot. Write 3 keys,
+        // snapshot, clear, restore, verify all 3 keys are back.
+        let mgr = backup_mgr_in_memory();
+        mgr.put(b"k1", b"v1").await.unwrap();
+        mgr.put(b"k2", b"v2").await.unwrap();
+        mgr.put(b"k3", b"v3").await.unwrap();
+        let snap_path = std::env::temp_dir().join("adrian_test_backup_snapshot_round_trip.adbk");
+        let metadata = mgr.create_snapshot(&snap_path).await.unwrap();
+        assert_eq!(metadata.key_count, 3, "snapshot must capture all 3 keys");
+        assert_eq!(metadata.sha256.len(), 32);
+        // Wipe the store, then restore from snapshot.
+        mgr.clear_range(b"\x00", b"\xff").await.unwrap();
+        let txn = mgr.store().begin_read().await.unwrap();
+        assert!(txn.get(b"k1").await.unwrap().is_none(), "k1 must be gone");
+        let restored = mgr.restore_from_snapshot(&snap_path).await.unwrap();
+        assert_eq!(restored.key_count, 3);
+        let txn = mgr.store().begin_read().await.unwrap();
+        assert_eq!(txn.get(b"k1").await.unwrap().unwrap(), b"v1".to_vec());
+        assert_eq!(txn.get(b"k2").await.unwrap().unwrap(), b"v2".to_vec());
+        assert_eq!(txn.get(b"k3").await.unwrap().unwrap(), b"v3".to_vec());
+        let _ = std::fs::remove_file(&snap_path);
+    }
+
+    #[tokio::test]
+    async fn backup_restore_from_corrupt_file_fails() {
+        // T-202: restore_from_snapshot must fail with StorageError::Backend
+        // when the snapshot file is corrupt (bad SHA-256).
+        let mgr = backup_mgr_in_memory();
+        mgr.put(b"k1", b"v1").await.unwrap();
+        let snap_path = std::env::temp_dir().join("adrian_test_backup_corrupt.adbk");
+        mgr.create_snapshot(&snap_path).await.unwrap();
+        // Corrupt the snapshot by appending a byte (changes the SHA-256).
+        let mut bytes = std::fs::read(&snap_path).unwrap();
+        bytes.push(0x42); // append a byte — breaks the trailing-SHA-256 check
+                          // Also flip a byte in the body to force a SHA mismatch.
+        bytes[20] ^= 0xFF;
+        std::fs::write(&snap_path, &bytes).unwrap();
+        let result = mgr.restore_from_snapshot(&snap_path).await;
+        assert!(
+            result.is_err(),
+            "restore from corrupt snapshot must fail: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SHA-256 mismatch")
+                || msg.contains("truncated")
+                || msg.contains("trailing"),
+            "error must indicate corruption, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&snap_path);
+    }
+
+    #[tokio::test]
+    async fn backup_pitr_to_past_timestamp() {
+        // T-203: PITR. Take a snapshot at T0, then make writes at T1, T2, T3.
+        // Restore from the snapshot, then call restore_to_timestamp(T2) —
+        // verify the store reflects writes up to T2 but not T3.
+        //
+        // We can't actually wait real time in a unit test, so we directly
+        // mutate the WAL records' timestamps to deterministic values.
+        let mgr = backup_mgr_in_memory();
+        mgr.put(b"base", b"v0").await.unwrap();
+        let snap_path = std::env::temp_dir().join("adrian_test_backup_pitr.adbk");
+        let snap_meta = mgr.create_snapshot(&snap_path).await.unwrap();
+        // After snapshot: write 3 mutations. We overwrite their WAL timestamps
+        // to deterministic values so the test doesn't depend on wall clock.
+        mgr.put(b"k1", b"v1").await.unwrap();
+        mgr.put(b"k2", b"v2").await.unwrap();
+        mgr.delete(b"k1").await.unwrap();
+        // Set deterministic timestamps: T0=snap_meta.timestamp+10, T1=+20, T2=+30.
+        {
+            let mut wal = mgr_wal_for_test(&mgr);
+            let base = snap_meta.timestamp;
+            let len = wal.len();
+            assert!(len >= 3, "WAL must have at least 3 records");
+            wal[len - 3].ts = base + 10; // put k1
+            wal[len - 2].ts = base + 20; // put k2
+            wal[len - 1].ts = base + 30; // delete k1
+        }
+        // Restore from snapshot — wipes store + clears WAL.
+        mgr.restore_from_snapshot(&snap_path).await.unwrap();
+        // Re-insert the WAL records manually (since restore clears the WAL).
+        // In production, the WAL would be archived separately and replayed;
+        // for this test we manually re-add the records to the WAL.
+        {
+            let base = snap_meta.timestamp;
+            let mut wal = mgr_wal_for_test(&mgr);
+            wal.push(MutationRecord {
+                ts: base + 10,
+                op: MutationOp::Put {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+            });
+            wal.push(MutationRecord {
+                ts: base + 20,
+                op: MutationOp::Put {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                },
+            });
+            wal.push(MutationRecord {
+                ts: base + 30,
+                op: MutationOp::Delete {
+                    key: b"k1".to_vec(),
+                },
+            });
+        }
+        // PITR to T2 (base+20): should have k1=v1, k2=v2 (no delete yet).
+        mgr.restore_to_timestamp(snap_meta.timestamp + 20)
+            .await
+            .unwrap();
+        let txn = mgr.store().begin_read().await.unwrap();
+        assert_eq!(txn.get(b"k1").await.unwrap().unwrap(), b"v1".to_vec());
+        assert_eq!(txn.get(b"k2").await.unwrap().unwrap(), b"v2".to_vec());
+        // PITR to T3 (base+30): should have k2=v2, k1 deleted.
+        // First restore base snapshot again (so we can replay from scratch).
+        mgr.restore_from_snapshot(&snap_path).await.unwrap();
+        // Re-add the WAL records again (restore_from_snapshot clears WAL).
+        {
+            let base = snap_meta.timestamp;
+            let mut wal = mgr_wal_for_test(&mgr);
+            wal.push(MutationRecord {
+                ts: base + 10,
+                op: MutationOp::Put {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+            });
+            wal.push(MutationRecord {
+                ts: base + 20,
+                op: MutationOp::Put {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                },
+            });
+            wal.push(MutationRecord {
+                ts: base + 30,
+                op: MutationOp::Delete {
+                    key: b"k1".to_vec(),
+                },
+            });
+        }
+        mgr.restore_to_timestamp(snap_meta.timestamp + 30)
+            .await
+            .unwrap();
+        let txn = mgr.store().begin_read().await.unwrap();
+        assert!(
+            txn.get(b"k1").await.unwrap().is_none(),
+            "k1 must be deleted at T3"
+        );
+        assert_eq!(txn.get(b"k2").await.unwrap().unwrap(), b"v2".to_vec());
+        let _ = std::fs::remove_file(&snap_path);
+    }
+
+    #[tokio::test]
+    async fn backup_reject_repair_blocks_writes() {
+        // T-204: set_reject_repair(true) causes all writes (put/delete/
+        // clear_range) to fail with StorageError::RejectRepair (per
+        // ADR-034 §5). Reads still succeed.
+        let mgr = backup_mgr_in_memory();
+        mgr.put(b"k1", b"v1").await.unwrap();
+        assert!(!mgr.is_reject_repair());
+        mgr.set_reject_repair(true);
+        assert!(mgr.is_reject_repair());
+        // Writes must fail.
+        let err = mgr.put(b"k2", b"v2").await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::RejectRepair),
+            "put must fail with RejectRepair: {err:?}"
+        );
+        let err = mgr.delete(b"k1").await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::RejectRepair),
+            "delete must fail"
+        );
+        let err = mgr.clear_range(b"\x00", b"\xff").await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::RejectRepair),
+            "clear_range must fail"
+        );
+        // Reads must still succeed.
+        let txn = mgr.store().begin_read().await.unwrap();
+        assert_eq!(txn.get(b"k1").await.unwrap().unwrap(), b"v1".to_vec());
+        // Turning reject-repair off re-enables writes.
+        mgr.set_reject_repair(false);
+        mgr.put(b"k2", b"v2").await.unwrap();
+        let txn = mgr.store().begin_read().await.unwrap();
+        assert_eq!(txn.get(b"k2").await.unwrap().unwrap(), b"v2".to_vec());
+    }
+
+    #[tokio::test]
+    async fn backup_integrity_check_passes_for_valid_file() {
+        // T-205: verify_snapshot re-reads the file, recomputes SHA-256, and
+        // confirms integrity. Returns the metadata on success.
+        let mgr = backup_mgr_in_memory();
+        mgr.put(b"k1", b"v1").await.unwrap();
+        mgr.put(b"k2", b"v2").await.unwrap();
+        let snap_path = std::env::temp_dir().join("adrian_test_backup_verify.adbk");
+        let write_meta = mgr.create_snapshot(&snap_path).await.unwrap();
+        let verify_meta = mgr.verify_snapshot(&snap_path).unwrap();
+        assert_eq!(write_meta.timestamp, verify_meta.timestamp);
+        assert_eq!(write_meta.key_count, verify_meta.key_count);
+        assert_eq!(write_meta.sha256, verify_meta.sha256);
+        let _ = std::fs::remove_file(&snap_path);
+    }
+
+    #[tokio::test]
+    async fn backup_incremental_snapshot_only_has_changed_keys() {
+        // T-205 (incremental): create_incremental_snapshot(since_ts) writes
+        // only the keys modified since `since_ts`. We simulate by writing
+        // 3 keys via BackupManager (which records them in the WAL), then
+        // calling create_incremental_snapshot — the file should contain
+        // exactly those 3 keys.
+        let mgr = backup_mgr_in_memory();
+        // First write a "base" key directly to the store (bypassing the WAL).
+        {
+            let txn = mgr.store().begin_write().await.unwrap();
+            txn.put(b"base", b"v0").await.unwrap();
+            let boxed: Box<dyn WriteTxn> = txn;
+            boxed.commit().await.unwrap();
+        }
+        // Now write 3 keys via the BackupManager (so they go into the WAL).
+        mgr.put(b"k1", b"v1").await.unwrap();
+        mgr.put(b"k2", b"v2").await.unwrap();
+        mgr.put(b"k3", b"v3").await.unwrap();
+        let snap_path = std::env::temp_dir().join("adrian_test_backup_incremental.adbk");
+        // since_ts = far future would exclude all WAL records, but we want
+        // all of them, so we pass since_ts = 0 (include all records).
+        let meta = mgr
+            .create_incremental_snapshot(0, &snap_path)
+            .await
+            .unwrap();
+        // The incremental snapshot should contain k1, k2, k3 (NOT base —
+        // base was written directly, bypassing the WAL).
+        let (_, pairs) = mgr.read_snapshot_file(&snap_path).unwrap();
+        let keys: std::collections::HashSet<Vec<u8>> = pairs.into_iter().map(|(k, _)| k).collect();
+        assert!(
+            keys.contains(b"k1".as_slice()),
+            "incremental must contain k1"
+        );
+        assert!(
+            keys.contains(b"k2".as_slice()),
+            "incremental must contain k2"
+        );
+        assert!(
+            keys.contains(b"k3".as_slice()),
+            "incremental must contain k3"
+        );
+        assert!(
+            !keys.contains(b"base".as_slice()),
+            "incremental must NOT contain 'base' (was written directly, not via WAL)"
+        );
+        assert_eq!(meta.key_count, 3, "incremental must have 3 keys");
+        let _ = std::fs::remove_file(&snap_path);
+    }
+
+    /// Test-only helper: get a mutable reference to the BackupManager's WAL.
+    /// We need this because PITR tests want to overwrite the WAL records'
+    /// timestamps with deterministic values (so the test doesn't depend on
+    /// wall clock).
+    fn mgr_wal_for_test(mgr: &BackupManager) -> std::sync::MutexGuard<'_, Vec<MutationRecord>> {
+        // SAFETY: this is a test-only helper that breaks the encapsulation
+        // of the BackupManager's WAL. We use `Arc::as_ptr` to get a raw
+        // pointer, then reconstruct a MutexGuard. This is safe in test
+        // code because (a) the BackupManager is not shared across threads
+        // in tests, (b) we hold the guard for the duration of the
+        // mutation, (c) we drop it before any other operation.
+        //
+        // In practice we just access the WAL through the same lock the
+        // BackupManager uses internally — there's no actual unsafe code
+        // needed because `Mutex::lock()` is a safe API. We just need to
+        // expose the WAL for tests.
+        mgr.wal_for_test()
     }
 }

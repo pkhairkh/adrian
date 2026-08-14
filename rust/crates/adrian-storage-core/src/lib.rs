@@ -290,6 +290,15 @@ pub enum StorageError {
     /// SD-dedup reference-count corruption (per ADR-004).
     #[error("sdtable corruption: {0}")]
     SdCorruption(String),
+    /// Reject-repair mode is active (per ADR-034 §Decision 5 — "Reject hard
+    /// repair tools"). When the `BackupManager` has set the reject-repair flag,
+    /// all writes (put/delete/atomic_add/clear_range/commit) MUST fail with
+    /// this error. The only recovery procedure is to restore from backup +
+    /// WAL replay; there is no `eseutil /p` equivalent.
+    ///
+    /// Wave 2: implemented by `BackupManager::set_reject_repair(true)`.
+    #[error("reject-repair mode is active; restore from backup (per ADR-034)")]
+    RejectRepair,
     /// Backend error (FDB cluster unavailable, network, etc.).
     #[error("backend error: {0}")]
     Backend(String),

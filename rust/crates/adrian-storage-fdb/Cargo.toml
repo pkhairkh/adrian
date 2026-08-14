@@ -24,6 +24,10 @@ uuid.workspace = true
 tokio = { workspace = true }
 bytes.workspace = true
 tracing.workspace = true
+# Wave 2 (ADR-010/034/059): backup/restore needs SHA-256 for snapshot
+# integrity verification and chrono for PITR timestamps.
+sha2.workspace = true
+chrono = { workspace = true }
 # `foundationdb` is declared as optional so that `cargo check` passes on
 # systems without libclang (foundationdb-sys requires it for bindgen). The
 # `fdb` feature flag enables the real backend; the in-memory fallback path
