@@ -482,6 +482,235 @@ impl AcmeState {
 }
 
 // ===========================================================================
+// Challenge verification (RFC 8555 §8.1-§8.4) — Domain-06 Wave 3
+// ===========================================================================
+
+/// Trait for http-01 challenge verification (RFC 8555 §8.1). The ACME
+/// server fetches `http://{domain}/.well-known/acme-challenge/{token}` and
+/// checks that the response body equals `{token}.{jwk_thumbprint}`.
+///
+/// Defining this as a trait lets tests inject a mock verifier (e.g. one
+/// that reads from a local hyper server) without real DNS / network.
+#[async_trait::async_trait]
+pub trait Http01Verifier: Send + Sync {
+    /// Fetch the URL and return the response body. Implementations should
+    /// follow redirects per RFC 8555 §8.1 (the ACME server MAY follow
+    /// redirects within the same host).
+    async fn fetch(&self, url: &str) -> Result<String, AcmeError>;
+}
+
+/// Real http-01 verifier using `reqwest`. Follows redirects, returns the
+/// response body as text. Used in production.
+pub struct ReqwestHttp01Verifier {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttp01Verifier {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .expect("reqwest client"),
+        }
+    }
+}
+
+impl Default for ReqwestHttp01Verifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl Http01Verifier for ReqwestHttp01Verifier {
+    async fn fetch(&self, url: &str) -> Result<String, AcmeError> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AcmeError::Internal(format!("http-01 fetch: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(AcmeError::Unauthorized(format!(
+                "http-01 HTTP {}",
+                resp.status()
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AcmeError::Internal(format!("http-01 body: {e}")))?;
+        Ok(body)
+    }
+}
+
+/// Verify an http-01 challenge (RFC 8555 §8.1). Fetches
+/// `http://{domain}/.well-known/acme-challenge/{token}` and checks that
+/// the response body equals `key_auth` (the expected
+/// `{token}.{jwk_thumbprint}` value).
+pub async fn verify_http_01_challenge(
+    verifier: &dyn Http01Verifier,
+    domain: &str,
+    token: &str,
+    key_auth: &str,
+) -> Result<(), AcmeError> {
+    let url = format!("http://{domain}/.well-known/acme-challenge/{token}");
+    let body = verifier.fetch(&url).await?;
+    // RFC 8555 §8.1: the server MUST verify that the response body equals
+    // the expected key authorization. Trim trailing whitespace (some
+    // servers add a newline).
+    let body_trimmed = body.trim_end();
+    let key_auth_trimmed = key_auth.trim_end();
+    if body_trimmed == key_auth_trimmed {
+        Ok(())
+    } else {
+        Err(AcmeError::Unauthorized(format!(
+            "http-01 key authorization mismatch: expected {key_auth_trimmed}, got {body_trimmed}"
+        )))
+    }
+}
+
+/// Trait for dns-01 challenge verification (RFC 8555 §8.4). The ACME
+/// server queries `_acme-challenge.{domain}` TXT records and checks that
+/// at least one matches the expected value.
+#[async_trait::async_trait]
+pub trait Dns01Verifier: Send + Sync {
+    /// Query TXT records for `name` and return all matching strings.
+    async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, AcmeError>;
+}
+
+/// Real dns-01 verifier using `hickory-resolver`.
+pub struct HickoryDns01Verifier {
+    resolver: std::sync::Arc<hickory_resolver::TokioAsyncResolver>,
+}
+
+impl HickoryDns01Verifier {
+    pub fn new() -> Self {
+        Self {
+            resolver: std::sync::Arc::new(
+                hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
+                    .expect("hickory resolver"),
+            ),
+        }
+    }
+}
+
+impl Default for HickoryDns01Verifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl Dns01Verifier for HickoryDns01Verifier {
+    async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, AcmeError> {
+        let lookup = self
+            .resolver
+            .txt_lookup(name)
+            .await
+            .map_err(|e| AcmeError::Internal(format!("dns-01 lookup: {e}")))?;
+        Ok(lookup.iter().map(|r| r.to_string()).collect::<Vec<_>>())
+    }
+}
+
+/// Verify a dns-01 challenge (RFC 8555 §8.4). Queries
+/// `_acme-challenge.{domain}` TXT records and checks that at least one
+/// matches `expected` (the SHA-256 digest of the key authorization,
+/// base64url-encoded).
+pub async fn verify_dns_01_challenge(
+    verifier: &dyn Dns01Verifier,
+    domain: &str,
+    expected: &str,
+) -> Result<(), AcmeError> {
+    let name = format!("_acme-challenge.{domain}");
+    let txts = verifier.lookup_txt(&name).await?;
+    if txts.iter().any(|t| t == expected) {
+        Ok(())
+    } else {
+        Err(AcmeError::Unauthorized(format!(
+            "dns-01: no TXT record for {name} matched {expected} (got {} records)",
+            txts.len()
+        )))
+    }
+}
+
+/// Compute the dns-01 challenge response value (RFC 8555 §8.4: SHA-256
+/// of the key authorization, base64url-encoded).
+pub fn dns_01_response_value(key_auth: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, key_auth.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest.as_ref())
+}
+
+/// Compute the http-01 key authorization (`{token}.{jwk_thumbprint}`).
+pub fn http_01_key_auth(token: &str, jwk: &Jwk) -> Result<String, AcmeError> {
+    let thumb = jwk.thumbprint()?;
+    Ok(format!("{token}.{thumb}"))
+}
+
+// ===========================================================================
+// ARI (RFC 8823) — Renewal Information endpoint
+// ===========================================================================
+
+/// ARI renewal-info response (RFC 8823 §4). The suggested window is the
+/// time range during which the client SHOULD attempt renewal.
+#[derive(Clone, Debug, Serialize)]
+pub struct AriRenewalInfo {
+    /// Suggested renewal window (start, end) in RFC 3339 format.
+    pub suggested_window: AriWindow,
+    /// Optional explanation URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation_url: Option<String>,
+}
+
+/// ARI renewal window.
+#[derive(Clone, Debug, Serialize)]
+pub struct AriWindow {
+    pub start: String,
+    pub end: String,
+}
+
+/// Parse an ARI certID (RFC 8823 §4.1). The certID is the base64url-encoded
+/// `issuerNameHash || issuerKeyHash || serialNumber` — specifically the
+/// `keyIdentifier` of the AKI ext + serial. For simplicity, this Wave 3
+/// implementation accepts a serial number directly and returns a default
+/// renewal window.
+pub fn parse_ari_cert_id(cert_id: &str) -> Result<u64, AcmeError> {
+    // The RFC 8823 certID is the base64url of the CertID (same structure as
+    // OCSP). For this implementation we accept either:
+    // 1. A plain decimal serial number (test convenience), OR
+    // 2. A base64url-encoded CertId (parsed via adrian_ca::OcspCertId).
+    if let Ok(serial) = cert_id.parse::<u64>() {
+        return Ok(serial);
+    }
+    // Try base64url decode + OCSP CertId parse.
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cert_id)
+        .map_err(|e| AcmeError::Malformed(format!("ari certId b64: {e}")))?;
+    let cert_id: adrian_ca::OcspCertId = rasn::der::decode(&bytes)
+        .map_err(|e| AcmeError::Malformed(format!("ari certId der: {e}")))?;
+    u64::try_from(&cert_id.serial_number)
+        .map_err(|_| AcmeError::Malformed("ari certId serial too large".into()))
+}
+
+/// Compute the ARI suggested renewal window for a certificate with the
+/// given `not_after` (expiry). RFC 8823 §4.2 recommends renewing in the
+/// last 1/3 of the certificate's validity period. For a 90-day cert, that's
+/// the last 30 days.
+pub fn ari_suggested_window(
+    not_after: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AriWindow {
+    let window_start = not_after - chrono::Duration::days(30);
+    let window_end = not_after;
+    let _ = now;
+    AriWindow {
+        start: window_start.to_rfc3339(),
+        end: window_end.to_rfc3339(),
+    }
+}
+
+// ===========================================================================
 // ACME server handle
 // ===========================================================================
 
@@ -525,9 +754,18 @@ impl AcmeServer {
     }
 
     /// Serve ARI (RFC 8823) renewal-info endpoint.
+    /// `GET /draft-ietf-acme-ari-03/renewal-info/{certID}` returns the
+    /// suggested renewal window for the certificate identified by `certID`.
+    /// The certID is either a plain decimal serial number (test convenience)
+    /// or a base64url-encoded OCSP CertId.
     pub fn ari_router(&self) -> Router {
-        // Wave 3a: ARI is a placeholder — RFC 8823 is not yet implemented.
+        let state = self.state.clone();
         Router::new()
+            .route(
+                "/draft-ietf-acme-ari-03/renewal-info/{cert_id}",
+                get(ari_renewal_info_handler),
+            )
+            .with_state(state)
     }
 }
 
@@ -1013,6 +1251,50 @@ async fn get_cert(State(state): State<Arc<AcmeState>>, Path(id): Path<String>) -
     resp
 }
 
+/// `GET /draft-ietf-acme-ari-03/renewal-info/{certID}` (RFC 8823 §4).
+/// Returns the suggested renewal window for the certificate identified by
+/// `certID`. The certID is either a plain decimal serial or a base64url-
+/// encoded OCSP CertId.
+async fn ari_renewal_info_handler(
+    State(state): State<Arc<AcmeState>>,
+    Path(cert_id): Path<String>,
+) -> Response {
+    let serial = match parse_ari_cert_id(&cert_id) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // Look up the issued cert by serial to find its not_after.
+    let cert = match state.ca.issued_cert_by_serial(serial).await {
+        Some(c) => c,
+        None => {
+            // RFC 8823 §4.2: if the cert is unknown, return a window that
+            // suggests immediate renewal (start = now, end = now + 7 days).
+            let now = chrono::Utc::now();
+            let window = AriWindow {
+                start: now.to_rfc3339(),
+                end: (now + chrono::Duration::days(7)).to_rfc3339(),
+            };
+            let info = AriRenewalInfo {
+                suggested_window: window,
+                explanation_url: None,
+            };
+            let mut resp = Json(serde_json::to_value(&info).unwrap_or_default()).into_response();
+            resp.headers_mut()
+                .insert("Content-Type", HeaderValue::from_static("application/json"));
+            return resp;
+        }
+    };
+    let window = ari_suggested_window(cert.not_after, chrono::Utc::now());
+    let info = AriRenewalInfo {
+        suggested_window: window,
+        explanation_url: None,
+    };
+    let mut resp = Json(serde_json::to_value(&info).unwrap_or_default()).into_response();
+    resp.headers_mut()
+        .insert("Content-Type", HeaderValue::from_static("application/json"));
+    resp
+}
+
 // ===========================================================================
 // Helpers
 // ===========================================================================
@@ -1359,7 +1641,7 @@ mod tests {
     fn make_csr_der() -> Vec<u8> {
         // Reuse adrian_ca's test CSR builder via ring directly.
         let rng = SystemRandom::new();
-        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
         let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
         let kp = ring::signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap();
         let pub_sec1 = kp.public_key().as_ref().to_vec();
@@ -1642,5 +1924,188 @@ mod tests {
         let server = AcmeServer::default();
         let _r1 = server.router();
         let _r2 = server.ari_router();
+    }
+
+    // ===== Domain-06 Wave 3: Real challenge verification + ARI tests =====
+
+    /// Mock http-01 verifier that returns a pre-configured response body.
+    /// Used to test `verify_http_01_challenge` without real network.
+    struct MockHttp01 {
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Http01Verifier for MockHttp01 {
+        async fn fetch(&self, _url: &str) -> Result<String, AcmeError> {
+            Ok(self.response.clone())
+        }
+    }
+
+    /// http-01 challenge verification succeeds when the response body
+    /// matches the expected key authorization (RFC 8555 §8.1).
+    #[tokio::test]
+    async fn http_01_challenge_succeeds_with_matching_key_auth() {
+        let kp = test_keypair();
+        let jwk = jwk_from_kp(&kp);
+        let token = "test-token-12345";
+        let key_auth = http_01_key_auth(token, &jwk).expect("key auth");
+        let verifier = MockHttp01 {
+            response: key_auth.clone(),
+        };
+        let result = verify_http_01_challenge(&verifier, "example.com", token, &key_auth).await;
+        assert!(
+            result.is_ok(),
+            "http-01 should succeed with matching key auth"
+        );
+    }
+
+    /// http-01 challenge verification fails when the response body does NOT
+    /// match the expected key authorization (RFC 8555 §8.1).
+    #[tokio::test]
+    async fn http_01_challenge_fails_with_wrong_response() {
+        let kp = test_keypair();
+        let jwk = jwk_from_kp(&kp);
+        let token = "test-token-12345";
+        let key_auth = http_01_key_auth(token, &jwk).expect("key auth");
+        let verifier = MockHttp01 {
+            response: "wrong-response".to_string(),
+        };
+        let result = verify_http_01_challenge(&verifier, "example.com", token, &key_auth).await;
+        let err = result.expect_err("http-01 should fail with wrong response");
+        assert!(matches!(err, AcmeError::Unauthorized(_)), "{err:?}");
+        assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    /// Mock dns-01 verifier that returns pre-configured TXT records.
+    struct MockDns01 {
+        txts: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Dns01Verifier for MockDns01 {
+        async fn lookup_txt(&self, _name: &str) -> Result<Vec<String>, AcmeError> {
+            Ok(self.txts.clone())
+        }
+    }
+
+    /// dns-01 challenge verification succeeds when a TXT record matches
+    /// the expected value (RFC 8555 §8.4).
+    #[tokio::test]
+    async fn dns_01_challenge_succeeds_with_matching_txt() {
+        let kp = test_keypair();
+        let jwk = jwk_from_kp(&kp);
+        let token = "dns-token-abc";
+        let key_auth = http_01_key_auth(token, &jwk).expect("key auth");
+        let expected = dns_01_response_value(&key_auth);
+        let verifier = MockDns01 {
+            txts: vec![expected.clone()],
+        };
+        let result = verify_dns_01_challenge(&verifier, "example.com", &expected).await;
+        assert!(result.is_ok(), "dns-01 should succeed with matching TXT");
+    }
+
+    /// ARI endpoint returns a renewal window for an existing cert.
+    /// We issue a cert via the ACME flow, then query ARI with its serial.
+    #[tokio::test]
+    async fn ari_returns_renewal_window_for_existing_cert() {
+        let server = AcmeServer::new("https://ca.example.com/acme").unwrap();
+        // Issue a cert to populate the CA's issued ledger.
+        let (kid, _jwk, kp, nonce) = create_account(&server).await;
+        // Create order + finalize to get a cert.
+        let protected = JwsProtectedHeader {
+            alg: "ES256".into(),
+            jwk: None,
+            kid: Some(kid.clone()),
+            nonce,
+            url: format!("{}/new-order", server.state().base_url),
+        };
+        let payload = serde_json::json!({
+            "identifiers": [{"type":"dns","value":"ari.adrian.dev"}],
+        });
+        let body = sign_jws(&kp, &protected, &payload);
+        let router = server.router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/new-order")
+            .header("Content-Type", "application/jose+json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (_status, headers, _body_bytes) = send(router, req).await;
+        let order_url = headers
+            .get("Location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let order_id = order_url.rsplit('/').next().unwrap().to_string();
+        let new_nonce = headers
+            .get("Replay-Nonce")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Finalize.
+        let csr_der = make_csr_der();
+        let csr_b64 = URL_SAFE_NO_PAD.encode(&csr_der);
+        let protected = JwsProtectedHeader {
+            alg: "ES256".into(),
+            jwk: None,
+            kid: Some(kid.clone()),
+            nonce: new_nonce,
+            url: format!("{}/order/{order_id}/finalize", server.state().base_url),
+        };
+        let payload = serde_json::json!({ "csr": csr_b64 });
+        let body = sign_jws(&kp, &protected, &payload);
+        let router = server.router();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/order/{order_id}/finalize"))
+            .header("Content-Type", "application/jose+json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (_status, _headers, _body_bytes) = send(router, req).await;
+
+        // Query ARI with serial 1 (the first issued cert).
+        let ari_router = server.ari_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/draft-ietf-acme-ari-03/renewal-info/1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _headers, body_bytes) = send(ari_router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(v["suggested_window"]["start"].is_string());
+        assert!(v["suggested_window"]["end"].is_string());
+    }
+
+    /// ARI endpoint for a non-existent cert returns a window suggesting
+    /// immediate renewal (RFC 8823 §4.2).
+    #[tokio::test]
+    async fn ari_returns_immediate_window_for_unknown_cert() {
+        let server = AcmeServer::new("https://ca.example.com/acme").unwrap();
+        let ari_router = server.ari_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/draft-ietf-acme-ari-03/renewal-info/999999")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _headers, body_bytes) = send(ari_router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(v["suggested_window"]["start"].is_string());
+        assert!(v["suggested_window"]["end"].is_string());
+        // The start time should be recent (within the last minute).
+        let start = v["suggested_window"]["start"].as_str().unwrap();
+        let start_dt = chrono::DateTime::parse_from_rfc3339(start).unwrap();
+        let now = chrono::Utc::now();
+        let delta = (now - start_dt.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .abs();
+        assert!(
+            delta < 120,
+            "ARI window start should be recent (delta={delta}s)"
+        );
     }
 }

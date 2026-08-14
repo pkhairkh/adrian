@@ -13,6 +13,10 @@ default = []
 # — suitable for development, test, and small deployments per ADR-015 §Rationale
 # ("software-based HSM ... for development and testing").
 hsm = ["dep:cryptoki"]
+# `enterprise-hsm` is an alias for `hsm` — kept for backwards-compat with
+# the tasklist DoD that references `enterprise-hsm` (and with the CA crate's
+# feature of the same name). Both flags enable the PKCS#11 backend.
+enterprise-hsm = ["hsm"]
 
 [dependencies]
 async-trait.workspace = true
@@ -38,3 +42,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
