@@ -1359,7 +1359,7 @@ mod tests {
     fn make_csr_der() -> Vec<u8> {
         // Reuse adrian_ca's test CSR builder via ring directly.
         let rng = SystemRandom::new();
-        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
         let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
         let kp = ring::signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap();
         let pub_sec1 = kp.public_key().as_ref().to_vec();

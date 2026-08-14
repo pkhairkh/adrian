@@ -103,11 +103,17 @@ impl Signer for SoftwareSigner {
 /// - `Rsa2048` — placeholder for RSA-2048 (used by future PKINIT / cert
 ///   signing); software-backed RSA is not implemented in this wave —
 ///   `generate_key(Rsa2048)` returns `Unsupported`.
+/// - `EcdsaP256` — ECDSA P-256 key pair (Wave 1 of domain-06). Backed by
+///   `ring::signature::EcdsaKeyPair` in `SoftwareHsm`; `sign_ecdsa` returns
+///   DER-encoded `ECDSA-Sig-Value` (ASN.1 `SEQUENCE { r INTEGER, s INTEGER }`),
+///   suitable for embedding directly into X.509 `BIT STRING` signature fields.
+///   Used by `adrian-ca` to sign certificates through the HSM trait (ADR-037).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
     Aes256,
     HmacSha1,
     Rsa2048,
+    EcdsaP256,
 }
 
 /// Opaque handle returned by the HSM. The `id` identifies the key by name
@@ -158,15 +164,100 @@ pub trait Hsm: Send + Sync {
     /// is overwritten (the software HSM does NOT keep `previous` — callers
     /// like `KrbtgtManager` track dual-key overlap themselves per ADR-015).
     async fn rotate_key(&self, key_id: &str) -> Result<KeyHandle, HsmError>;
+
+    /// Sign `data` with the ECDSA P-256 key identified by `key_handle` and
+    /// return the DER-encoded `ECDSA-Sig-Value` (`SEQUENCE { r INTEGER,
+    /// s INTEGER }`). The hash is SHA-256 (RFC 5480 §2.2). The key MUST be
+    /// `KeyType::EcdsaP256`. Used by `adrian-ca` for X.509 cert signing
+    /// through the HSM trait (ADR-037).
+    async fn sign_ecdsa(&self, key_handle: &KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError>;
+
+    /// Verify a DER-encoded `ECDSA-Sig-Value` signature produced by
+    /// `sign_ecdsa`. Returns `true` on success.
+    async fn verify_ecdsa(
+        &self,
+        key_handle: &KeyHandle,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, HsmError>;
+
+    /// Return the SEC1 uncompressed public key (65 bytes: `0x04 || X || Y`)
+    /// for an ECDSA P-256 key. Required by the CA to embed the public key
+    /// in `SubjectPublicKeyInfo` and to compute the SubjectKeyIdentifier
+    /// (SHA-1 of the SEC1 bytes per RFC 5280 §4.2.1.2 method 1).
+    async fn public_key_ecdsa(&self, key_handle: &KeyHandle) -> Result<Vec<u8>, HsmError>;
 }
 
 // ---- in-memory key entry ----
 
+/// ECDSA P-256 key pair held in software. Wraps a `ring::signature::EcdsaKeyPair`
+/// behind an `Arc` so the entry can be `Clone` (required because `KeyEntry`
+/// is stored in a `HashMap` and may need to be cloned out for read paths).
+/// The underlying `EcdsaKeyPair` is `Send + Sync` per ring's docs.
+#[derive(Clone)]
+pub struct EcdsaP256Key {
+    inner: Arc<ring::signature::EcdsaKeyPair>,
+    /// SEC1 uncompressed public key (65 bytes: 0x04 || X || Y).
+    public_sec1: Vec<u8>,
+}
+
+impl std::fmt::Debug for EcdsaP256Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcdsaP256Key")
+            .field("public_sec1_len", &self.public_sec1.len())
+            .finish()
+    }
+}
+
+impl EcdsaP256Key {
+    /// Generate a fresh ECDSA-P256 key pair.
+    pub fn generate() -> Result<Self, HsmError> {
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(alg, &rng)
+            .map_err(|_| HsmError::Crypto("ECDSA P-256 key generation failed".into()))?;
+        let kp = ring::signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng)
+            .map_err(|_| HsmError::Crypto("ECDSA P-256 from_pkcs8 failed".into()))?;
+        let public_sec1 = kp.public_key().as_ref().to_vec();
+        Ok(Self {
+            inner: Arc::new(kp),
+            public_sec1,
+        })
+    }
+
+    /// Sign `data` returning DER-encoded `ECDSA-Sig-Value`
+    /// (`SEQUENCE { r INTEGER, s INTEGER }`). The ASN1 signing algorithm
+    /// is used so ring produces DER output directly (the FIXED variant
+    /// returns a 64-byte raw r||s concatenation).
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let rng = ring::rand::SystemRandom::new();
+        let sig = self
+            .inner
+            .sign(&rng, data)
+            .map_err(|_| HsmError::Crypto("ECDSA sign failed".into()))?;
+        Ok(sig.as_ref().to_vec())
+    }
+
+    /// Verify a DER-encoded `ECDSA-Sig-Value` signature against `data`.
+    pub fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
+        let pk = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            &self.public_sec1,
+        );
+        Ok(pk.verify(data, signature).is_ok())
+    }
+
+    /// Return the SEC1 uncompressed public key (65 bytes).
+    pub fn public_sec1(&self) -> &[u8] {
+        &self.public_sec1
+    }
+}
+
 #[derive(Clone, Debug)]
 struct KeyEntry {
     key_type: KeyType,
-    /// Raw key material. NEVER leaves the `SoftwareHsm` except via the
-    /// `sign`/`verify`/`encrypt`/`decrypt` operations.
+    /// Raw symmetric key material for `Aes256` / `HmacSha1`.
     ///
     /// Wrapped in `Zeroizing<Vec<u8>>` so that the heap buffer is securely
     /// zeroed when this entry is dropped (e.g. during `rotate_key` or HSM
@@ -174,7 +265,14 @@ struct KeyEntry {
     /// persist in memory after the owning handle is dropped. Compare with
     /// `adrian-ntlm-client`'s correct use of `Zeroizing<[u8; 16]>` for NT
     /// hashes.
+    ///
+    /// For `EcdsaP256` keys, this field is empty — the key pair lives in
+    /// `ecdsa` (which wraps `ring::EcdsaKeyPair` and does not expose
+    /// extractable private key material; ring keeps the scalar internal).
+    #[allow(dead_code)]
     material: Zeroizing<Vec<u8>>,
+    /// ECDSA P-256 key pair. `None` for symmetric key types.
+    ecdsa: Option<EcdsaP256Key>,
     version: u32,
 }
 
@@ -268,13 +366,16 @@ impl SoftwareHsm {
         Ok(plaintext.to_vec())
     }
 
-    /// Key material length for each `KeyType`.
+    /// Key material length for each symmetric `KeyType`. Returns 0 for
+    /// asymmetric types (RSA / ECDSA) whose material lives in `ecdsa` /
+    /// a future `rsa` field rather than the byte buffer.
     fn key_len(key_type: KeyType) -> usize {
         match key_type {
             KeyType::Aes256 => 32,
             KeyType::HmacSha1 => 20,
-            // RSA requires a real keypair generator (not in this wave).
+            // RSA / ECDSA material lives in dedicated fields, not `material`.
             KeyType::Rsa2048 => 0,
+            KeyType::EcdsaP256 => 0,
         }
     }
 }
@@ -310,10 +411,22 @@ impl Hsm for SoftwareHsm {
                 key_type: existing.key_type,
             });
         }
-        let material = Zeroizing::new(Self::random_bytes(Self::key_len(key_type))?);
+        let (material, ecdsa) = match key_type {
+            KeyType::Aes256 | KeyType::HmacSha1 => (
+                Zeroizing::new(Self::random_bytes(Self::key_len(key_type))?),
+                None,
+            ),
+            KeyType::EcdsaP256 => (Zeroizing::new(Vec::new()), Some(EcdsaP256Key::generate()?)),
+            KeyType::Rsa2048 => {
+                return Err(HsmError::Unsupported(
+                    "RSA-2048 not implemented in SoftwareHsm".into(),
+                ));
+            }
+        };
         let entry = KeyEntry {
             key_type,
             material,
+            ecdsa,
             version: 1,
         };
         keys.insert(key_id.to_string(), entry);
@@ -345,6 +458,9 @@ impl Hsm for SoftwareHsm {
             )),
             KeyType::Rsa2048 => Err(HsmError::Unsupported(
                 "RSA-2048 not implemented in SoftwareHsm".into(),
+            )),
+            KeyType::EcdsaP256 => Err(HsmError::Unsupported(
+                "EcdsaP256 keys must use sign_ecdsa (not sign)".into(),
             )),
         }
     }
@@ -388,6 +504,9 @@ impl Hsm for SoftwareHsm {
             KeyType::Rsa2048 => Err(HsmError::Unsupported(
                 "RSA-2048 not implemented in SoftwareHsm".into(),
             )),
+            KeyType::EcdsaP256 => Err(HsmError::Unsupported(
+                "EcdsaP256 keys cannot encrypt (use sign_ecdsa/verify_ecdsa)".into(),
+            )),
         }
     }
 
@@ -414,6 +533,9 @@ impl Hsm for SoftwareHsm {
             KeyType::Rsa2048 => Err(HsmError::Unsupported(
                 "RSA-2048 not implemented in SoftwareHsm".into(),
             )),
+            KeyType::EcdsaP256 => Err(HsmError::Unsupported(
+                "EcdsaP256 keys cannot decrypt (use sign_ecdsa/verify_ecdsa)".into(),
+            )),
         }
     }
 
@@ -427,18 +549,105 @@ impl Hsm for SoftwareHsm {
                 "RSA-2048 not implemented in SoftwareHsm".into(),
             ));
         }
-        let new_material = Zeroizing::new(Self::random_bytes(Self::key_len(entry.key_type))?);
-        // Re-assigning into `Zeroizing<Vec<u8>>` drops the OLD
-        // `Zeroizing<Vec<u8>>`, which securely zeroes the previous key
-        // material in place — this is the crypto-hygiene benefit of the
-        // wrapper (EVALUATION.md P0 #7).
-        entry.material = new_material;
+        match entry.key_type {
+            KeyType::Aes256 | KeyType::HmacSha1 => {
+                let new_material =
+                    Zeroizing::new(Self::random_bytes(Self::key_len(entry.key_type))?);
+                // Re-assigning into `Zeroizing<Vec<u8>>` drops the OLD
+                // `Zeroizing<Vec<u8>>`, which securely zeroes the previous key
+                // material in place — this is the crypto-hygiene benefit of the
+                // wrapper (EVALUATION.md P0 #7).
+                entry.material = new_material;
+            }
+            KeyType::EcdsaP256 => {
+                let new_kp = EcdsaP256Key::generate()?;
+                // Dropping the old `EcdsaP256Key` drops the `Arc<EcdsaKeyPair>`;
+                // when the last `Arc` ref goes, ring's `EcdsaKeyPair` is
+                // dropped, which does NOT zeroize its internal scalar (ring
+                // does not expose a zeroizing destructor for ECDSA scalars —
+                // a known limitation; a real HSM would zeroize). The
+                // software HSM documents this limitation in the crate docs.
+                entry.ecdsa = Some(new_kp);
+            }
+            KeyType::Rsa2048 => unreachable!("guarded above"),
+        }
         entry.version = entry.version.saturating_add(1);
         Ok(KeyHandle {
             id: key_id.to_string(),
             version: entry.version,
             key_type: entry.key_type,
         })
+    }
+
+    async fn sign_ecdsa(&self, key_handle: &KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let keys = self.keys.read().await;
+        let entry = keys
+            .get(&key_handle.id)
+            .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+        if entry.version != key_handle.version {
+            return Err(HsmError::Unsupported(format!(
+                "key version mismatch: handle={} store={}",
+                key_handle.version, entry.version
+            )));
+        }
+        if entry.key_type != KeyType::EcdsaP256 {
+            return Err(HsmError::Unsupported(format!(
+                "sign_ecdsa requires EcdsaP256 key, got {:?}",
+                entry.key_type
+            )));
+        }
+        let kp = entry
+            .ecdsa
+            .as_ref()
+            .ok_or_else(|| HsmError::Crypto("missing ecdsa key material".into()))?;
+        kp.sign(data)
+    }
+
+    async fn verify_ecdsa(
+        &self,
+        key_handle: &KeyHandle,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, HsmError> {
+        let keys = self.keys.read().await;
+        let entry = keys
+            .get(&key_handle.id)
+            .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+        if entry.version != key_handle.version {
+            return Err(HsmError::Unsupported(format!(
+                "key version mismatch: handle={} store={}",
+                key_handle.version, entry.version
+            )));
+        }
+        if entry.key_type != KeyType::EcdsaP256 {
+            return Err(HsmError::Unsupported(format!(
+                "verify_ecdsa requires EcdsaP256 key, got {:?}",
+                entry.key_type
+            )));
+        }
+        let kp = entry
+            .ecdsa
+            .as_ref()
+            .ok_or_else(|| HsmError::Crypto("missing ecdsa key material".into()))?;
+        kp.verify(data, signature)
+    }
+
+    async fn public_key_ecdsa(&self, key_handle: &KeyHandle) -> Result<Vec<u8>, HsmError> {
+        let keys = self.keys.read().await;
+        let entry = keys
+            .get(&key_handle.id)
+            .ok_or_else(|| HsmError::NotFound(key_handle.id.clone()))?;
+        if entry.key_type != KeyType::EcdsaP256 {
+            return Err(HsmError::Unsupported(format!(
+                "public_key_ecdsa requires EcdsaP256 key, got {:?}",
+                entry.key_type
+            )));
+        }
+        let kp = entry
+            .ecdsa
+            .as_ref()
+            .ok_or_else(|| HsmError::Crypto("missing ecdsa key material".into()))?;
+        Ok(kp.public_sec1().to_vec())
     }
 }
 
@@ -776,6 +985,7 @@ mod tests {
         let entry = KeyEntry {
             key_type: KeyType::HmacSha1,
             material: Zeroizing::new(vec![0u8; 20]),
+            ecdsa: None,
             version: 1,
         };
         _assert_material_is_zeroizing(&entry.material);
@@ -791,5 +1001,190 @@ mod tests {
         // time control returns), but the type system guarantees the drop
         // impl runs.
         drop(entry);
+    }
+
+    // ===== Domain-06 Wave 1: ECDSA P-256 + CA-through-HSM tests =====
+
+    /// `generate_key(EcdsaP256)` MUST return a handle with `key_type ==
+    /// EcdsaP256`, version 1, and the SEC1 public key MUST be a 65-byte
+    /// uncompressed P-256 point (`0x04 || X[32] || Y[32]`). This is the
+    /// type-level contract that downstream CA code relies on to build
+    /// `SubjectPublicKeyInfo` and the SubjectKeyIdentifier extension.
+    #[tokio::test]
+    async fn ecdsa_p256_key_generation_returns_valid_sec1_public_key() {
+        let hsm = SoftwareHsm::new();
+        let kh = hsm
+            .generate_key("ca-root", KeyType::EcdsaP256)
+            .await
+            .expect("generate_key EcdsaP256");
+        assert_eq!(kh.version, 1);
+        assert_eq!(kh.key_type, KeyType::EcdsaP256);
+
+        let pub_sec1 = hsm.public_key_ecdsa(&kh).await.expect("public_key_ecdsa");
+        assert_eq!(pub_sec1.len(), 65, "P-256 uncompressed pubkey is 65 bytes");
+        assert_eq!(pub_sec1[0], 0x04, "SEC1 uncompressed prefix");
+    }
+
+    /// `sign_ecdsa` + `verify_ecdsa` round-trip. A signature over `data`
+    /// MUST verify under the same key, and a tampered signature MUST NOT
+    /// verify. The signature MUST be DER-encoded `ECDSA-Sig-Value` (tag
+    /// 0x30 = SEQUENCE).
+    #[tokio::test]
+    async fn ecdsa_sign_verify_round_trip() {
+        let hsm = SoftwareHsm::new();
+        let kh = hsm
+            .generate_key("signing-key", KeyType::EcdsaP256)
+            .await
+            .expect("generate_key");
+
+        let data = b"tbs certificate payload - bytes to be signed";
+        let sig = hsm.sign_ecdsa(&kh, data).await.expect("sign_ecdsa");
+        // DER SEQUENCE tag.
+        assert_eq!(sig[0], 0x30, "ECDSA-Sig-Value is DER SEQUENCE");
+
+        assert!(
+            hsm.verify_ecdsa(&kh, data, &sig)
+                .await
+                .expect("verify_ecdsa"),
+            "valid signature must verify"
+        );
+
+        // Tampered signature must NOT verify.
+        let mut bad_sig = sig.clone();
+        bad_sig[4] ^= 0xFF;
+        assert!(
+            !hsm.verify_ecdsa(&kh, data, &bad_sig)
+                .await
+                .expect("verify_ecdsa"),
+            "tampered signature must NOT verify"
+        );
+
+        // Wrong data must NOT verify.
+        assert!(
+            !hsm.verify_ecdsa(&kh, b"different data", &sig)
+                .await
+                .expect("verify_ecdsa"),
+            "signature over different data must NOT verify"
+        );
+    }
+
+    /// Calling `sign_ecdsa` with a non-ECDSA key handle (e.g. HMAC-SHA1)
+    /// MUST return `Unsupported` — this prevents the silent-failure case
+    /// where a CA accidentally signs with the wrong key type.
+    #[tokio::test]
+    async fn sign_ecdsa_rejects_non_ecdsa_key() {
+        let hsm = SoftwareHsm::new();
+        let hmac_kh = hsm
+            .generate_key("mac", KeyType::HmacSha1)
+            .await
+            .expect("generate_key HmacSha1");
+        let err = hsm
+            .sign_ecdsa(&hmac_kh, b"data")
+            .await
+            .expect_err("sign_ecdsa on HMAC key must error");
+        assert!(matches!(err, HsmError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("EcdsaP256"), "{err}");
+    }
+
+    /// `rotate_key` on an ECDSA P-256 key MUST bump the version AND
+    /// replace the key material — signatures from the old key MUST NOT
+    /// verify under the new key handle. This is the same golden-ticket
+    /// mitigation property as for symmetric keys (ADR-015).
+    #[tokio::test]
+    async fn rotate_ecdsa_key_invalidates_old_signatures() {
+        let hsm = SoftwareHsm::new();
+        let kh1 = hsm
+            .generate_key("ca-root", KeyType::EcdsaP256)
+            .await
+            .expect("generate_key");
+        let data = b"payload";
+        let sig1 = hsm.sign_ecdsa(&kh1, data).await.expect("sign under v1");
+        // Snapshot the v1 public key BEFORE rotation (public_key_ecdsa
+        // returns the current version's key, so we must capture it now).
+        let pub1 = hsm.public_key_ecdsa(&kh1).await.expect("pub v1");
+
+        let kh2 = hsm.rotate_key("ca-root").await.expect("rotate_key");
+        assert_eq!(kh2.id, "ca-root");
+        assert_eq!(kh2.version, 2);
+        assert_eq!(kh2.key_type, KeyType::EcdsaP256);
+
+        // Old signatures MUST NOT verify under the new public key.
+        let verify_res = hsm
+            .verify_ecdsa(&kh2, data, &sig1)
+            .await
+            .expect("verify call");
+        assert!(
+            !verify_res,
+            "rotate_key MUST replace ECDSA material so old signatures no longer verify"
+        );
+
+        // New handle must produce+verify fresh signatures.
+        let sig2 = hsm.sign_ecdsa(&kh2, data).await.expect("sign under v2");
+        assert!(
+            hsm.verify_ecdsa(&kh2, data, &sig2)
+                .await
+                .expect("verify v2"),
+            "v2 signature must verify under v2"
+        );
+
+        // Public key MUST change after rotation.
+        let pub2 = hsm.public_key_ecdsa(&kh2).await.expect("pub v2");
+        assert_ne!(pub1, pub2, "rotation MUST produce a new public key");
+    }
+
+    /// `generate_key(EcdsaP256)` is idempotent — calling it twice with
+    /// the same `key_id` returns the SAME handle (same version, same
+    /// key_type) and MUST NOT regenerate key material. We verify the
+    /// no-overwrite property by signing under the first handle and
+    /// verifying with the second handle.
+    #[tokio::test]
+    async fn ecdsa_generate_key_is_idempotent() {
+        let hsm = SoftwareHsm::new();
+        let kh1 = hsm
+            .generate_key("ca-idem", KeyType::EcdsaP256)
+            .await
+            .expect("first generate_key");
+        let kh2 = hsm
+            .generate_key("ca-idem", KeyType::EcdsaP256)
+            .await
+            .expect("second generate_key");
+        assert_eq!(kh1, kh2, "second generate_key must return identical handle");
+
+        let data = b"payload";
+        let sig = hsm.sign_ecdsa(&kh1, data).await.expect("sign under kh1");
+        assert!(
+            hsm.verify_ecdsa(&kh2, data, &sig)
+                .await
+                .expect("verify under kh2"),
+            "idempotent generate_key must preserve key material"
+        );
+    }
+
+    /// `public_key_ecdsa` on a missing key returns `NotFound`; on a
+    /// non-ECDSA key returns `Unsupported`. These are the contract
+    /// guarantees that the CA relies on when fetching the public key
+    /// to build `SubjectPublicKeyInfo`.
+    #[tokio::test]
+    async fn public_key_ecdsa_error_paths() {
+        let hsm = SoftwareHsm::new();
+        // Missing key.
+        let fake = KeyHandle {
+            id: "no-such-key".into(),
+            version: 1,
+            key_type: KeyType::EcdsaP256,
+        };
+        let err = hsm.public_key_ecdsa(&fake).await.expect_err("missing key");
+        assert!(matches!(err, HsmError::NotFound(_)), "{err:?}");
+
+        // Wrong key type.
+        let hmac_kh = hsm
+            .generate_key("mac", KeyType::HmacSha1)
+            .await
+            .expect("generate_key");
+        let err = hsm
+            .public_key_ecdsa(&hmac_kh)
+            .await
+            .expect_err("wrong type");
+        assert!(matches!(err, HsmError::Unsupported(_)), "{err:?}");
     }
 }

@@ -45,6 +45,9 @@ use ring::signature::{EcdsaKeyPair, KeyPair as RingKeyPair};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+// Domain-06 Wave 1: HSM-backed CA signing (ADR-037).
+use adrian_hsm::{Hsm, KeyHandle, KeyType};
+
 #[derive(Debug, Error)]
 pub enum CaError {
     #[error("profile not found: {0}")]
@@ -63,6 +66,8 @@ pub enum CaError {
     Crypto(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 impl From<rasn::error::EncodeError> for CaError {
@@ -86,6 +91,12 @@ impl From<ring::error::KeyRejected> for CaError {
 impl From<ring::error::Unspecified> for CaError {
     fn from(e: ring::error::Unspecified) -> Self {
         CaError::Crypto(e.to_string())
+    }
+}
+
+impl From<adrian_hsm::HsmError> for CaError {
+    fn from(e: adrian_hsm::HsmError) -> Self {
+        CaError::Hsm(e.to_string())
     }
 }
 
@@ -284,7 +295,7 @@ impl CaKeyPair {
     /// Generate a fresh ECDSA-P256 key pair using `ring`.
     pub fn generate() -> Result<Self, CaError> {
         let rng = SystemRandom::new();
-        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng)?;
         let kp = EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng)?;
         let public_sec1 = kp.public_key().as_ref().to_vec();
@@ -300,7 +311,7 @@ impl CaKeyPair {
     /// restarts in future waves).
     pub fn from_pkcs8(pkcs8_der: &[u8]) -> Result<Self, CaError> {
         let rng = SystemRandom::new();
-        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
         let kp = EcdsaKeyPair::from_pkcs8(alg, pkcs8_der, &rng)?;
         let public_sec1 = kp.public_key().as_ref().to_vec();
         let ski_bytes = sha1_digest(&public_sec1);
@@ -334,6 +345,78 @@ impl CaKeyPair {
     /// Build the `SubjectPublicKeyInfo` for this key pair.
     pub fn spki(&self) -> SubjectPublicKeyInfo {
         let bits = BitVec::<u8, Msb0>::from_vec(self.public_sec1.clone());
+        SubjectPublicKeyInfo {
+            algorithm: ec_p256_pubkey_alg_id(),
+            subject_public_key: bits,
+        }
+    }
+}
+
+// ===========================================================================
+// CA signer abstraction — direct (ring) vs HSM-bound (ADR-037)
+// ===========================================================================
+
+/// Unified CA signer. Two variants:
+///
+/// - `Direct(CaKeyPair)` — the legacy path: ring ECDSA key pair held in
+///   process memory. Used by `CaService::new()` / `with_subject_cn()` and
+///   by all Wave 3a tests. Suitable for development and small deployments.
+/// - `HsmBound` — the Wave 1 path: the ECDSA P-256 private key lives
+///   inside an `Hsm` (software or PKCS#11), and signing goes through
+///   `Hsm::sign_ecdsa`. The public key + SKI are cached in the variant
+///   so cert construction stays synchronous. Used by
+///   `CaService::with_hsm()` (ADR-037).
+///
+/// Both variants expose the same accessor surface (`public_sec1`,
+/// `ski_bytes`, `spki`) and a `sign` async method.
+pub enum CaSigner {
+    /// Ring-backed direct signing (legacy / dev path).
+    Direct(CaKeyPair),
+    /// HSM-bound signing (ADR-037). The `Arc<dyn Hsm>` is shared with the
+    /// caller so the HSM can be reused for other keys (OCSP signing,
+    /// krbtgt, etc.).
+    HsmBound {
+        hsm: Arc<dyn Hsm>,
+        handle: KeyHandle,
+        public_sec1: Vec<u8>,
+        ski_bytes: Vec<u8>,
+    },
+}
+
+impl CaSigner {
+    /// Sign `data` and return the DER-encoded `ECDSA-Sig-Value`. For
+    /// `Direct`, uses `ring::EcdsaKeyPair::sign` directly. For `HsmBound`,
+    /// delegates to `Hsm::sign_ecdsa`.
+    pub async fn sign(&self, data: &[u8]) -> Result<Vec<u8>, CaError> {
+        match self {
+            CaSigner::Direct(kp) => kp.sign(data),
+            CaSigner::HsmBound { hsm, handle, .. } => {
+                let sig = hsm.sign_ecdsa(handle, data).await?;
+                Ok(sig)
+            }
+        }
+    }
+
+    /// SEC1 uncompressed public key (65 bytes for P-256: `0x04 || X || Y`).
+    pub fn public_sec1(&self) -> &[u8] {
+        match self {
+            CaSigner::Direct(kp) => kp.public_sec1(),
+            CaSigner::HsmBound { public_sec1, .. } => public_sec1,
+        }
+    }
+
+    /// SubjectKeyIdentifier bytes (SHA-1 of the SEC1 public key per
+    /// RFC 5280 §4.2.1.2 method (1)).
+    pub fn ski_bytes(&self) -> &[u8] {
+        match self {
+            CaSigner::Direct(kp) => kp.ski_bytes(),
+            CaSigner::HsmBound { ski_bytes, .. } => ski_bytes,
+        }
+    }
+
+    /// Build the `SubjectPublicKeyInfo` for this signer's public key.
+    pub fn spki(&self) -> SubjectPublicKeyInfo {
+        let bits = BitVec::<u8, Msb0>::from_vec(self.public_sec1().to_vec());
         SubjectPublicKeyInfo {
             algorithm: ec_p256_pubkey_alg_id(),
             subject_public_key: bits,
@@ -547,12 +630,13 @@ impl CertificationRequest {
     }
 
     /// Verify the CSR's self-signature using its embedded public key. Uses
-    /// `ring::signature::UnparsedPublicKey` with `ECDSA_P256_SHA256_FIXED`.
+    /// `ring::signature::UnparsedPublicKey` with `ECDSA_P256_SHA256_ASN1`
+    /// (accepts DER-encoded `ECDSA-Sig-Value`).
     pub fn verify_signature(&self) -> Result<(), CaError> {
         let pub_sec1 = self.public_key_sec1()?;
         let tbs_der = rasn::der::encode(&self.certification_request_info)?;
         let sig_bytes = self.signature.clone().into_vec();
-        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED;
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1;
         let pk = ring::signature::UnparsedPublicKey::new(alg, pub_sec1);
         pk.verify(&tbs_der, &sig_bytes)
             .map_err(|_| CaError::CsrInvalid("self-signature invalid".into()))?;
@@ -608,10 +692,11 @@ pub fn parse_crl_reason(s: &str) -> CrlReason {
 // CA service handle
 // ===========================================================================
 
-/// CA service handle. Owns the CA's signing key pair, the self-signed root
-/// certificate, an in-memory issued-cert ledger, and an in-memory CRL ledger.
+/// CA service handle. Owns the CA's signer (direct ring keypair OR HSM-bound
+/// ECDSA key per ADR-037), the self-signed root certificate, an in-memory
+/// issued-cert ledger, and an in-memory CRL ledger.
 pub struct CaService {
-    key: Arc<CaKeyPair>,
+    signer: Arc<CaSigner>,
     subject: Name,
     root_der: Vec<u8>,
     serial: AtomicU64,
@@ -623,7 +708,9 @@ pub struct CaService {
 impl CaService {
     /// Create a new CA with a freshly generated ECDSA-P256 key pair and a
     /// freshly self-signed root certificate. The root has `basicConstraints
-    /// CA:TRUE pathlen:1` per the two-tier model (ADR-037).
+    /// CA:TRUE pathlen:1` per the two-tier model (ADR-037). Uses the
+    /// `Direct` (ring-backed) signer — for HSM-bound signing, use
+    /// `with_hsm()`.
     pub fn new() -> Result<Self, CaError> {
         Self::with_subject_cn("Adrian Root CA")
     }
@@ -642,9 +729,49 @@ impl CaService {
             let p = kind.profile();
             profiles.insert(p.name.clone(), p);
         }
-        let root_der = build_root_cert(&key, subject.clone())?;
+        let signer = Arc::new(CaSigner::Direct(key));
+        let root_der = build_root_cert(&signer, subject.clone())?;
         Ok(Self {
-            key: Arc::new(key),
+            signer,
+            subject,
+            root_der,
+            serial: AtomicU64::new(1),
+            issued: RwLock::new(Vec::new()),
+            revoked: RwLock::new(Vec::new()),
+            profiles: RwLock::new(profiles),
+        })
+    }
+
+    /// Create a new CA whose ECDSA P-256 signing key lives inside an HSM
+    /// (ADR-037). The `hsm` must already have an `EcdsaP256` key under
+    /// `key_id`; this constructor calls `generate_key` (idempotent) to
+    /// ensure the key exists, then fetches the public key to build the
+    /// root certificate. Suitable for production deployments where the
+    /// CA private key must never leave the HSM boundary.
+    pub async fn with_hsm(hsm: Arc<dyn Hsm>, key_id: &str, cn: &str) -> Result<Self, CaError> {
+        let handle = hsm.generate_key(key_id, KeyType::EcdsaP256).await?;
+        let public_sec1 = hsm.public_key_ecdsa(&handle).await?;
+        let ski_bytes = sha1_digest(&public_sec1);
+        let subject = name_from_cn(cn);
+        let mut profiles = HashMap::new();
+        for kind in [
+            CertProfileKind::WebServer,
+            CertProfileKind::Client,
+            CertProfileKind::CodeSigning,
+            CertProfileKind::KerberosKdc,
+        ] {
+            let p = kind.profile();
+            profiles.insert(p.name.clone(), p);
+        }
+        let signer = Arc::new(CaSigner::HsmBound {
+            hsm: hsm.clone(),
+            handle: handle.clone(),
+            public_sec1: public_sec1.clone(),
+            ski_bytes: ski_bytes.clone(),
+        });
+        let root_der = build_root_cert_async(&signer, subject.clone()).await?;
+        Ok(Self {
+            signer,
             subject,
             root_der,
             serial: AtomicU64::new(1),
@@ -661,17 +788,23 @@ impl CaService {
 
     /// Return the SEC1 uncompressed CA public key (65 bytes for P-256).
     pub fn ca_public_key_sec1(&self) -> &[u8] {
-        self.key.public_sec1()
+        self.signer.public_sec1()
     }
 
     /// Return the SubjectKeyIdentifier of the CA (for AKI on issued certs).
     pub fn ca_ski(&self) -> &[u8] {
-        self.key.ski_bytes()
+        self.signer.ski_bytes()
     }
 
     /// Return the CA's subject DN.
     pub fn ca_subject(&self) -> &Name {
         &self.subject
+    }
+
+    /// Return the CA's signer (Direct or HsmBound). Used by OCSP / ARI
+    /// sub-services that need to sign with the CA key.
+    pub fn signer(&self) -> &Arc<CaSigner> {
+        &self.signer
     }
 
     /// Look up a profile by name (built-in or loaded via `load_profiles`).
@@ -706,7 +839,7 @@ impl CaService {
         let not_after = now + Duration::days(profile.validity_days as i64);
 
         let der = build_end_entity_cert(
-            &self.key,
+            &self.signer,
             &self.subject,
             &subject,
             &pub_sec1,
@@ -715,7 +848,8 @@ impl CaService {
             not_after,
             &profile,
             &dns_names,
-        )?;
+        )
+        .await?;
 
         let issued = IssuedCert {
             serial,
@@ -773,10 +907,10 @@ impl CaService {
             this_update: Time::General(now.fixed_offset()),
             next_update: Some(Time::General(next_update.fixed_offset())),
             revoked_certificates: revoked_entries.into_iter().collect(),
-            crl_extensions: Some(Extensions::from(vec![ext_aki(self.key.ski_bytes())?])),
+            crl_extensions: Some(Extensions::from(vec![ext_aki(self.signer.ski_bytes())?])),
         };
         let tbs_der = rasn::der::encode(&tbs)?;
-        let sig = self.key.sign(&tbs_der)?;
+        let sig = self.signer.sign(&tbs_der).await?;
         let crl = CertificateList {
             tbs_cert_list: tbs,
             signature_algorithm: ecdsa_sha256_alg_id(),
@@ -810,20 +944,70 @@ impl Default for CaService {
 // Certificate construction helpers
 // ===========================================================================
 
-/// Build a self-signed root certificate (CA:TRUE, pathlen=1).
-fn build_root_cert(key: &CaKeyPair, subject: Name) -> Result<Vec<u8>, CaError> {
+/// Build a self-signed root certificate (CA:TRUE, pathlen=1). Async because
+/// the signer may be HSM-bound (signing goes through `Hsm::sign_ecdsa`).
+async fn build_root_cert_async(signer: &CaSigner, subject: Name) -> Result<Vec<u8>, CaError> {
     let serial = 1u64;
     let now = Utc::now();
     let not_after = now + Duration::days(3650); // 10 years
 
-    let spki = key.spki();
+    let mut extensions = vec![
+        ext_basic_constraints(true, Some(1))?,
+        ext_key_usage(&[KU_KEY_CERT_SIGN])?,
+        ext_ski(signer.ski_bytes())?,
+        ext_aki(signer.ski_bytes())?,
+    ];
+
+    let tbs = TbsCertificate {
+        version: Version::V3,
+        serial_number: Integer::from(serial),
+        signature: ecdsa_sha256_alg_id(),
+        issuer: subject.clone(),
+        validity: Validity {
+            not_before: Time::General(now.fixed_offset()),
+            not_after: Time::General(not_after.fixed_offset()),
+        },
+        subject: subject.clone(),
+        subject_public_key_info: signer.spki(),
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: Some(Extensions::from(std::mem::take(&mut extensions))),
+    };
+    let tbs_der = rasn::der::encode(&tbs)?;
+    let sig = signer.sign(&tbs_der).await?;
+    let cert = Certificate {
+        tbs_certificate: tbs,
+        signature_algorithm: ecdsa_sha256_alg_id(),
+        signature_value: BitVec::<u8, Msb0>::from_vec(sig),
+    };
+    Ok(rasn::der::encode(&cert)?)
+}
+
+/// Backwards-compat sync wrapper for `build_root_cert_async`. Used by
+/// `CaService::with_subject_cn` (the non-HSM path) so existing callers
+/// don't need to be async. Only supports the `Direct` signer variant
+/// (HSM-bound signers MUST use the async `with_hsm` constructor).
+fn build_root_cert(signer: &CaSigner, subject: Name) -> Result<Vec<u8>, CaError> {
+    match signer {
+        CaSigner::Direct(key) => build_root_cert_direct(key, subject),
+        CaSigner::HsmBound { .. } => Err(CaError::Internal(
+            "HSM-bound signer requires async construction (use with_hsm)".into(),
+        )),
+    }
+}
+
+/// Sync root cert builder for the `Direct` (ring-backed) signer.
+fn build_root_cert_direct(key: &CaKeyPair, subject: Name) -> Result<Vec<u8>, CaError> {
+    let serial = 1u64;
+    let now = Utc::now();
+    let not_after = now + Duration::days(3650); // 10 years
+
     let mut extensions = vec![
         ext_basic_constraints(true, Some(1))?,
         ext_key_usage(&[KU_KEY_CERT_SIGN])?,
         ext_ski(key.ski_bytes())?,
         ext_aki(key.ski_bytes())?,
     ];
-    let _ = spki; // already in tbs below
 
     let tbs = TbsCertificate {
         version: Version::V3,
@@ -850,10 +1034,11 @@ fn build_root_cert(key: &CaKeyPair, subject: Name) -> Result<Vec<u8>, CaError> {
     Ok(rasn::der::encode(&cert)?)
 }
 
-/// Build an end-entity certificate signed by the CA.
+/// Build an end-entity certificate signed by the CA. Async because the
+/// signer may be HSM-bound.
 #[allow(clippy::too_many_arguments)]
-fn build_end_entity_cert(
-    ca_key: &CaKeyPair,
+async fn build_end_entity_cert(
+    ca_signer: &CaSigner,
     issuer: &Name,
     subject: &Name,
     pub_sec1: &[u8],
@@ -877,7 +1062,7 @@ fn build_end_entity_cert(
         ext_basic_constraints(false, None)?,
         ext_key_usage(&ku_bits)?,
         ext_ski(&sha1_digest(pub_sec1))?,
-        ext_aki(ca_key.ski_bytes())?,
+        ext_aki(ca_signer.ski_bytes())?,
     ];
     if !profile.extended_key_usages.is_empty() {
         extensions.push(ext_eku(&profile.extended_key_usages)?);
@@ -908,7 +1093,7 @@ fn build_end_entity_cert(
         )),
     };
     let tbs_der = rasn::der::encode(&tbs)?;
-    let sig = ca_key.sign(&tbs_der)?;
+    let sig = ca_signer.sign(&tbs_der).await?;
     let cert = Certificate {
         tbs_certificate: tbs,
         signature_algorithm: ecdsa_sha256_alg_id(),
@@ -989,7 +1174,7 @@ mod tests {
     /// the DER bytes. Used by several issuance tests.
     fn make_csr(subject_cn: &str) -> Vec<u8> {
         let rng = SystemRandom::new();
-        let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let alg = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
         let kp = EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap();
         let pub_sec1 = kp.public_key().as_ref().to_vec();
@@ -1071,6 +1256,10 @@ mod tests {
         assert_eq!(
             CaError::NotFound("serial".into()).to_string(),
             "not found: serial"
+        );
+        assert_eq!(
+            CaError::Internal("boom".into()).to_string(),
+            "internal: boom"
         );
     }
 
@@ -1327,5 +1516,128 @@ mod tests {
             parameters: None,
         };
         assert!(csr.public_key_sec1().is_err());
+    }
+
+    // ===== Domain-06 Wave 1: CA signs through HSM + crypto verification =====
+
+    /// The CA's issued cert signature MUST cryptographically verify under
+    /// the CA's public key. The Wave 3a tests only checked the signature
+    /// algorithm OID; this test catches the latent bug where the CA used
+    /// `ECDSA_P256_SHA256_FIXED_SIGNING` (raw 64-byte r||s) but the X.509
+    /// `BIT STRING` expects DER-encoded `ECDSA-Sig-Value`. After the Wave 1
+    /// fix (switch to `ECDSA_P256_SHA256_ASN1_SIGNING`), the signature
+    /// MUST verify under `ECDSA_P256_SHA256_ASN1`.
+    #[tokio::test]
+    async fn ca_issued_cert_signature_cryptographically_verifies() {
+        let ca = CaService::new().expect("ca");
+        let csr_der = make_csr("verify.adrian.dev");
+        let cert_der = ca.issue("adrian-webserver", &csr_der).await.expect("issue");
+
+        // Parse the cert and re-encode the TBS certificate to DER.
+        let parsed: Certificate = rasn::der::decode(&cert_der).expect("parse cert");
+        let tbs_der = rasn::der::encode(&parsed.tbs_certificate).expect("encode tbs");
+        let sig_bytes = parsed.signature_value.clone().into_vec();
+
+        // Verify under the CA's public key.
+        let ca_pub = ca.ca_public_key_sec1();
+        let pk = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            ca_pub,
+        );
+        pk.verify(&tbs_der, &sig_bytes)
+            .expect("cert signature MUST verify under CA public key");
+    }
+
+    /// The CA's root cert self-signature MUST cryptographically verify.
+    #[tokio::test]
+    async fn ca_root_cert_self_signature_verifies() {
+        let ca = CaService::new().expect("ca");
+        let root_der = ca.root_cert_der();
+        let parsed: Certificate = rasn::der::decode(root_der).expect("parse root");
+        let tbs_der = rasn::der::encode(&parsed.tbs_certificate).expect("encode tbs");
+        let sig_bytes = parsed.signature_value.clone().into_vec();
+        let pk = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            ca.ca_public_key_sec1(),
+        );
+        pk.verify(&tbs_der, &sig_bytes)
+            .expect("root self-signature MUST verify");
+    }
+
+    /// `CaService::with_hsm()` constructs a CA whose signing key lives in
+    /// an `adrian_hsm::SoftwareHsm`. The issued cert's signature MUST
+    /// verify under the HSM's public key, proving that the CA correctly
+    /// routes signing through `Hsm::sign_ecdsa` (ADR-037).
+    #[tokio::test]
+    async fn ca_with_hsm_signs_through_hsm_trait() {
+        let hsm = Arc::new(adrian_hsm::SoftwareHsm::new());
+        let ca = CaService::with_hsm(hsm.clone(), "ca-hsm", "HSM Root CA")
+            .await
+            .expect("with_hsm");
+
+        // The CA's public key MUST match the HSM's public key.
+        let hsm_handle = adrian_hsm::KeyHandle {
+            id: "ca-hsm".into(),
+            version: 1,
+            key_type: adrian_hsm::KeyType::EcdsaP256,
+        };
+        let hsm_pub = hsm
+            .public_key_ecdsa(&hsm_handle)
+            .await
+            .expect("hsm public key");
+        assert_eq!(ca.ca_public_key_sec1(), hsm_pub.as_slice());
+
+        // Issue a cert and verify the signature under the HSM's public key.
+        let csr_der = make_csr("hsm-signed.adrian.dev");
+        let cert_der = ca.issue("adrian-webserver", &csr_der).await.expect("issue");
+        let parsed: Certificate = rasn::der::decode(&cert_der).expect("parse cert");
+        let tbs_der = rasn::der::encode(&parsed.tbs_certificate).expect("encode tbs");
+        let sig_bytes = parsed.signature_value.clone().into_vec();
+
+        // Verify the signature using the HSM's verify_ecdsa (independent of
+        // the CA's signer path — proves the signature was produced by the
+        // HSM-bound key).
+        assert!(
+            hsm.verify_ecdsa(&hsm_handle, &tbs_der, &sig_bytes)
+                .await
+                .expect("hsm verify_ecdsa"),
+            "cert signature MUST verify via HSM's verify_ecdsa"
+        );
+
+        // Also verify using ring directly (independent of the HSM trait).
+        let pk = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            &hsm_pub,
+        );
+        pk.verify(&tbs_der, &sig_bytes)
+            .expect("cert signature MUST verify via ring");
+    }
+
+    /// `CaSigner::Direct` and `CaSigner::HsmBound` produce different public
+    /// keys (since they're independent key pairs), but both MUST produce
+    /// 65-byte SEC1 uncompressed P-256 public keys and 20-byte SKIs.
+    #[tokio::test]
+    async fn ca_signer_variants_produce_valid_keys() {
+        let direct = CaSigner::Direct(CaKeyPair::generate().expect("generate"));
+        assert_eq!(direct.public_sec1().len(), 65);
+        assert_eq!(direct.public_sec1()[0], 0x04);
+        assert_eq!(direct.ski_bytes().len(), 20);
+
+        let hsm = Arc::new(adrian_hsm::SoftwareHsm::new());
+        let handle = hsm
+            .generate_key("signer-test", adrian_hsm::KeyType::EcdsaP256)
+            .await
+            .expect("generate_key");
+        let pub_sec1 = hsm.public_key_ecdsa(&handle).await.expect("public_key");
+        let ski = sha1_digest(&pub_sec1);
+        let bound = CaSigner::HsmBound {
+            hsm,
+            handle,
+            public_sec1: pub_sec1,
+            ski_bytes: ski,
+        };
+        assert_eq!(bound.public_sec1().len(), 65);
+        assert_eq!(bound.public_sec1()[0], 0x04);
+        assert_eq!(bound.ski_bytes().len(), 20);
     }
 }

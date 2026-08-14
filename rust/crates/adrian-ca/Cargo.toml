@@ -8,12 +8,21 @@ description = "CA service — cert issuance, revocation, HSM-bound keys"
 
 [features]
 default = []
-enterprise-hsm = ["adrian-hsm"]
+# `enterprise-hsm` is a no-op alias kept for backwards compatibility with
+# the tasklist DoD that references it. The `adrian-hsm` crate is now always
+# linked (Domain-06 Wave 1: CA signs through HSM trait, ADR-037), so there
+# is nothing to gate at this layer — PKCS#11 backend gating lives in the
+# `adrian-hsm` crate's own `hsm` feature.
+enterprise-hsm = []
 
 [dependencies]
 adrian-storage-core = { path = "../adrian-storage-core" }
 adrian-storage-fdb = { path = "../adrian-storage-fdb" }
-adrian-hsm = { path = "../adrian-hsm", optional = true }
+# Domain-06 Wave 1: CA signs through the HSM trait (ADR-037). `adrian-hsm` is
+# always-on (not optional) so the CA can use `SoftwareHsm` for dev and a real
+# PKCS#11 HSM in production. The `enterprise-hsm` feature is kept as a
+# no-op alias for backwards-compat with the tasklist DoD that references it.
+adrian-hsm = { path = "../adrian-hsm" }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
