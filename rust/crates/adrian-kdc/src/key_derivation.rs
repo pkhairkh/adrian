@@ -15,11 +15,13 @@
 //! Per RFC 3961 §5.1 (simplified profile) and RFC 3962 §6 (AES profile):
 //!
 //! 1. **`nfold(in, outbits)`** — fold an arbitrary-length input byte string
-//!    into exactly `outbits` bits. The algorithm treats the input as a
-//!    circular bit string, rotates it left by `outbits` bits at a time, and
-//!    XORs `lcm(inbits, outbits) / outbits` rotations together. (Equivalently:
-//!    for each `k` in `0..lcm`, output bit `k mod outbits` is XORed with input
-//!    bit `k mod inbits`.)
+//!    into exactly `outbits` bits. The algorithm (matching MIT krb5
+//!    `krb5int_nfold` and impacket `_nfold`) concatenates `lcm/inbits` copies
+//!    of the input, where copy `k` is rotated RIGHT by `13*k` bits, then
+//!    splits the result into `lcm/outbits` chunks of `outbits` bits each and
+//!    adds them using **one's-complement addition** (end-around carry). The
+//!    13-bit rotation is the key subtlety that distinguishes the real
+//!    algorithm from a naive cyclic-repetition-and-XOR.
 //!
 //! 2. **`DR(base_key, constant)`** — the Derivation Random function:
 //!    - `nfold` the constant to one AES block (128 bits = 16 bytes).
@@ -36,27 +38,21 @@
 //!    AS-REP encpart (key usage 3) produces the constant
 //!    `00 00 00 03 AA` for Ke and `00 00 00 03 55` for Ki.
 //!
-//! ## What's VERIFIED vs UNVERIFIED
+//! ## Verification status (v0.8.0)
 //!
-//! - **VERIFIED**: `nfold` is deterministic, length-preserving when
-//!   `inbits == outbits`, and produces different outputs for different inputs
-//!   (round-trip property tests).
+//! - **VERIFIED**: `nfold` matches all 11 RFC 3961 §A.1 test vectors
+//!   byte-for-byte. The algorithm was cross-checked against MIT krb5
+//!   `krb5int_nfold` (C) and impacket `_nfold` (Python) — both produce
+//!   identical output. The critical detail is the 13-bit right rotation per
+//!   copy, which the v0.7.0 implementation was missing entirely.
 //! - **VERIFIED**: `derive_encryption_key` / `derive_integrity_key` are
 //!   deterministic, produce different keys for different usages, and produce
 //!   different Ke vs Ki for the same usage.
 //! - **VERIFIED**: a derived Ke round-trips through
 //!   `crypto::encrypt_aes256_cts_hmac_sha1_96` /
-//!   `decrypt_aes256_cts_hmac_sha1_96` for full-block plaintexts (the AES-CTS
-//!   panic on partial blocks is a separate, known bug tracked in Wave 1c).
-//! - **UNVERIFIED**: byte-exact match against MIT krb5 / Windows / Heimdal
-//!   reference vectors. RFC 3961 Appendix A publishes nfold test vectors and
-//!   RFC 3962 §7 publishes AES-DK test vectors; the Wave 1b sandbox does not
-//!   include a `ktutil`/`hexdump` reference, so the `rfc3961_*` test cases are
-//!   marked `#[ignore = "..."]` and **MUST be verified against MIT krb5 before
-//!   any "MIT interop" claim lands in the CHANGELOG**. A reviewer who can run
-//!   `python -c 'from impacket.crypto import nfold; ...'` should un-ignore the
-//!   RFC test cases and confirm they pass; if they don't, the nfold algorithm
-//!   (or the constants 0xAA/0x55) is wrong and must be fixed.
+//!   `decrypt_aes256_cts_hmac_sha1_96`.
+//! - **PENDING (Wave 4)**: byte-exact match against RFC 3962 §7 AES-DK
+//!   key-derivation test vectors (DR-encrypt chain).
 //!
 //! ## ADR compliance
 //!
@@ -107,86 +103,121 @@ fn lcm(a: usize, b: usize) -> usize {
     }
 }
 
-/// `nfold(input, outbits)` per RFC 3961 §5.1.
+/// `nfold(input, outbits)` per RFC 3961 §5.1 / §A.1.
 ///
 /// Folds the variable-length `input` byte string into an `outbits`-bit output
-/// (where `outbits` must be a multiple of 8). The algorithm treats the input
-/// as a circular bit string (MSB-first), rotates it left by `outbits` bits at
-/// a time, and XORs `lcm(inbits, outbits) / outbits` rotations together to
-/// produce the output.
+/// (where `outbits` must be a positive multiple of 8). The algorithm (matching
+/// MIT krb5 `krb5int_nfold` and impacket `_nfold`) is:
 ///
-/// This is equivalent to: for each `k` in `0..lcm(inbits, outbits)`, output
-/// bit `k mod outbits` is XORed with input bit `k mod inbits` (both bit
-/// indices are MSB-first within their respective byte strings).
+/// 1. Let `lcm = lcm(len(input), outbits/8)` (in bytes).
+/// 2. Build a `lcm`-byte string by concatenating `lcm/len(input)` copies of
+///    `input`, where copy `k` is rotated RIGHT by `13*k` bits.
+/// 3. Slice the `lcm`-byte string into `lcm/(outbits/8)` chunks of `outbits/8`
+///    bytes each.
+/// 4. Add all chunks using **one's-complement addition** (end-around carry:
+///    a carry out of the MSB wraps to the LSB).
+///
+/// The 13-bit rotation is the key subtlety that distinguishes the real
+/// algorithm from a naive cyclic-repetition-and-XOR. It is verified against
+/// all 11 RFC 3961 §A.1 test vectors.
 ///
 /// # Panics
 ///
-/// Panics if `outbits` is not a multiple of 8, or if `outbits` is 0.
-/// RFC 3961 §A.1 `nfold` — stretch/compress `input` to exactly `outbits` bits.
-///
-/// # Algorithm
-///
-/// 1. Treat the input as a cyclic bit string of `inbits` bits.
-/// 2. Create an LCM(`inbits`, `outbits`)-bit string by cyclically repeating
-///    the input (bit `k` of the stretched string = bit `k mod inbits` of the
-///    input).
-/// 3. Split the stretched string into `LCM/outbits` blocks of `outbits` bits.
-/// 4. Add all blocks using **one's-complement addition** (end-around carry):
-///    carry out of the MSB wraps to the LSB.
-///
-/// The v0.6.0 implementation used XOR instead of one's-complement addition —
-/// this produced incorrect output for all non-trivial inputs. v0.7.0 fixes
-/// this with proper carry propagation, matching RFC 3961 §A.1 test vectors.
+/// Panics if `outbits` is not a positive multiple of 8.
 pub fn nfold(input: &[u8], outbits: usize) -> Vec<u8> {
     assert!(
         outbits > 0 && outbits.is_multiple_of(8),
         "outbits must be a positive multiple of 8"
     );
     let outbytes = outbits / 8;
-    let inbits = input
-        .len()
-        .checked_mul(8)
-        .expect("input length overflows usize");
-    if inbits == 0 {
+    let inbytes = input.len();
+    if inbytes == 0 {
         return vec![0u8; outbytes];
     }
-    let lcm_val = lcm(inbits, outbits);
+
+    let lcm_val = lcm(inbytes, outbytes); // in bytes
+    let num_copies = lcm_val / inbytes;
+
+    // Build the rotated stream: concatenate copies, each rotated right by 13*k bits.
+    let mut bigstr = Vec::with_capacity(lcm_val);
+    for k in 0..num_copies {
+        let rotated = rotate_right(input, 13 * k);
+        bigstr.extend_from_slice(&rotated);
+    }
+    debug_assert_eq!(bigstr.len(), lcm_val);
+
+    // Slice into outbytes-sized chunks and one's-complement add them all.
     let mut out = vec![0u8; outbytes];
+    for chunk in bigstr.chunks_exact(outbytes) {
+        add_ones_complement_inplace(&mut out, chunk);
+    }
 
-    for k in 0..lcm_val {
-        // Input bit index per RFC 3961 §A / MIT krb5 nfold.c:
-        //   b = (k * inbits / lcm) mod inbits
-        // This is NOT simple cyclic repetition — it's a resampling that
-        // maps each LCM position to a specific input bit.
-        let in_bit_idx = ((k * inbits) / lcm_val) % inbits;
-        let in_byte_idx = in_bit_idx / 8;
-        let in_shift = 7 - (in_bit_idx % 8);
-        let bit = (input[in_byte_idx] >> in_shift) & 1;
-        if bit == 0 {
-            continue;
-        }
+    out
+}
 
-        // Output bit position: k mod outbits (MSB-first).
-        let out_bit_idx = k % outbits;
-        let byte_idx = out_bit_idx / 8;
-        let bit_in_byte = 7 - (out_bit_idx % 8);
+/// Rotate a byte string RIGHT by `nbits` bits (circular bit rotation, MSB-first).
+///
+/// This implements the per-copy rotation used by `nfold`. The rotation is
+/// circular: bits shifted off the right end reappear at the left end.
+///
+/// Equivalent to impacket's `rotate_right(ba, nbits)`.
+fn rotate_right(input: &[u8], nbits: usize) -> Vec<u8> {
+    let len = input.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let nbytes_shift = (nbits / 8) % len;
+    let remain = nbits % 8;
 
-        let mut carry = 1u16 << bit_in_byte;
-        let mut idx = byte_idx;
-        while carry > 0 {
-            let val = out[idx] as u16 + carry;
-            out[idx] = (val & 0xFF) as u8;
-            carry = val >> 8;
-            if carry > 0 {
-                if idx == 0 {
-                    idx = outbytes - 1;
-                } else {
-                    idx -= 1;
-                }
-            }
-        }
+    let mut out = vec![0u8; len];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // impacket uses Python negative indexing: ba[i - nbytes_shift].
+        // Equivalent modular index:
+        let idx_high = (i + len - nbytes_shift) % len;
+        // The byte BEFORE idx_high supplies the low bits that wrap around.
+        let idx_low = (idx_high + len - 1) % len;
+
+        // Use u16 to avoid overflow when shifting by 8 (remain == 0 case).
+        let high = (input[idx_high] as u16) >> remain;
+        let low = ((input[idx_low] as u16) << (8 - remain)) & 0xFF;
+        *slot = (high | low) as u8;
     }
     out
+}
+
+/// One's-complement (end-around-carry) addition: `acc = acc + b`.
+///
+/// Both slices must be the same length. The addition is performed as
+/// big-endian one's-complement: carries out of any byte position propagate
+/// to the next MORE-significant byte (lower index), and a carry out of the
+/// MSB (index 0) wraps to the LSB (last index). Carries are propagated
+/// iteratively until none remain.
+fn add_ones_complement_inplace(acc: &mut [u8], b: &[u8]) {
+    let n = acc.len();
+    debug_assert_eq!(n, b.len());
+
+    // Element-wise sum into a u16 working array.
+    let mut v: Vec<u16> = acc
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as u16 + y as u16)
+        .collect();
+
+    // Propagate carries end-around until none remain.
+    while v.iter().any(|&x| x > 0xFF) {
+        let mut new_v = vec![0u16; n];
+        for i in 0..n {
+            // Position i receives the carry from position (i+1) % n.
+            // (Position 0 = MSB; carry out of MSB wraps to position n-1 = LSB.)
+            let carry_src = (i + 1) % n;
+            new_v[i] = (v[carry_src] >> 8) + (v[i] & 0xFF);
+        }
+        v = new_v;
+    }
+
+    for (slot, &val) in acc.iter_mut().zip(v.iter()) {
+        *slot = val as u8;
+    }
 }
 
 /// Encrypt a single AES-256 block (16 bytes) under `key`.
@@ -403,32 +434,37 @@ mod tests {
         let _ = nfold(b"abc", 0);
     }
 
-    // ----------------- RFC 3961 Appendix A nfold test vectors ------------
+    // ----------------- RFC 3961 §A.1 nfold test vectors ------------------
     //
-    // v0.7.0: The nfold algorithm was upgraded from XOR to one's-complement
-    // addition (RFC 3961 §A). The expected values below are self-consistent
-    // (produced by our own implementation). They have NOT yet been verified
-    // against MIT krb5 / impacket reference output — a v0.8.0 task. The
-    // algorithm is correct for self-consistent KDC operation (encrypt and
-    // decrypt use the same nfold, so round-trips work). MIT krb5 interop
-    // requires matching the exact RFC 3961 §A.1 test vectors.
+    // v0.8.0: The nfold algorithm was completely rewritten to match MIT krb5
+    // `krb5int_nfold` and impacket `_nfold`. The critical fix is the 13-bit
+    // right rotation per copy — the v0.7.0 implementation was missing this
+    // entirely and produced self-consistent (but WRONG) output. All 11 RFC
+    // 3961 §A.1 test vectors now pass byte-for-byte, verified against both
+    // MIT krb5 (C) and impacket (Python) reference implementations.
+    //
+    // NOTE: The v0.7.0 tasklist listed 7 vectors with incorrect expected
+    // values (5 of 7 didn't match the actual RFC). The real RFC 3961 §A.1
+    // publishes 11 vectors; we test all 11 here. See worklog for details.
 
     #[test]
     fn rfc3961_nfold_012345_to_64() {
         let out = nfold(b"012345", 64);
-        assert_eq!(bytes_to_hex(&out), "02fd0ff002fd101d");
+        assert_eq!(bytes_to_hex(&out), "be072631276b1955");
     }
 
     #[test]
     fn rfc3961_nfold_password_to_56() {
         let out = nfold(b"password", 56);
-        assert_eq!(bytes_to_hex(&out), "0fffe7c0407ffb");
+        assert_eq!(bytes_to_hex(&out), "78a07b6caf85fa");
     }
 
     #[test]
-    fn rfc3961_nfold_rough_consensus_to_56() {
-        let out = nfold(b"Rough consensus, and running code.", 56);
-        assert_eq!(bytes_to_hex(&out), "38133850dfbeef");
+    fn rfc3961_nfold_rough_consensus_to_64() {
+        // RFC 3961 §A.1: 64-fold("Rough Consensus, and Running Code")
+        // Note: capital C's, no trailing period, 64-bit output (not 56).
+        let out = nfold(b"Rough Consensus, and Running Code", 64);
+        assert_eq!(bytes_to_hex(&out), "bb6ed30870b7f0e0");
     }
 
     #[test]
@@ -436,16 +472,18 @@ mod tests {
         let out = nfold(b"password", 168);
         assert_eq!(
             bytes_to_hex(&out),
-            "00003ffffffffff9ffffc00001000007fffffffffb"
+            "59e4a8ca7c0385c3c37b3f6d2000247cb6e6bd5b3e"
         );
     }
 
     #[test]
-    fn rfc3961_nfold_massachusetts_to_192() {
-        let out = nfold(b"massachusetts", 192);
+    fn rfc3961_nfold_massachvsetts_to_192() {
+        // RFC 3961 §A.1 uses the archaic "V" spelling: MASSACHVSETTS.
+        let input = b"MASSACHVSETTS INSTITVTE OF TECHNOLOGY";
+        let out = nfold(input, 192);
         assert_eq!(
             bytes_to_hex(&out),
-            "00000cfffffffffff9fffffb000003000000000004fffff6"
+            "db3b0d8f0b061e603282b308a50841229ad798fab9540c1b"
         );
     }
 
@@ -454,14 +492,82 @@ mod tests {
         let out = nfold(b"Q", 168);
         assert_eq!(
             bytes_to_hex(&out),
-            "000007ffffc00001fffff0000000000000001fffff"
+            "518a54a215a8452a518a54a215a8452a518a54a215"
         );
     }
 
     #[test]
-    fn rfc3961_nfold_ba_to_16() {
-        let out = nfold(b"ba", 16);
-        assert_eq!(bytes_to_hex(&out), "6261");
+    fn rfc3961_nfold_ba_to_168() {
+        // RFC 3961 §A.1: 168-fold("ba"), NOT 16-fold. (16-fold("ba") = "6261"
+        // by identity, since lcm == inbits means no folding occurs.)
+        let out = nfold(b"ba", 168);
+        assert_eq!(
+            bytes_to_hex(&out),
+            "fb25d531ae8974499f52fd92ea9857c4ba24cf297e"
+        );
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_64() {
+        let out = nfold(b"kerberos", 64);
+        assert_eq!(bytes_to_hex(&out), "6b65726265726f73");
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_128() {
+        let out = nfold(b"kerberos", 128);
+        assert_eq!(bytes_to_hex(&out), "6b65726265726f737b9b5b2b93132b93");
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_168() {
+        let out = nfold(b"kerberos", 168);
+        assert_eq!(
+            bytes_to_hex(&out),
+            "8372c236344e5f1550cd0747e15d62ca7a5a3bcea4"
+        );
+    }
+
+    #[test]
+    fn rfc3961_nfold_kerberos_to_256() {
+        let out = nfold(b"kerberos", 256);
+        assert_eq!(
+            bytes_to_hex(&out),
+            "6b65726265726f737b9b5b2b93132b935c9bdcdad95c9899c4cae4dee6d6cae4"
+        );
+    }
+
+    // -------- Edge-case tests (T-104: empty, single byte, identity) --------
+
+    #[test]
+    fn nfold_edge_case_empty_input() {
+        // Empty input → all-zero output of the requested length.
+        assert_eq!(nfold(&[], 64), vec![0u8; 8]);
+        assert_eq!(nfold(&[], 128), vec![0u8; 16]);
+        assert_eq!(nfold(&[], 256), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn nfold_edge_case_single_byte_input() {
+        // Single-byte input nfolded to 168 bits — verified against RFC ("Q" →
+        // 168 above). Here we test a different single byte (0x00) for
+        // sanity: all-zero input must produce all-zero output.
+        assert_eq!(nfold(&[0x00], 64), vec![0u8; 8]);
+        assert_eq!(nfold(&[0xFF], 64), vec![0xFFu8; 8]);
+    }
+
+    #[test]
+    fn nfold_edge_case_identity_when_inbits_eq_outbits() {
+        // When input length == output length, lcm == inbits, so there is
+        // exactly one copy (rotation by 0 bits) and one slice. The
+        // one's-complement sum of a single value is the value itself.
+        let input = b"0123456789abcdef";
+        let out = nfold(input, 128);
+        assert_eq!(out, input, "nfold(x, |x|) == x when |x| is the block size");
+
+        let input2 = b"\x01\x02\x03\x04";
+        let out2 = nfold(input2, 32);
+        assert_eq!(out2, input2);
     }
 
     // ----------------------- Key derivation tests -------------------------
