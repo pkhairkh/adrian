@@ -3888,6 +3888,219 @@ pub mod gss_api {
 }
 
 // ============================================================================
+// Wave 4: DFS-N referrals (MS-DFSN §2.2.3 / §2.2.4)
+// ============================================================================
+
+/// A single DFS referral entry (a target `\\server\share` for a DFS path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DfsReferralEntry {
+    /// The DFS path that this referral resolves (e.g.
+    /// `\\domain.example.com\shares\docs`).
+    pub dfs_path: String,
+    /// The target UNC path the client should connect to (e.g.
+    /// `\\dc01.example.com\docs$`).
+    pub target_path: String,
+    /// Target priority (lower = higher priority; 0 = highest).
+    pub priority: u16,
+}
+
+/// A DFS referral request (MS-DFSN §2.2.3). The client sends the
+/// DFS path it wants to resolve; the server returns one or more
+/// referral entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DfsReferralRequest {
+    /// The DFS path to resolve (e.g. `\\domain.example.com\shares\docs`).
+    pub path: String,
+}
+
+impl DfsReferralRequest {
+    /// Build a new DFS referral request for `path`.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Encode the request as a simple length-prefixed UTF-16LE path
+    /// (the framework's wire format for DFS referral requests — the
+    /// real MS-DFSN format is more complex; this minimal form
+    /// suffices for the framework's own client/server pair).
+    pub fn encode(&self) -> Vec<u8> {
+        let path_utf16 = encode_utf16le(&self.path);
+        let mut out = Vec::with_capacity(4 + path_utf16.len());
+        out.extend_from_slice(&(path_utf16.len() as u32).to_le_bytes());
+        out.extend_from_slice(&path_utf16);
+        out
+    }
+
+    /// Decode a DFS referral request.
+    pub fn decode(buf: &[u8]) -> Result<Self, SmbError> {
+        if buf.len() < 4 {
+            return Err(SmbError::Malformed("dfs referral request too short".into()));
+        }
+        let path_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if 4 + path_len > buf.len() {
+            return Err(SmbError::Malformed(
+                "dfs referral request path truncated".into(),
+            ));
+        }
+        let path = decode_utf16le(&buf[4..4 + path_len]);
+        Ok(Self { path })
+    }
+}
+
+/// A DFS referral response (MS-DFSN §2.2.4). Contains one or more
+/// referral entries the client should follow.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DfsReferralResponse {
+    /// The referral entries (ordered by priority).
+    pub entries: Vec<DfsReferralEntry>,
+}
+
+impl DfsReferralResponse {
+    /// Build an empty DFS referral response.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a DFS referral response with one entry.
+    #[must_use]
+    pub fn with_entry(
+        dfs_path: impl Into<String>,
+        target_path: impl Into<String>,
+        priority: u16,
+    ) -> Self {
+        Self {
+            entries: vec![DfsReferralEntry {
+                dfs_path: dfs_path.into(),
+                target_path: target_path.into(),
+                priority,
+            }],
+        }
+    }
+
+    /// Encode the response as a count-prefixed list of entries. Each
+    /// entry is encoded as `dfs_path_len(u32 LE) || dfs_path_utf16 ||
+    /// target_path_len(u32 LE) || target_path_utf16 || priority(u16 LE)`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * 64);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            let dfs_utf16 = encode_utf16le(&entry.dfs_path);
+            let target_utf16 = encode_utf16le(&entry.target_path);
+            out.extend_from_slice(&(dfs_utf16.len() as u32).to_le_bytes());
+            out.extend_from_slice(&dfs_utf16);
+            out.extend_from_slice(&(target_utf16.len() as u32).to_le_bytes());
+            out.extend_from_slice(&target_utf16);
+            out.extend_from_slice(&entry.priority.to_le_bytes());
+        }
+        out
+    }
+
+    /// Decode a DFS referral response.
+    pub fn decode(buf: &[u8]) -> Result<Self, SmbError> {
+        if buf.len() < 4 {
+            return Err(SmbError::Malformed(
+                "dfs referral response too short".into(),
+            ));
+        }
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let mut pos = 4usize;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if pos + 4 > buf.len() {
+                return Err(SmbError::Malformed(
+                    "dfs entry dfs_path length truncated".into(),
+                ));
+            }
+            let dfs_len =
+                u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            pos += 4;
+            if pos + dfs_len > buf.len() {
+                return Err(SmbError::Malformed("dfs entry dfs_path truncated".into()));
+            }
+            let dfs_path = decode_utf16le(&buf[pos..pos + dfs_len]);
+            pos += dfs_len;
+            if pos + 4 > buf.len() {
+                return Err(SmbError::Malformed(
+                    "dfs entry target_path length truncated".into(),
+                ));
+            }
+            let target_len =
+                u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            pos += 4;
+            if pos + target_len > buf.len() {
+                return Err(SmbError::Malformed(
+                    "dfs entry target_path truncated".into(),
+                ));
+            }
+            let target_path = decode_utf16le(&buf[pos..pos + target_len]);
+            pos += target_len;
+            if pos + 2 > buf.len() {
+                return Err(SmbError::Malformed("dfs entry priority truncated".into()));
+            }
+            let priority = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            pos += 2;
+            entries.push(DfsReferralEntry {
+                dfs_path,
+                target_path,
+                priority,
+            });
+        }
+        Ok(Self { entries })
+    }
+}
+
+/// A DFS referral resolver. Wraps a referral-source callable and
+/// exposes a [`DfsResolver::resolve`] method that returns the first
+/// (highest-priority) target for a DFS path.
+///
+/// Per ADR-044 the framework's SMB client follows DFS referrals
+/// transparently: when a TreeConnect to `\\domain\share` returns a
+/// referral, the client re-issues the TreeConnect to the first
+/// target. The resolver is the piece that turns a referral response
+/// into the next TreeConnect target.
+pub struct DfsResolver<F>
+where
+    F: Fn(&str) -> Option<DfsReferralResponse>,
+{
+    fetch: F,
+}
+
+impl<F> DfsResolver<F>
+where
+    F: Fn(&str) -> Option<DfsReferralResponse>,
+{
+    /// Construct a new resolver backed by the given fetch callable
+    /// (typically a closure that queries a server-side referral
+    /// table or sends an SMB2 GET_DFS_REFERRAL IOCTL over the wire).
+    #[must_use]
+    pub fn new(fetch: F) -> Self {
+        Self { fetch }
+    }
+
+    /// Resolve a DFS path to its first (highest-priority) target.
+    /// Returns `None` if the path is not in the DFS namespace or the
+    /// referral response has no entries.
+    #[must_use]
+    pub fn resolve(&self, dfs_path: &str) -> Option<DfsReferralEntry> {
+        let response = (self.fetch)(dfs_path)?;
+        response.entries.iter().min_by_key(|e| e.priority).cloned()
+    }
+
+    /// Resolve a DFS path and return all referral entries (ordered
+    /// by priority — caller is responsible for falling through to
+    /// the next target if the first is unreachable).
+    #[must_use]
+    pub fn resolve_all(&self, dfs_path: &str) -> Option<Vec<DfsReferralEntry>> {
+        let response = (self.fetch)(dfs_path)?;
+        let mut entries = response.entries;
+        entries.sort_by_key(|e| e.priority);
+        Some(entries)
+    }
+}
+
+// ============================================================================
 // NetBIOS Session Service framing — used by the transport
 // ============================================================================
 

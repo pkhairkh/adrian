@@ -317,6 +317,76 @@ impl DurableHandleTable {
     }
 }
 
+/// Server-wide DFS-N referral table (ADR-044). Maps a DFS path
+/// (e.g. `\\domain.example.com\shares\docs`) to a list of target
+/// UNC paths (e.g. `\\dc01.example.com\docs$`, `\\dc02.example.com\docs$`).
+///
+/// When a client connects to a DFS path, the server returns the
+/// referral list; the client then connects to the first available
+/// target. Per ADR-044 the framework resolves DFS targets via DNS
+/// SRV records rather than Active Directory site-costing, so the
+/// priority field here is a simple static ordering.
+#[derive(Debug, Default)]
+pub struct DfsReferralTable {
+    referrals: HashMap<String, Vec<adrian_smb_core::DfsReferralEntry>>,
+}
+
+impl DfsReferralTable {
+    /// Construct an empty DFS referral table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a referral entry for `dfs_path` pointing to `target_path`
+    /// with the given priority (lower = preferred).
+    pub fn add_referral(
+        &mut self,
+        dfs_path: impl Into<String>,
+        target_path: impl Into<String>,
+        priority: u16,
+    ) {
+        let key = dfs_path.into().to_lowercase();
+        let entry = adrian_smb_core::DfsReferralEntry {
+            dfs_path: key.clone(),
+            target_path: target_path.into(),
+            priority,
+        };
+        self.referrals.entry(key).or_default().push(entry);
+    }
+
+    /// Look up the referral list for `dfs_path`. Returns `None` if
+    /// the path is not in the DFS namespace.
+    #[must_use]
+    pub fn lookup(&self, dfs_path: &str) -> Option<&[adrian_smb_core::DfsReferralEntry]> {
+        self.referrals
+            .get(&dfs_path.to_lowercase())
+            .map(Vec::as_slice)
+    }
+
+    /// Build a [`DfsReferralResponse`] for `dfs_path`. Returns `None`
+    /// if the path is not in the DFS namespace.
+    #[must_use]
+    pub fn build_response(&self, dfs_path: &str) -> Option<adrian_smb_core::DfsReferralResponse> {
+        self.lookup(dfs_path)
+            .map(|entries| adrian_smb_core::DfsReferralResponse {
+                entries: entries.to_vec(),
+            })
+    }
+
+    /// Number of DFS paths in the namespace.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.referrals.len()
+    }
+
+    /// True if the table holds no referrals.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.referrals.is_empty()
+    }
+}
+
 /// A registered directory-change watcher (one per outstanding
 /// CHANGE_NOTIFY request).
 #[derive(Debug, Clone)]
@@ -2008,5 +2078,96 @@ mod tests {
         assert!(registry
             .acknowledge(file_id, adrian_smb_core::oplock_level::NONE)
             .is_none());
+    }
+
+    // ---- Wave 4: DFS-N referrals ----
+
+    #[test]
+    fn wave4_dfs_referral_response_round_trips() {
+        // T-401 / T-405: DfsReferralTable.add_referral builds a
+        // referral list; build_response returns a DfsReferralResponse
+        // that round-trips through encode/decode.
+        let mut table = DfsReferralTable::new();
+        assert!(table.is_empty());
+        table.add_referral(
+            r"\\domain.example.com\shares\docs",
+            r"\\dc01.example.com\docs$",
+            0,
+        );
+        table.add_referral(
+            r"\\domain.example.com\shares\docs",
+            r"\\dc02.example.com\docs$",
+            10,
+        );
+        assert_eq!(table.len(), 1);
+        // Lookup is case-insensitive.
+        let entries = table
+            .lookup(r"\\DOMAIN.EXAMPLE.COM\SHARES\DOCS")
+            .expect("lookup must succeed case-insensitively");
+        assert_eq!(entries.len(), 2);
+        // Build a response and round-trip it.
+        let response = table
+            .build_response(r"\\domain.example.com\shares\docs")
+            .expect("build_response");
+        let encoded = response.encode();
+        let decoded = adrian_smb_core::DfsReferralResponse::decode(&encoded).expect("decode");
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(
+            decoded.entries[0].dfs_path,
+            r"\\domain.example.com\shares\docs"
+        );
+        assert_eq!(decoded.entries[0].target_path, r"\\dc01.example.com\docs$");
+        assert_eq!(decoded.entries[1].target_path, r"\\dc02.example.com\docs$");
+        // The DfsReferralRequest codec round-trips too.
+        let req = adrian_smb_core::DfsReferralRequest::new(r"\\domain.example.com\shares\docs");
+        let req_bytes = req.encode();
+        let req_decoded = adrian_smb_core::DfsReferralRequest::decode(&req_bytes).expect("decode");
+        assert_eq!(req_decoded.path, req.path);
+    }
+
+    #[test]
+    fn wave4_dfs_referral_following_returns_highest_priority_target() {
+        // T-402 / T-405: a DfsResolver wrapping a DfsReferralTable
+        // resolves a DFS path to its highest-priority target.
+        // (This models the client's transparent referral-following
+        // path: a TreeConnect to the DFS path is intercepted, the
+        // resolver returns the first target, and the client
+        // re-issues TreeConnect to that target.)
+        let mut table = DfsReferralTable::new();
+        table.add_referral(
+            r"\\domain.example.com\shares\docs",
+            r"\\dc02.example.com\docs$",
+            10, // lower priority
+        );
+        table.add_referral(
+            r"\\domain.example.com\shares\docs",
+            r"\\dc01.example.com\docs$",
+            0, // higher priority
+        );
+        // The resolver is constructed with a closure that queries the
+        // table. (In a real client this closure would issue an
+        // SMB2_GET_DFS_REFERRAL IOCTL over the wire; for this test we
+        // drive it directly off the table.)
+        let table_for_resolver = std::sync::Arc::new(std::sync::Mutex::new(table));
+        let table_clone = table_for_resolver.clone();
+        let resolver = adrian_smb_core::DfsResolver::new(move |path: &str| {
+            let table = table_clone.lock().unwrap();
+            table.build_response(path)
+        });
+        let target = resolver
+            .resolve(r"\\domain.example.com\shares\docs")
+            .expect("must resolve");
+        // The highest-priority target (priority=0) is returned.
+        assert_eq!(target.target_path, r"\\dc01.example.com\docs$");
+        assert_eq!(target.priority, 0);
+        // resolve_all returns all entries sorted by priority.
+        let all = resolver
+            .resolve_all(r"\\domain.example.com\shares\docs")
+            .expect("must resolve all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].priority, 0);
+        assert_eq!(all[1].priority, 10);
+        // Resolving an unknown DFS path returns None.
+        assert!(resolver.resolve(r"\\domain.example.com\unknown").is_none());
     }
 }

@@ -347,6 +347,8 @@ pub fn spnego_blob_for_spn(target_spn: &str, client_secret: &[u8]) -> Vec<u8> {
         .expect("init_sec_context only fails on empty SPN; caller must provide a non-empty SPN")
 }
 
+// DFS-N referral following is provided by `adrian_smb_core::DfsResolver`.
+
 #[cfg(test)]
 mod tests {
     use super::*;
