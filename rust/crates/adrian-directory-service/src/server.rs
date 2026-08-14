@@ -564,6 +564,7 @@ mod tests {
             ldap_bind_addr: SocketAddr::from(([127, 0, 0, 1], 1389)),
             gc_bind_addr: SocketAddr::from(([127, 0, 0, 1], 3268)),
             list_objects,
+            bind_policy: crate::BindPolicy::None,
         });
         (dsa, store)
     }

@@ -83,8 +83,8 @@ pub mod types;
 // Re-export the most-used types at the crate root for convenience.
 pub use filter::{parse_filter, Filter, Substring};
 pub use handler::{
-    handle_add, handle_bind, handle_delete, handle_extended_request, handle_modify, handle_search,
-    root_dse, DEFAULT_NAMING_CONTEXT,
+    handle_add, handle_bind, handle_bind_with_context, handle_delete, handle_extended_request,
+    handle_modify, handle_search, root_dse, DEFAULT_NAMING_CONTEXT,
 };
 pub use server::{
     serve_connection, serve_with_timeout, LdapServer, DEFAULT_BIND_ADDR, DEFAULT_GC_BIND_ADDR,
@@ -139,6 +139,69 @@ pub struct Dsa {
     /// list — set to a real enumerator in production wiring or in tests
     /// that exercise search.
     pub list_objects: ListObjectsFn,
+    /// Bind-time security policy (per ADR-021). Controls whether LDAP
+    /// signing and/or channel binding are enforced on incoming binds.
+    /// Defaults to [`BindPolicy::None`] — production deployments should
+    /// set this to [`BindPolicy::ChannelBindingRequired`] for domain
+    /// controllers.
+    pub bind_policy: BindPolicy,
+}
+
+/// The bind-time security policy (per ADR-021 — LDAP signing + channel
+/// binding).
+///
+/// AD domain controllers can be configured to require LDAP signing
+/// (message integrity) and/or channel binding (bind the LDAP session to
+/// the TLS session via a channel binding token, defeating MITM attacks).
+/// This enum configures the DSA's enforcement level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindPolicy {
+    /// No signing or channel binding required. Suitable for development
+    /// and tests; never use in production for a domain controller.
+    #[default]
+    None,
+    /// LDAP signing required. Rejects simple binds over plaintext
+    /// connections — binds must either be over TLS or use SASL with
+    /// integrity protection.
+    SigningRequired,
+    /// Channel binding required (per ADR-021 §Decision 2). Rejects binds
+    /// that don't include a channel binding token (CBT) derived from the
+    /// TLS session. Implies [`BindPolicy::SigningRequired`].
+    ChannelBindingRequired,
+}
+
+/// Context passed to [`handle_bind_with_context`] describing the
+/// transport-level security of the incoming bind request.
+#[derive(Debug, Clone, Default)]
+pub struct BindContext {
+    /// Whether the connection is over TLS (LDAPS or StartTLS). `false`
+    /// for plaintext LDAP on port 389.
+    pub is_tls: bool,
+    /// The channel binding token (CBT) provided by the client, if any.
+    /// For TLS 1.2 this is the `tls-server-end-point` channel binding
+    /// type — the DER-encoded server certificate hash. `None` if the
+    /// client did not include a CBT in its SASL bind.
+    pub channel_binding_token: Option<Vec<u8>>,
+}
+
+impl BindContext {
+    /// Construct a `BindContext` for a plaintext (non-TLS) connection
+    /// with no channel binding token.
+    pub fn plaintext() -> Self {
+        Self {
+            is_tls: false,
+            channel_binding_token: None,
+        }
+    }
+
+    /// Construct a `BindContext` for a TLS connection with the given
+    /// channel binding token (or `None` if the client didn't supply one).
+    pub fn tls(channel_binding_token: Option<Vec<u8>>) -> Self {
+        Self {
+            is_tls: true,
+            channel_binding_token,
+        }
+    }
 }
 
 impl Dsa {
@@ -165,6 +228,7 @@ impl Dsa {
             ldap_bind_addr,
             gc_bind_addr,
             list_objects: Arc::new(Vec::new),
+            bind_policy: BindPolicy::None,
         }
     }
 
@@ -660,5 +724,99 @@ mod tests {
             .await
             .expect("serve task did not finish within 5s of client close")
             .unwrap();
+    }
+
+    // ---- Wave 4: LDAP signing / channel binding (ADR-021) ----
+
+    fn build_test_dsa_with_policy(policy: BindPolicy) -> Dsa {
+        let mut dsa = build_test_dsa();
+        dsa.bind_policy = policy;
+        dsa
+    }
+
+    fn anonymous_bind_request() -> BindRequest {
+        BindRequest {
+            version: 3,
+            name: String::new(),
+            authentication: AuthenticationChoice::Simple(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_signing_required_rejects_plaintext() {
+        // ADR-021: when the DSA's bind_policy is SigningRequired, simple
+        // binds over plaintext (non-TLS) connections MUST be rejected
+        // with confidentialityRequired.
+        let dsa = build_test_dsa_with_policy(BindPolicy::SigningRequired);
+        let ctx = BindContext::plaintext();
+        let resp = handle_bind_with_context(&dsa, anonymous_bind_request(), &ctx).await;
+        assert_eq!(
+            resp.result.result_code,
+            ResultCode::ConfidentialityRequired,
+            "plaintext bind should be rejected when SigningRequired: {:?}",
+            resp
+        );
+        assert!(
+            resp.result.diagnostic_message.contains("signing required"),
+            "diagnostic should mention signing: {}",
+            resp.result.diagnostic_message
+        );
+        // The same bind over TLS should succeed (no signing requirement
+        // on the bind itself — TLS provides the integrity protection).
+        let dsa2 = build_test_dsa_with_policy(BindPolicy::SigningRequired);
+        let ctx_tls = BindContext::tls(None);
+        let resp = handle_bind_with_context(&dsa2, anonymous_bind_request(), &ctx_tls).await;
+        assert_eq!(
+            resp.result.result_code,
+            ResultCode::Success,
+            "TLS bind should succeed when SigningRequired: {:?}",
+            resp
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_channel_binding_required_rejects_missing_cbt() {
+        // ADR-021: when the DSA's bind_policy is ChannelBindingRequired,
+        // binds over TLS without a channel binding token (CBT) MUST be
+        // rejected with confidentialityRequired.
+        let dsa = build_test_dsa_with_policy(BindPolicy::ChannelBindingRequired);
+        // TLS connection, but no CBT provided.
+        let ctx = BindContext::tls(None);
+        let resp = handle_bind_with_context(&dsa, anonymous_bind_request(), &ctx).await;
+        assert_eq!(
+            resp.result.result_code,
+            ResultCode::ConfidentialityRequired,
+            "TLS bind without CBT should be rejected when ChannelBindingRequired: {:?}",
+            resp
+        );
+        assert!(
+            resp.result
+                .diagnostic_message
+                .contains("channel binding token"),
+            "diagnostic should mention CBT: {}",
+            resp.result.diagnostic_message
+        );
+        // And the same bind with a CBT should succeed.
+        let dsa2 = build_test_dsa_with_policy(BindPolicy::ChannelBindingRequired);
+        let ctx_with_cbt = BindContext::tls(Some(vec![0xAA; 32]));
+        let resp = handle_bind_with_context(&dsa2, anonymous_bind_request(), &ctx_with_cbt).await;
+        assert_eq!(
+            resp.result.result_code,
+            ResultCode::Success,
+            "TLS bind with CBT should succeed when ChannelBindingRequired: {:?}",
+            resp
+        );
+        // And plaintext binds are also rejected (channel binding implies
+        // signing-required semantics).
+        let dsa3 = build_test_dsa_with_policy(BindPolicy::ChannelBindingRequired);
+        let resp =
+            handle_bind_with_context(&dsa3, anonymous_bind_request(), &BindContext::plaintext())
+                .await;
+        assert_eq!(
+            resp.result.result_code,
+            ResultCode::ConfidentialityRequired,
+            "plaintext bind should be rejected when ChannelBindingRequired: {:?}",
+            resp
+        );
     }
 }

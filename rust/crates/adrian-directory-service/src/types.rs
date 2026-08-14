@@ -97,6 +97,10 @@ pub enum ResultCode {
     UnwillingToPerform = 53,
     /// `loopDetect(54)` — referral loop detected.
     LoopDetect = 54,
+    /// `confidentialityRequired(13)` — server requires TLS or stronger
+    /// authentication before performing the operation (per RFC 4511
+    /// §4.1.9). Used by ADR-021 enforcement.
+    ConfidentialityRequired = 13,
     /// `namingViolation(64)` — DN violates naming rules.
     NamingViolation = 64,
     /// `objectClassViolation(65)` — entry violates object class rules.
@@ -145,6 +149,7 @@ impl ResultCode {
             52 => ResultCode::Unavailable,
             53 => ResultCode::UnwillingToPerform,
             54 => ResultCode::LoopDetect,
+            13 => ResultCode::ConfidentialityRequired,
             64 => ResultCode::NamingViolation,
             65 => ResultCode::ObjectClassViolation,
             66 => ResultCode::NotAllowedOnNonLeaf,

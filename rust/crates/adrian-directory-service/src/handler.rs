@@ -59,8 +59,54 @@ pub const CONFIGURATION_NC_DN: &str = "CN=Configuration,DC=adrian,DC=example,DC=
 
 /// Handle a `BindRequest` (RFC 4511 §4.2).
 ///
-/// See the [module docs](self) for the bind semantics.
+/// See the [module docs](self) for the bind semantics. Uses a default
+/// [`crate::BindContext`] (plaintext, no CBT) — for ADR-021 enforcement
+/// use [`handle_bind_with_context`].
 pub async fn handle_bind(dsa: &Dsa, req: BindRequest) -> BindResponse {
+    handle_bind_with_context(dsa, req, &crate::BindContext::plaintext()).await
+}
+
+/// Handle a `BindRequest` with a [`crate::BindContext`] describing the
+/// transport-level security of the incoming connection (per ADR-021).
+///
+/// Enforces the DSA's [`crate::BindPolicy`]:
+/// - [`crate::BindPolicy::None`] — no enforcement.
+/// - [`crate::BindPolicy::SigningRequired`] — rejects simple binds over
+///   plaintext (non-TLS) connections.
+/// - [`crate::BindPolicy::ChannelBindingRequired`] — rejects binds that
+///   don't include a channel binding token (CBT). Implies signing.
+pub async fn handle_bind_with_context(
+    dsa: &Dsa,
+    req: BindRequest,
+    ctx: &crate::BindContext,
+) -> BindResponse {
+    // ADR-021 enforcement: check the policy before any credential
+    // verification so a missing CBT never leaks whether the DN exists.
+    match dsa.bind_policy {
+        crate::BindPolicy::None => {}
+        crate::BindPolicy::SigningRequired => {
+            if !ctx.is_tls {
+                return BindResponse::error(
+                    ResultCode::ConfidentialityRequired,
+                    "LDAP signing required (ADR-021): plaintext bind rejected — use TLS",
+                );
+            }
+        }
+        crate::BindPolicy::ChannelBindingRequired => {
+            if !ctx.is_tls {
+                return BindResponse::error(
+                    ResultCode::ConfidentialityRequired,
+                    "channel binding required (ADR-021): plaintext bind rejected — use TLS",
+                );
+            }
+            if ctx.channel_binding_token.is_none() {
+                return BindResponse::error(
+                    ResultCode::ConfidentialityRequired,
+                    "channel binding required (ADR-021): bind must include a channel binding token (CBT)",
+                );
+            }
+        }
+    }
     // LDAPv3 only — reject v1/v2.
     if req.version != 3 {
         return BindResponse::error(
@@ -315,6 +361,36 @@ fn filter_matches(obj: &Object, filter: &crate::filter::Filter) -> bool {
                 }
                 substrings_match(&a.value, initial, &anys, final_)
             })
+        }
+        Filter::ExtensibleMatch {
+            matching_rule: _,
+            r#type,
+            match_value,
+            dn_attributes,
+        } => {
+            // ExtensibleMatch is treated as case-sensitive equality on
+            // the named attribute (or the DN components if dn_attributes
+            // is set). The matchingRule is currently ignored — AD-aware
+            // clients that specify a rule (e.g. caseExactMatch) get
+            // case-sensitive comparison either way.
+            let attr_match = r#type.as_ref().map_or(false, |attribute| {
+                obj.attributes.iter().any(|a| {
+                    a.name.eq_ignore_ascii_case(attribute)
+                        && a.value.as_slice() == match_value.as_slice()
+                })
+            });
+            if attr_match {
+                return true;
+            }
+            if *dn_attributes {
+                // Also match against the DN itself (case-insensitive
+                // substring — sufficient for Wave 4).
+                let dn_lc = obj.dn.dn.to_ascii_lowercase();
+                let value_lc = String::from_utf8_lossy(match_value).to_ascii_lowercase();
+                dn_lc.contains(&value_lc)
+            } else {
+                false
+            }
         }
     }
 }
@@ -714,6 +790,7 @@ mod tests {
             ldap_bind_addr: dummy_socket_addr(1389),
             gc_bind_addr: dummy_socket_addr(3268),
             list_objects,
+            bind_policy: crate::BindPolicy::None,
         };
         (dsa, store)
     }
