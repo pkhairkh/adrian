@@ -281,24 +281,34 @@ pub fn ntowfv2(nt_hash: &[u8; 16], user: &str, domain: &str) -> Zeroizing<[u8; 1
 }
 
 /// Build the NTLMv2 client blob (`NTLMv2_CLIENT_CHALLENGE` per MS-NLMP
-/// §2.2.2.3):
+/// §3.3.2):
 ///
 /// ```text
-/// RespType (4B, 0x00000001)
-/// HiRespType (4B, 0x00000001)
+/// RespType (1B, 0x01)
+/// HiRespType (1B, 0x01)
 /// Reserved (6B, 0)
 /// Timestamp (8B, FILETIME)
 /// ClientChallenge (8B)
 /// Reserved (4B, 0)
 /// AvPairs (target_info copied from Type 2)
 /// [MsvAvEOL terminator if not already present in target_info]
+/// Reserved (4B, 0)   — trailing Z(4) per MS-NLMP §3.3.2
 /// ```
+///
+/// The MS-NLMP §3.3.2 pseudocode defines `temp = ConcatenationOf(
+/// Responserversion, HiResponserversion, Z(6), Time, ClientChallenge,
+/// Z(4), ServerName, Z(4))`.  The MS-NLMP §4.2.4.3 AUTHENTICATE_MESSAGE
+/// test-vector bytes confirm that `Responserversion` and
+/// `HiResponserversion` are each a single byte (0x01), not 4-byte LE
+/// integers — the §2.2.2.7 field table is misleading on this point.
+/// The trailing `Z(4)` is always present, regardless of whether the
+/// AvPairs already end with MsvAvEOL.
 fn build_ntlmv2_blob(timestamp: u64, client_challenge: &[u8; 8], target_info: &[u8]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(34 + target_info.len() + 4);
-    // RespType (4 bytes) = 0x00000001
-    put_u32_le(&mut blob, 0x00000001);
-    // HiRespType (4 bytes) = 0x00000001
-    put_u32_le(&mut blob, 0x00000001);
+    let mut blob = Vec::with_capacity(28 + target_info.len() + 4 + 4);
+    // RespType (1 byte) = 0x01
+    blob.push(0x01);
+    // HiRespType (1 byte) = 0x01
+    blob.push(0x01);
     // Reserved (6 bytes) = 0
     blob.extend_from_slice(&[0u8; 6]);
     // Timestamp (8 bytes) = FILETIME
@@ -314,6 +324,8 @@ fn build_ntlmv2_blob(timestamp: u64, client_challenge: &[u8; 8], target_info: &[
         put_u16_le(&mut blob, AvId::Eol as u16);
         put_u16_le(&mut blob, 0);
     }
+    // Trailing Reserved (4 bytes) = 0 — Z(4) per MS-NLMP §3.3.2.
+    put_u32_le(&mut blob, 0x00000000);
     blob
 }
 
@@ -879,31 +891,30 @@ mod tests {
         assert_eq!(NTLMSSP_SIGNATURE.len(), 8);
     }
 
-    /// NTOWFv1 (NT hash) of "Password" matches the MS-NLMP §4.2.2
-    /// reference value `0xCD06CA7C7E10C99B1D33BAA4865DCC18`.
+    /// NTOWFv1 (NT hash) of "Password" matches the MS-NLMP §4.2.2.1.2
+    /// reference value `0xA4F49C406510BDCAB6824EE7C30FD852` (MD4 of
+    /// UTF-16LE("Password") per MS-NLMP §3.3.1).
     #[test]
-    #[ignore = "NTLMv2 NT hash computation has a known bug vs MS-NLMP test vectors; see Wave 6 follow-up."]
     fn ntowfv1_matches_ms_nlmp_test_vector() {
         let nt = ntowfv1("Password");
         let expected: [u8; 16] = [
-            0xCD, 0x06, 0xCA, 0x7C, 0x7E, 0x10, 0xC9, 0x9B, 0x1D, 0x33, 0xBA, 0xA4, 0x86, 0x5D,
-            0xCC, 0x18,
+            0xA4, 0xF4, 0x9C, 0x40, 0x65, 0x10, 0xBD, 0xCA, 0xB6, 0x82, 0x4E, 0xE7, 0xC3, 0x0F,
+            0xD8, 0x52,
         ];
         assert_eq!(*nt, expected);
     }
 
     /// NTOWFv2 (HMAC-MD5 of NT-hash, UTF-16LE(UPPER(user)+domain))
-    /// matches the MS-NLMP §4.2.2 reference value
-    /// `0x0C86A813A6D0DBD0DBC8F8481FB2E497` for `user="User"`,
+    /// matches the MS-NLMP §4.2.4.1.1 reference value
+    /// `0x0C868A403BFD7A93A3001EF22EF02E3F` for `user="User"`,
     /// `domain="Domain"`, `password="Password"`.
     #[test]
-    #[ignore = "NTLMv2 NT hash computation has a known bug vs MS-NLMP test vectors; see Wave 6 follow-up."]
     fn ntowfv2_matches_ms_nlmp_test_vector() {
         let nt = ntowfv1("Password");
         let ntowf = ntowfv2(&nt, "User", "Domain");
         let expected: [u8; 16] = [
-            0x0C, 0x86, 0xA8, 0x13, 0xA6, 0xD0, 0xDB, 0xD0, 0xDB, 0xC8, 0xF8, 0x48, 0x1F, 0xB2,
-            0xE4, 0x97,
+            0x0C, 0x86, 0x8A, 0x40, 0x3B, 0xFD, 0x7A, 0x93, 0xA3, 0x00, 0x1E, 0xF2, 0x2E, 0xF0,
+            0x2E, 0x3F,
         ];
         assert_eq!(*ntowf, expected);
     }
@@ -922,13 +933,13 @@ mod tests {
         assert_ne!(*a, *c, "domain MUST be case-sensitive");
     }
 
-    /// NTLMv2 NTProofStr matches the MS-NLMP §4.2.4 reference value
+    /// NTLMv2 NTProofStr matches the MS-NLMP §4.2.4.2.2 reference value
     /// `0x68CD0AB851E51C96AABC927BEBEF6A1C` for the documented inputs:
     /// user="User", domain="Domain", password="Password",
     /// server_challenge=0x0123456789ABCDEF, client_challenge=0xAAAAAAAAAAAAAAAA,
-    /// timestamp=0, and the MS-NLMP §4.2.3 TargetInfo.
+    /// timestamp=0, and the MS-NLMP §4.2.4.3 TargetInfo (NbDomainName +
+    /// NbComputerName + MsvAvEOL).
     #[test]
-    #[ignore = "NTLMv2 NTProofStr has a known bug vs MS-NLMP test vectors; see Wave 6 follow-up."]
     fn ntlmv2_ntproofstr_matches_ms_nlmp_test_vector() {
         let server_challenge: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         let client_challenge: [u8; 8] = [0xAA; 8];
@@ -1006,7 +1017,8 @@ mod tests {
         assert_ne!(&response1[0..16], &response5[0..16]);
     }
 
-    /// NTLMv2 response = NTProofStr (16 bytes) ++ client blob (>= 34 bytes).
+    /// NTLMv2 response = NTProofStr (16 bytes) ++ client blob (>= 28 bytes
+    /// fixed header + AvPairs + 4-byte trailing Z(4) per MS-NLMP §3.3.2).
     #[test]
     fn ntlmv2_response_layout_is_proof_plus_blob() {
         let server_challenge: [u8; 8] = [0x01; 8];
@@ -1021,11 +1033,17 @@ mod tests {
             0,
             &client_challenge,
         );
-        // Blob minimum = 34 bytes (4+4+6+8+8+4) + 4 (EOL since target_info already has one).
-        // Total = 16 (proof) + 34 (blob fixed) + 4 (target_info) = 54 bytes.
-        assert!(response.len() >= 16 + 34);
+        // Blob fixed header = 28 bytes (1+1+6+8+8+4) per MS-NLMP §3.3.2.
+        // target_info already ends with MsvAvEOL, so no extra EOL is appended.
+        // Trailing Z(4) = 4 bytes.
+        // Total = 16 (proof) + 28 (blob fixed) + 4 (target_info) + 4 (trailing Z(4)) = 52 bytes.
+        assert!(
+            response.len() >= 16 + 28,
+            "response must include proof + blob fixed header, got {}",
+            response.len()
+        );
         // First 16 bytes are the proof.
-        assert_eq!(response.len(), 16 + 34 + target_info.len());
+        assert_eq!(response.len(), 16 + 28 + target_info.len() + 4);
     }
 
     /// LMv2 response is 24 bytes (16-byte proof + 8-byte client challenge).
@@ -1083,48 +1101,34 @@ mod tests {
         buf
     }
 
-    /// The MS-NLMP §4.2.3 TargetInfo AV_PAIR blob (used for test vectors).
-    /// Contains:
-    /// - MsvAvNbComputerName = "Server"
-    /// - MsvAvNbDomainName = "Domain"
-    /// - MsvAvDnsComputerName = "Server.Server.domain.com"
-    /// - MsvAvDnsDomainName = "Server.domain.com"
-    /// - MsvAvDnsTreeName = "domain.com"
-    /// - MsvAvTimestamp = 0
+    /// The MS-NLMP §4.2.4.3 CHALLENGE_MESSAGE TargetInfo AV_PAIR blob,
+    /// extracted from the AUTHENTICATE_MESSAGE test vector. Contains:
+    /// - MsvAvNbDomainName = "Domain"  (AvId 0x0002)
+    /// - MsvAvNbComputerName = "Server" (AvId 0x0001)
     /// - MsvAvEOL
+    ///
+    /// Note: the AV-pair order (NbDomainName FIRST, then NbComputerName)
+    /// and the minimal 2-pair content are dictated by the §4.2.4.3
+    /// CHALLENGE_MESSAGE bytes — NOT by the §4.2.2.2 example, which
+    /// uses 6 AV pairs in a different order.  Using the wrong TargetInfo
+    /// produces a different NTProofStr and fails the §4.2.4.2.2 test
+    /// vector.
     fn ms_nlmp_4_2_3_target_info() -> Vec<u8> {
         let mut ti = Vec::new();
-        let nb_computer = utf16_le("Server");
         let nb_domain = utf16_le("Domain");
-        let dns_computer = utf16_le("Server.Server.domain.com");
-        let dns_domain = utf16_le("Server.domain.com");
-        let dns_tree = utf16_le("domain.com");
-        let ts_bytes = 0u64.to_le_bytes();
+        let nb_computer = utf16_le("Server");
 
-        put_u16_le(&mut ti, AvId::NbComputerName as u16);
-        put_u16_le(&mut ti, nb_computer.len() as u16);
-        ti.extend_from_slice(&nb_computer);
-
+        // MsvAvNbDomainName (AvId=0x0002) — FIRST per §4.2.4.3.
         put_u16_le(&mut ti, AvId::NbDomainName as u16);
         put_u16_le(&mut ti, nb_domain.len() as u16);
         ti.extend_from_slice(&nb_domain);
 
-        put_u16_le(&mut ti, AvId::DnsComputerName as u16);
-        put_u16_le(&mut ti, dns_computer.len() as u16);
-        ti.extend_from_slice(&dns_computer);
+        // MsvAvNbComputerName (AvId=0x0001) — SECOND per §4.2.4.3.
+        put_u16_le(&mut ti, AvId::NbComputerName as u16);
+        put_u16_le(&mut ti, nb_computer.len() as u16);
+        ti.extend_from_slice(&nb_computer);
 
-        put_u16_le(&mut ti, AvId::DnsDomainName as u16);
-        put_u16_le(&mut ti, dns_domain.len() as u16);
-        ti.extend_from_slice(&dns_domain);
-
-        put_u16_le(&mut ti, AvId::DnsTreeName as u16);
-        put_u16_le(&mut ti, dns_tree.len() as u16);
-        ti.extend_from_slice(&dns_tree);
-
-        put_u16_le(&mut ti, AvId::Timestamp as u16);
-        put_u16_le(&mut ti, 8);
-        ti.extend_from_slice(&ts_bytes);
-
+        // MsvAvEOL terminator.
         put_u16_le(&mut ti, AvId::Eol as u16);
         put_u16_le(&mut ti, 0);
         ti
@@ -1255,17 +1259,18 @@ mod tests {
     /// Type 3 message includes the NTLMv2 response field, which is the
     /// 16-byte NTProofStr + variable-length client blob.
     #[test]
-    #[ignore = "NTLMv2 build_authenticate depends on the NT hash bug; see Wave 6 follow-up."]
     fn build_authenticate_includes_ntlmv2_response() {
         let challenge = parse_challenge(&synthetic_challenge_message()).unwrap();
         let msg =
             build_authenticate(&challenge, "User", "Password", "Domain", "WS01").expect("build");
-        // NtChallengeResponseFields at offset 12 (Len, MaxLen, BufferOffset)
-        let nt_len = read_u16_le(&msg, 12).unwrap() as usize;
-        let nt_offset = read_u32_le(&msg, 16).unwrap() as usize;
-        // The NTLMv2 response is at least 16 (proof) + 34 (blob fixed) bytes.
+        // NtChallengeResponseFields at offset 20 (Len, MaxLen, BufferOffset) —
+        // per MS-NLMP §2.2.1.3, LmChallengeResponseFields is at offset 12 and
+        // NtChallengeResponseFields follows at offset 20.
+        let nt_len = read_u16_le(&msg, 20).unwrap() as usize;
+        let nt_offset = read_u32_le(&msg, 24).unwrap() as usize;
+        // The NTLMv2 response is at least 16 (proof) + 28 (blob fixed) bytes.
         assert!(
-            nt_len >= 16 + 34,
+            nt_len >= 16 + 28,
             "NTLMv2 response must include proof + blob, got {nt_len}"
         );
         // The NT proof should be non-zero (an all-zero proof would indicate
@@ -1428,7 +1433,6 @@ mod tests {
     /// completes without error and produces a Type 3 message whose
     /// NTLMv2 response is non-trivial (16-byte non-zero NTProofStr).
     #[test]
-    #[ignore = "NTLMv2 end-to-end handshake depends on the NT hash bug; see Wave 6 follow-up."]
     fn end_to_end_handshake_succeeds() {
         let mut client = NtlmClient::with_workstation("Domain", "WS01");
         client.set_credentials("User", "Password");
@@ -1444,11 +1448,12 @@ mod tests {
         assert_eq!(&auth[0..8], NTLMSSP_SIGNATURE);
         assert_eq!(read_u32_le(&auth, 8).unwrap(), 3);
         // The NTLMv2 response (NtChallengeResponse) must have a non-zero
-        // NTProofStr (first 16 bytes).
-        let nt_len = read_u16_le(&auth, 12).unwrap() as usize;
-        let nt_offset = read_u32_le(&auth, 16).unwrap() as usize;
+        // NTProofStr (first 16 bytes). NtChallengeResponseFields is at
+        // offset 20 per MS-NLMP §2.2.1.3 (LmChallengeResponseFields at 12).
+        let nt_len = read_u16_le(&auth, 20).unwrap() as usize;
+        let nt_offset = read_u32_le(&auth, 24).unwrap() as usize;
         let proof = &auth[nt_offset..nt_offset + 16];
-        assert!(nt_len >= 16 + 34);
+        assert!(nt_len >= 16 + 28);
         assert!(proof.iter().any(|&b| b != 0));
     }
 
