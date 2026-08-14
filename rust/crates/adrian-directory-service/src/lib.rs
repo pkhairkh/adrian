@@ -89,9 +89,12 @@ pub use handler::{
 pub use server::{serve_connection, serve_with_timeout, LdapServer, DEFAULT_BIND_ADDR};
 pub use types::{
     AddRequest, AddResponse, AuthenticationChoice, BindRequest, BindResponse, Change, Control,
-    DelRequest, DelResponse, LdapMessage, LdapResult, MessageId, ModificationOp, ModifyRequest,
-    ModifyResponse, ProtocolOp, ResultCode, SaslCredentials, SearchRequest, SearchResultDone,
-    SearchResultEntry, UnbindRequest,
+    DelRequest, DelResponse, ExtendedDnFormat, ExtendedDnValue, LdapMessage, LdapResult, MessageId,
+    ModificationOp, ModifyRequest, ModifyResponse, PagedResultValue, ProtocolOp, ResultCode,
+    SaslCredentials, SdFlags, SearchRequest, SearchResultDone, SearchResultEntry, SortKey,
+    SortRequestValue, SortResponseValue, SortResultCode, UnbindRequest,
+    LDAP_SERVER_EXTENDED_DN_OID, LDAP_SERVER_PAGED_RESULT_OID, LDAP_SERVER_SD_FLAGS_OID,
+    LDAP_SERVER_SORT_OID, LDAP_SERVER_SORT_RESPONSE_OID,
 };
 
 use adrian_identity_core::IdentityMapping;

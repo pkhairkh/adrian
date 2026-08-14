@@ -22,8 +22,8 @@
 
 use crate::ber::{
     self, decode_bool_value, decode_integer_value, decode_string_value, BerError, AUTH_SASL,
-    AUTH_SIMPLE, CONTROLS_TAG, TAG_BOOLEAN, TAG_ENUMERATED, TAG_OCTET_STRING, TAG_SEQUENCE,
-    TAG_SET,
+    AUTH_SIMPLE, CONTROLS_TAG, TAG_BOOLEAN, TAG_ENUMERATED, TAG_INTEGER, TAG_OCTET_STRING,
+    TAG_SEQUENCE, TAG_SET,
 };
 use crate::filter::Filter;
 
@@ -1062,6 +1062,504 @@ impl Control {
     }
 }
 
+// ---- AD-interop LDAP controls (ADR-006) ----
+//
+// Microsoft Active Directory extends LDAP with a set of controls under
+// the `1.2.840.113556.1.4.*` OID arc. AD-aware clients (Windows LDAP,
+// third-party tools that interop with AD) expect these controls to be
+// understood by any server that claims AD-compatibility. The Adrian DSA
+// implements the four most-commonly-used controls per ADR-006:
+//
+// - Paged results (RFC 2696 / `LDAP_SERVER_PAGED_RESULT_OID`)
+// - Server-side sort (RFC 2891 / `LDAP_SERVER_SORT_OID`)
+// - SD flags (`LDAP_SERVER_SD_FLAGS_OID` — controls which parts of the
+//   `nTSecurityDescriptor` attribute are returned)
+// - Extended DN (`LDAP_SERVER_EXTENDED_DN_OID` — appends `;<GUID>` and
+//   `;<SID>` to DNs in search responses)
+
+/// `1.2.840.113556.1.4.319` — paged results control OID (RFC 2696,
+/// also `LDAP_SERVER_PAGED_RESULT_OID` per MS-ADTS).
+pub const LDAP_SERVER_PAGED_RESULT_OID: &str = "1.2.840.113556.1.4.319";
+
+/// `1.2.840.113556.1.4.473` — server-side sort request control OID
+/// (RFC 2891, also `LDAP_SERVER_SORT_OID`).
+pub const LDAP_SERVER_SORT_OID: &str = "1.2.840.113556.1.4.473";
+
+/// `1.2.840.113556.1.4.474` — server-side sort response control OID
+/// (RFC 2891, also `LDAP_SERVER_SORT_RESPONSE_OID`).
+pub const LDAP_SERVER_SORT_RESPONSE_OID: &str = "1.2.840.113556.1.4.474";
+
+/// `1.2.840.113556.1.4.801` — security descriptor flags control OID
+/// (`LDAP_SERVER_SD_FLAGS_OID` per MS-ADTS §3.1.1.3.4.1).
+pub const LDAP_SERVER_SD_FLAGS_OID: &str = "1.2.840.113556.1.4.801";
+
+/// `1.2.840.113556.1.4.529` — extended DN control OID
+/// (`LDAP_SERVER_EXTENDED_DN_OID` per MS-ADTS §3.1.1.3.4.2).
+pub const LDAP_SERVER_EXTENDED_DN_OID: &str = "1.2.840.113556.1.4.529";
+
+/// A paged-results control value (RFC 2696 §2).
+///
+/// Wire form: `SEQUENCE { size INTEGER (0), cookie OCTET STRING }`.
+/// `size` is the page size on the request and the estimated result-set
+/// size on the response. `cookie` is opaque server state; an empty
+/// cookie on the response signals "no more pages".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PagedResultValue {
+    /// Page size (request) or estimated result-set size (response).
+    /// 0 on the request means "abandon paged search".
+    pub size: i32,
+    /// Opaque server state. Empty cookie on a response means "no more
+    /// pages".
+    pub cookie: Vec<u8>,
+}
+
+impl PagedResultValue {
+    /// Encode as a BER SEQUENCE suitable for use as a `controlValue`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        ber::encode_integer(self.size as i64, &mut body);
+        ber::encode_tlv(TAG_OCTET_STRING, &self.cookie, &mut body);
+        let mut out = Vec::new();
+        ber::encode_tlv(TAG_SEQUENCE, &body, &mut out);
+        out
+    }
+
+    /// Decode from BER bytes (the contents of a `controlValue`).
+    pub fn decode(bytes: &[u8]) -> Result<Self, BerError> {
+        let (seq_tlv, rest) = ber::decode_tlv(bytes)?;
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        let (size_tlv, rest) = ber::decode_tlv(seq_tlv.value)?;
+        if size_tlv.tag != TAG_INTEGER {
+            return Err(BerError::UnexpectedTag {
+                expected: TAG_INTEGER,
+                actual: size_tlv.tag,
+            });
+        }
+        let size = decode_integer_value(size_tlv.value)? as i32;
+        let (cookie_tlv, rest) = ber::decode_tlv(rest)?;
+        if cookie_tlv.tag != TAG_OCTET_STRING {
+            return Err(BerError::UnexpectedTag {
+                expected: TAG_OCTET_STRING,
+                actual: cookie_tlv.tag,
+            });
+        }
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        Ok(Self {
+            size,
+            cookie: cookie_tlv.value.to_vec(),
+        })
+    }
+
+    /// Build a request `Control` for paged results with the given page
+    /// size and (typically empty) cookie.
+    pub fn request_control(page_size: i32, cookie: Vec<u8>, criticality: bool) -> Control {
+        Control {
+            control_type: LDAP_SERVER_PAGED_RESULT_OID.into(),
+            criticality,
+            control_value: Some(
+                PagedResultValue {
+                    size: page_size,
+                    cookie,
+                }
+                .encode(),
+            ),
+        }
+    }
+}
+
+/// A single sort key in a server-side sort request (RFC 2891 §1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    /// Attribute description to sort by.
+    pub attribute: String,
+    /// If `true`, sort in reverse order.
+    pub reverse: bool,
+    /// Optional matching rule OID (e.g. `caseExactMatch`).
+    pub ordering_rule: Option<String>,
+}
+
+/// A server-side sort request value (RFC 2891 §1.1).
+///
+/// Wire form: `SEQUENCE OF SEQUENCE { attributeDescription, reverseOrder
+/// BOOLEAN DEFAULT FALSE, orderingRule [0] MatchingRuleId OPTIONAL }`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SortRequestValue {
+    /// The list of sort keys (multiple = tie-breakers).
+    pub keys: Vec<SortKey>,
+}
+
+/// Context-specific tag `[0]` for the optional `orderingRule` field of
+/// a `SortKey` (RFC 2891 §1.1).
+const SORT_ORDERING_RULE_TAG: u8 = crate::ber::CLASS_CONTEXT;
+
+impl SortRequestValue {
+    /// Encode as a BER SEQUENCE OF SEQUENCE suitable for use as a
+    /// `controlValue`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut seq = Vec::new();
+        for key in &self.keys {
+            let mut key_body = Vec::new();
+            ber::encode_string(&key.attribute, &mut key_body);
+            // reverseOrder defaults to FALSE — only emit if TRUE.
+            if key.reverse {
+                ber::encode_bool(true, &mut key_body);
+            }
+            if let Some(rule) = &key.ordering_rule {
+                ber::encode_tlv(SORT_ORDERING_RULE_TAG, rule.as_bytes(), &mut key_body);
+            }
+            ber::encode_tlv(TAG_SEQUENCE, &key_body, &mut seq);
+        }
+        let mut out = Vec::new();
+        ber::encode_tlv(TAG_SEQUENCE, &seq, &mut out);
+        out
+    }
+
+    /// Decode from BER bytes (the contents of a `controlValue`).
+    pub fn decode(bytes: &[u8]) -> Result<Self, BerError> {
+        let (seq_tlv, rest) = ber::decode_tlv(bytes)?;
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        let mut keys = Vec::new();
+        let mut rest = seq_tlv.value;
+        while !rest.is_empty() {
+            let (key_tlv, remaining) = ber::decode_tlv(rest)?;
+            if key_tlv.tag != TAG_SEQUENCE {
+                return Err(BerError::UnexpectedTag {
+                    expected: TAG_SEQUENCE,
+                    actual: key_tlv.tag,
+                });
+            }
+            let (attr_tlv, krest) = ber::decode_tlv(key_tlv.value)?;
+            let attribute = decode_string_value(attr_tlv.value)?;
+            let mut reverse = false;
+            let mut ordering_rule = None;
+            let mut krest = krest;
+            while !krest.is_empty() {
+                let (next_tlv, r) = ber::decode_tlv(krest)?;
+                match next_tlv.tag {
+                    TAG_BOOLEAN => {
+                        reverse = decode_bool_value(next_tlv.value)?;
+                    }
+                    SORT_ORDERING_RULE_TAG => {
+                        ordering_rule = Some(decode_string_value(next_tlv.value)?);
+                    }
+                    _ => {
+                        return Err(BerError::UnexpectedTag {
+                            expected: TAG_BOOLEAN,
+                            actual: next_tlv.tag,
+                        });
+                    }
+                }
+                krest = r;
+            }
+            keys.push(SortKey {
+                attribute,
+                reverse,
+                ordering_rule,
+            });
+            rest = remaining;
+        }
+        Ok(Self { keys })
+    }
+
+    /// Build a request `Control` for server-side sorting.
+    pub fn request_control(keys: Vec<SortKey>, criticality: bool) -> Control {
+        Control {
+            control_type: LDAP_SERVER_SORT_OID.into(),
+            criticality,
+            control_value: Some(Self { keys }.encode()),
+        }
+    }
+}
+
+/// Server-side sort result codes (RFC 2891 §1.2). Only the values
+/// used by this implementation are listed; unknown codes round-trip via
+/// the `Other` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SortResultCode {
+    /// `success (0)` — sort succeeded.
+    Success = 0,
+    /// `operationsError (1)`.
+    OperationsError = 1,
+    /// `timeLimitExceeded (3)`.
+    TimeLimitExceeded = 3,
+    /// `strongAuthRequired (8)`.
+    StrongAuthRequired = 8,
+    /// `adminLimitExceeded (11)`.
+    AdminLimitExceeded = 11,
+    /// `noSuchAttribute (16)`.
+    NoSuchAttribute = 16,
+    /// `inappropriateMatching (18)`.
+    InappropriateMatching = 18,
+    /// `insufficientAccessRights (50)`.
+    InsufficientAccessRights = 50,
+    /// `busy (51)`.
+    Busy = 51,
+    /// `unwillingToPerform (53)`.
+    UnwillingToPerform = 53,
+    /// `other (80)`.
+    Other = 80,
+}
+
+impl SortResultCode {
+    /// Convert to the i32 wire value.
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    /// Convert from an i32 wire value. Unknown values map to `Other`.
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => Self::Success,
+            1 => Self::OperationsError,
+            3 => Self::TimeLimitExceeded,
+            8 => Self::StrongAuthRequired,
+            11 => Self::AdminLimitExceeded,
+            16 => Self::NoSuchAttribute,
+            18 => Self::InappropriateMatching,
+            50 => Self::InsufficientAccessRights,
+            51 => Self::Busy,
+            53 => Self::UnwillingToPerform,
+            80 => Self::Other,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A server-side sort response value (RFC 2891 §1.2).
+///
+/// Wire form: `SEQUENCE { sortResult ENUMERATED, attributeType [0]
+/// AttributeDescription OPTIONAL }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortResponseValue {
+    /// The sort result code.
+    pub sort_result: SortResultCode,
+    /// If the sort failed because the attribute was unrecognized, the
+    /// offending attribute type is named here.
+    pub attribute_type: Option<String>,
+}
+
+impl SortResponseValue {
+    /// Encode as a BER SEQUENCE suitable for use as a `controlValue`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        ber::encode_enumerated(self.sort_result.as_i32() as i64, &mut body);
+        if let Some(attr) = &self.attribute_type {
+            ber::encode_tlv(SORT_ORDERING_RULE_TAG, attr.as_bytes(), &mut body);
+        }
+        let mut out = Vec::new();
+        ber::encode_tlv(TAG_SEQUENCE, &body, &mut out);
+        out
+    }
+
+    /// Decode from BER bytes (the contents of a `controlValue`).
+    pub fn decode(bytes: &[u8]) -> Result<Self, BerError> {
+        let (seq_tlv, rest) = ber::decode_tlv(bytes)?;
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        let (res_tlv, rest) = ber::decode_tlv(seq_tlv.value)?;
+        if res_tlv.tag != TAG_ENUMERATED {
+            return Err(BerError::UnexpectedTag {
+                expected: TAG_ENUMERATED,
+                actual: res_tlv.tag,
+            });
+        }
+        let sort_result = SortResultCode::from_i32(decode_integer_value(res_tlv.value)? as i32);
+        let attribute_type = if rest.is_empty() {
+            None
+        } else {
+            let (attr_tlv, rest) = ber::decode_tlv(rest)?;
+            if attr_tlv.tag != SORT_ORDERING_RULE_TAG {
+                return Err(BerError::UnexpectedTag {
+                    expected: SORT_ORDERING_RULE_TAG,
+                    actual: attr_tlv.tag,
+                });
+            }
+            if !rest.is_empty() {
+                return Err(BerError::TrailingData(rest.len()));
+            }
+            Some(decode_string_value(attr_tlv.value)?)
+        };
+        Ok(Self {
+            sort_result,
+            attribute_type,
+        })
+    }
+
+    /// Build a response `Control` for server-side sorting. Response
+    /// controls are never marked critical.
+    pub fn response_control(
+        sort_result: SortResultCode,
+        attribute_type: Option<String>,
+    ) -> Control {
+        Control {
+            control_type: LDAP_SERVER_SORT_RESPONSE_OID.into(),
+            criticality: false,
+            control_value: Some(
+                Self {
+                    sort_result,
+                    attribute_type,
+                }
+                .encode(),
+            ),
+        }
+    }
+}
+
+/// Bit flags for the SD flags control (`LDAP_SERVER_SD_FLAGS_OID` per
+/// MS-ADTS §3.1.1.3.4.1). When a client requests
+/// `nTSecurityDescriptor`, the server returns only the parts of the SD
+/// selected by these flags — saving wire bandwidth when the client only
+/// needs the DACL, for example.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SdFlags(pub i32);
+
+impl SdFlags {
+    /// `OWNER_SECURITY_INFORMATION (0x1)` — return the owner field.
+    pub const OWNER: Self = Self(0x1);
+    /// `GROUP_SECURITY_INFORMATION (0x2)` — return the primary group.
+    pub const GROUP: Self = Self(0x2);
+    /// `DACL_SECURITY_INFORMATION (0x4)` — return the DACL.
+    pub const DACL: Self = Self(0x4);
+    /// `SACL_SECURITY_INFORMATION (0x8)` — return the SACL (requires
+    /// `SE_SECURITY_NAME` privilege).
+    pub const SACL: Self = Self(0x8);
+
+    /// Combine two flag sets with bitwise OR.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// True if the OWNER bit is set.
+    pub const fn wants_owner(self) -> bool {
+        self.0 & Self::OWNER.0 != 0
+    }
+
+    /// True if the GROUP bit is set.
+    pub const fn wants_group(self) -> bool {
+        self.0 & Self::GROUP.0 != 0
+    }
+
+    /// True if the DACL bit is set.
+    pub const fn wants_dacl(self) -> bool {
+        self.0 & Self::DACL.0 != 0
+    }
+
+    /// True if the SACL bit is set.
+    pub const fn wants_sacl(self) -> bool {
+        self.0 & Self::SACL.0 != 0
+    }
+
+    /// Encode as a BER SEQUENCE wrapping a single INTEGER (the wire form
+    /// per MS-ADTS).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        ber::encode_integer(self.0 as i64, &mut body);
+        let mut out = Vec::new();
+        ber::encode_tlv(TAG_SEQUENCE, &body, &mut out);
+        out
+    }
+
+    /// Decode from BER bytes (the contents of a `controlValue`).
+    pub fn decode(bytes: &[u8]) -> Result<Self, BerError> {
+        let (seq_tlv, rest) = ber::decode_tlv(bytes)?;
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        let (int_tlv, rest) = ber::decode_tlv(seq_tlv.value)?;
+        if int_tlv.tag != TAG_INTEGER {
+            return Err(BerError::UnexpectedTag {
+                expected: TAG_INTEGER,
+                actual: int_tlv.tag,
+            });
+        }
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        Ok(Self(decode_integer_value(int_tlv.value)? as i32))
+    }
+
+    /// Build a request `Control` for SD flags.
+    pub fn request_control(self, criticality: bool) -> Control {
+        Control {
+            control_type: LDAP_SERVER_SD_FLAGS_OID.into(),
+            criticality,
+            control_value: Some(self.encode()),
+        }
+    }
+}
+
+/// Format flag for the extended DN control (`LDAP_SERVER_EXTENDED_DN_OID`
+/// per MS-ADTS §3.1.1.3.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtendedDnFormat {
+    /// `0` — return the GUID/SID as a hex string. This is the default
+    /// and the format AD uses for backward compatibility.
+    #[default]
+    HexString = 0,
+    /// `1` — return the GUID/SID in the `<GUID=...>` string form.
+    StringForm = 1,
+}
+
+/// Extended DN control value (MS-ADTS §3.1.1.3.4.2). The control value
+/// is a single INTEGER (0 or 1) specifying the GUID/SID format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExtendedDnValue {
+    /// The requested format.
+    pub format: ExtendedDnFormat,
+}
+
+impl ExtendedDnValue {
+    /// Encode as a single BER INTEGER (the wire form per MS-ADTS).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        ber::encode_integer(self.format as i64, &mut out);
+        out
+    }
+
+    /// Decode from BER bytes (the contents of a `controlValue`).
+    pub fn decode(bytes: &[u8]) -> Result<Self, BerError> {
+        let (int_tlv, rest) = ber::decode_tlv(bytes)?;
+        if int_tlv.tag != TAG_INTEGER {
+            return Err(BerError::UnexpectedTag {
+                expected: TAG_INTEGER,
+                actual: int_tlv.tag,
+            });
+        }
+        if !rest.is_empty() {
+            return Err(BerError::TrailingData(rest.len()));
+        }
+        let v = decode_integer_value(int_tlv.value)?;
+        let format = match v {
+            0 => ExtendedDnFormat::HexString,
+            1 => ExtendedDnFormat::StringForm,
+            _ => {
+                return Err(BerError::OutOfRange(format!(
+                    "ExtendedDn format must be 0 or 1, got {}",
+                    v
+                )));
+            }
+        };
+        Ok(Self { format })
+    }
+
+    /// Build a request `Control` for extended DN.
+    pub fn request_control(format: ExtendedDnFormat, criticality: bool) -> Control {
+        Control {
+            control_type: LDAP_SERVER_EXTENDED_DN_OID.into(),
+            criticality,
+            control_value: Some(Self { format }.encode()),
+        }
+    }
+}
+
 /// The `protocolOp` CHOICE of an `LDAPMessage` (RFC 4511 §4.1.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolOp {
@@ -1586,7 +2084,144 @@ mod tests {
         let (tlv, _) = ber::decode_tlv(&out).unwrap();
         let decoded = Control::decode_from_value(tlv.value).unwrap();
         assert_eq!(decoded.control_type, "1.2.3.4");
-        assert!(!decoded.criticality);
+        assert_eq!(decoded.criticality, false);
         assert_eq!(decoded.control_value, Some(vec![0xAA, 0xBB]));
+    }
+
+    // ---- AD-interop control tests (ADR-006) ----
+
+    #[test]
+    fn paged_results_request_round_trip() {
+        // A client sends a paged-results request asking for a 500-entry
+        // page with an empty cookie (initial page).
+        let ctrl = PagedResultValue::request_control(500, Vec::new(), true);
+        assert_eq!(ctrl.control_type, LDAP_SERVER_PAGED_RESULT_OID);
+        assert!(ctrl.criticality);
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = PagedResultValue::decode(&value).unwrap();
+        assert_eq!(decoded.size, 500);
+        assert!(decoded.cookie.is_empty());
+    }
+
+    #[test]
+    fn paged_results_response_round_trip() {
+        // The server responds with the next cookie to use for the
+        // subsequent page; an empty cookie signals "no more pages".
+        let resp = PagedResultValue {
+            size: 0,
+            cookie: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let bytes = resp.encode();
+        let decoded = PagedResultValue::decode(&bytes).unwrap();
+        assert_eq!(decoded, resp);
+        // And the terminal-response case: empty cookie.
+        let terminal = PagedResultValue {
+            size: 0,
+            cookie: Vec::new(),
+        };
+        let bytes = terminal.encode();
+        let decoded = PagedResultValue::decode(&bytes).unwrap();
+        assert_eq!(decoded, terminal);
+    }
+
+    #[test]
+    fn sort_request_round_trip() {
+        // Client requests sorting by `sn` ascending, then `cn` descending
+        // as a tie-breaker.
+        let keys = vec![
+            SortKey {
+                attribute: "sn".into(),
+                reverse: false,
+                ordering_rule: None,
+            },
+            SortKey {
+                attribute: "cn".into(),
+                reverse: true,
+                ordering_rule: Some("caseExactMatch".into()),
+            },
+        ];
+        let ctrl = SortRequestValue::request_control(keys.clone(), false);
+        assert_eq!(ctrl.control_type, LDAP_SERVER_SORT_OID);
+        assert!(!ctrl.criticality);
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = SortRequestValue::decode(&value).unwrap();
+        assert_eq!(decoded.keys, keys);
+    }
+
+    #[test]
+    fn sort_response_round_trip() {
+        // The server reports sort success.
+        let ctrl = SortResponseValue::response_control(SortResultCode::Success, None);
+        assert_eq!(ctrl.control_type, LDAP_SERVER_SORT_RESPONSE_OID);
+        assert!(!ctrl.criticality);
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = SortResponseValue::decode(&value).unwrap();
+        assert_eq!(decoded.sort_result, SortResultCode::Success);
+        assert!(decoded.attribute_type.is_none());
+        // And the failure case: name the offending attribute.
+        let ctrl = SortResponseValue::response_control(
+            SortResultCode::NoSuchAttribute,
+            Some("nonexistent".into()),
+        );
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = SortResponseValue::decode(&value).unwrap();
+        assert_eq!(decoded.sort_result, SortResultCode::NoSuchAttribute);
+        assert_eq!(decoded.attribute_type.as_deref(), Some("nonexistent"));
+    }
+
+    #[test]
+    fn sd_flags_request_round_trip() {
+        // Client requests OWNER | GROUP | DACL (0x7) — typical for an
+        // ACL-editing tool that doesn't need the SACL.
+        let flags = SdFlags::OWNER.union(SdFlags::GROUP).union(SdFlags::DACL);
+        assert_eq!(flags.0, 0x7);
+        assert!(flags.wants_owner());
+        assert!(flags.wants_group());
+        assert!(flags.wants_dacl());
+        assert!(!flags.wants_sacl());
+        let ctrl = flags.request_control(true);
+        assert_eq!(ctrl.control_type, LDAP_SERVER_SD_FLAGS_OID);
+        assert!(ctrl.criticality);
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = SdFlags::decode(&value).unwrap();
+        assert_eq!(decoded, flags);
+    }
+
+    #[test]
+    fn sd_flags_decode_rejects_non_integer() {
+        // If a malformed client sends a control_value that isn't a
+        // SEQUENCE{INTEGER}, decode should fail loudly.
+        let bogus = vec![0x04, 0x01, 0x42]; // OCTET STRING, not SEQUENCE
+        assert!(SdFlags::decode(&bogus).is_err());
+    }
+
+    #[test]
+    fn extended_dn_request_round_trip() {
+        // Client requests hex-string format (0) — the default AD format.
+        let ctrl = ExtendedDnValue::request_control(ExtendedDnFormat::HexString, false);
+        assert_eq!(ctrl.control_type, LDAP_SERVER_EXTENDED_DN_OID);
+        assert!(!ctrl.criticality);
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = ExtendedDnValue::decode(&value).unwrap();
+        assert_eq!(decoded.format, ExtendedDnFormat::HexString);
+        // And the string-form (1) variant.
+        let ctrl = ExtendedDnValue::request_control(ExtendedDnFormat::StringForm, true);
+        let value = ctrl.control_value.expect("control_value must be present");
+        let decoded = ExtendedDnValue::decode(&value).unwrap();
+        assert_eq!(decoded.format, ExtendedDnFormat::StringForm);
+    }
+
+    #[test]
+    fn extended_dn_decode_rejects_invalid_format() {
+        // Only 0 and 1 are valid format integers per MS-ADTS.
+        // Encode the integer 2 manually.
+        let mut bytes = Vec::new();
+        ber::encode_integer(2, &mut bytes);
+        let err = ExtendedDnValue::decode(&bytes).unwrap_err();
+        assert!(
+            matches!(err, BerError::OutOfRange(_)),
+            "expected OutOfRange, got {:?}",
+            err
+        );
     }
 }
