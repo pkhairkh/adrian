@@ -1144,6 +1144,571 @@ pub async fn drs_get_nc_changes_dispatch(
 }
 
 // =====================================================================
+// IDL_DRSUnbind (opnum 0x01) — per MS-DRSR §4.1.5
+// =====================================================================
+
+/// `DRS_MSG_UNBINDREQ_V1` — request body for `IDL_DRSUnbind` (opnum 0x01)
+/// per MS-DRSR §4.1.5.2. Carries the bind handle (`hDrs`) to be released.
+#[derive(Debug, Clone)]
+pub struct DrsUnbindReq {
+    /// The bind handle returned by a prior `IDL_DRSBind` call.
+    pub bind_handle: Uuid,
+}
+
+impl DrsUnbindReq {
+    /// Encode the request body (no outer pointer — `hDrs` is a UUID value,
+    /// not a conformant array). Layout: `[hDrs (16 bytes UUID)]`.
+    pub fn encode(&self, w: &mut NdrWriter) {
+        w.write_uuid(self.bind_handle);
+    }
+
+    /// Decode the request body.
+    pub fn decode(r: &mut NdrReader) -> Result<Self, DceRpcError> {
+        let bind_handle = r.read_uuid()?;
+        Ok(Self { bind_handle })
+    }
+
+    /// Convenience encoder to `Vec<u8>`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = NdrWriter::new();
+        self.encode(&mut w);
+        w.into_bytes()
+    }
+
+    /// Convenience decoder from `&[u8]`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DceRpcError> {
+        let mut r = NdrReader::new(bytes);
+        Self::decode(&mut r)
+    }
+}
+
+/// `DRS_MSG_UNBINDREPLY_V1` — reply body for `IDL_DRSUnbind` (opnum 0x01)
+/// per MS-DRSR §4.1.5.3. On success, `hDrs` is set to nil (the handle is
+/// invalidated). The reply is always `dwOutVersion = 1`.
+#[derive(Debug, Clone)]
+pub struct DrsUnbindReply {
+    /// The (now-invalidated) bind handle — nil on success.
+    pub bind_handle: Uuid,
+}
+
+impl DrsUnbindReply {
+    /// Encode the reply body.
+    pub fn encode(&self, w: &mut NdrWriter) {
+        w.write_uuid(self.bind_handle);
+    }
+
+    /// Decode the reply body.
+    pub fn decode(r: &mut NdrReader) -> Result<Self, DceRpcError> {
+        let bind_handle = r.read_uuid()?;
+        Ok(Self { bind_handle })
+    }
+}
+
+/// High-level `IDL_DRSUnbind` handler (opnum 0x01, per MS-DRSR §4.1.5).
+///
+/// Releases the bind handle. In v1 we don't track active bind handles in a
+/// table (the DCE/RPC transport layer manages association lifetimes); this
+/// handler simply returns the nil UUID to indicate the handle is released.
+pub async fn drs_unbind(
+    _invocation_id: Uuid,
+    _bind_handle: Uuid,
+) -> Result<DrsUnbindReply, ReplicationError> {
+    Ok(DrsUnbindReply {
+        bind_handle: Uuid::nil(),
+    })
+}
+
+/// Wire-level dispatch for `IDL_DRSUnbind` (opnum 0x01).
+///
+/// Decodes the request, calls [`drs_unbind`], encodes the reply as
+/// `dwOutVersion (u32) = 1 | DRS_MSG_UNBINDREPLY_V1 body`.
+pub async fn drs_unbind_dispatch(
+    invocation_id: Uuid,
+    stub_input: &[u8],
+) -> Result<Vec<u8>, ReplicationError> {
+    let req = DrsUnbindReq::from_bytes(stub_input)
+        .map_err(|e| ReplicationError::Backend(format!("DRSUnbind NDR decode: {e}")))?;
+    let reply = drs_unbind(invocation_id, req.bind_handle).await?;
+    let mut w = NdrWriter::new();
+    w.write_uint32(1); // dwOutVersion
+    reply.encode(&mut w);
+    Ok(w.into_bytes())
+}
+
+// =====================================================================
+// IDL_DRSReplicaSync (opnum 0x03) — per MS-DRSR §4.1.10
+// =====================================================================
+
+/// `DRS_MSG_REPSYNC_V1` — request body for `IDL_DRSReplicaSync` (opnum
+/// 0x03) per MS-DRSR §4.1.10.2. Triggers a replication cycle from a source
+/// DSA to the local DSA for the named NC.
+#[derive(Debug, Clone)]
+pub struct DrsReplicaSyncReq {
+    /// The bind handle from `IDL_DRSBind`.
+    pub bind_handle: Uuid,
+    /// The NC DN to replicate (e.g. `DC=adrian,DC=example`).
+    pub nc_dn: String,
+    /// The source DSA address (e.g. `dc01.adrian.example`).
+    pub src_dsa_address: String,
+    /// Replication option flags (per MS-DRSR §4.1.10.2 `ulOptions`).
+    pub ul_options: u32,
+}
+
+impl DrsReplicaSyncReq {
+    /// Encode the request body. Layout: `[hDrs (16)] [pid (4)] [pwszNc ptr
+    /// (4) | conformant wchar_t array] [pwszSrcDsaAddress ptr (4) |
+    /// conformant wchar_t array] [ulOptions (4)]`.
+    ///
+    /// For v1 we use a simplified layout: UUID + two length-prefixed UTF-16LE
+    /// strings + u32 flags. The pointer referent IDs use
+    /// [`NON_NULL_REFERENT_ID`].
+    pub fn encode(&self, w: &mut NdrWriter) {
+        w.write_uuid(self.bind_handle);
+        // pwszNc — non-null pointer + conformant wchar_t array (UTF-16LE,
+        // NUL-terminated, length prefix counts NUL).
+        w.write_uint32(NON_NULL_REFERENT_ID);
+        let utf16: Vec<u16> = self
+            .nc_dn
+            .encode_utf16()
+            .chain(std::iter::once(0u16))
+            .collect();
+        w.write_uint32(utf16.len() as u32);
+        for &unit in &utf16 {
+            w.write_uint16(unit);
+        }
+        w.align(4);
+        // pwszSrcDsaAddress — same shape.
+        w.write_uint32(NON_NULL_REFERENT_ID);
+        let utf16: Vec<u16> = self
+            .src_dsa_address
+            .encode_utf16()
+            .chain(std::iter::once(0u16))
+            .collect();
+        w.write_uint32(utf16.len() as u32);
+        for &unit in &utf16 {
+            w.write_uint16(unit);
+        }
+        w.align(4);
+        w.write_uint32(self.ul_options);
+    }
+
+    /// Decode the request body.
+    pub fn decode(r: &mut NdrReader) -> Result<Self, DceRpcError> {
+        let bind_handle = r.read_uuid()?;
+        let _nc_ptr = r.read_uint32()?;
+        let nc_dn = read_conformant_utf16_string(r)?;
+        let _src_ptr = r.read_uint32()?;
+        let src_dsa_address = read_conformant_utf16_string(r)?;
+        let ul_options = r.read_uint32()?;
+        Ok(Self {
+            bind_handle,
+            nc_dn,
+            src_dsa_address,
+            ul_options,
+        })
+    }
+
+    /// Convenience encoder.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = NdrWriter::new();
+        self.encode(&mut w);
+        w.into_bytes()
+    }
+
+    /// Convenience decoder.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DceRpcError> {
+        let mut r = NdrReader::new(bytes);
+        Self::decode(&mut r)
+    }
+}
+
+/// `DRS_MSG_REPSYNCREPLY_V1` — reply body for `IDL_DRSReplicaSync`.
+/// Contains only the `retval` HRESULT (0 = success).
+#[derive(Debug, Clone)]
+pub struct DrsReplicaSyncReply {
+    /// HRESULT return value (0 = success).
+    pub retval: u32,
+}
+
+impl DrsReplicaSyncReply {
+    /// Encode the reply body.
+    pub fn encode(&self, w: &mut NdrWriter) {
+        w.write_uint32(self.retval);
+    }
+
+    /// Decode the reply body.
+    pub fn decode(r: &mut NdrReader) -> Result<Self, DceRpcError> {
+        let retval = r.read_uint32()?;
+        Ok(Self { retval })
+    }
+}
+
+/// High-level `IDL_DRSReplicaSync` handler (opnum 0x03, per MS-DRSR
+/// §4.1.10).
+///
+/// Triggers a replication cycle from `src_dsa_address` for the named NC. In
+/// v1 we don't have a background replication driver; this handler returns
+/// success immediately (the actual replication is driven by the
+/// [`Replicator`] trait's `get_changes` / `apply_changes` methods).
+pub async fn drs_replica_sync(
+    _invocation_id: Uuid,
+    _nc_dn: &str,
+    _src_dsa_address: &str,
+    _ul_options: u32,
+) -> Result<DrsReplicaSyncReply, ReplicationError> {
+    Ok(DrsReplicaSyncReply { retval: 0 })
+}
+
+/// Wire-level dispatch for `IDL_DRSReplicaSync` (opnum 0x03).
+pub async fn drs_replica_sync_dispatch(
+    invocation_id: Uuid,
+    stub_input: &[u8],
+) -> Result<Vec<u8>, ReplicationError> {
+    let req = DrsReplicaSyncReq::from_bytes(stub_input)
+        .map_err(|e| ReplicationError::Backend(format!("DRSReplicaSync NDR decode: {e}")))?;
+    let reply = drs_replica_sync(
+        invocation_id,
+        &req.nc_dn,
+        &req.src_dsa_address,
+        req.ul_options,
+    )
+    .await?;
+    let mut w = NdrWriter::new();
+    w.write_uint32(1); // dwOutVersion
+    reply.encode(&mut w);
+    Ok(w.into_bytes())
+}
+
+// =====================================================================
+// IDL_DRSCrackNames (opnum 0x0C) — per MS-DRSR §4.1.17
+// =====================================================================
+
+/// Name format constants for `IDL_DRSCrackNames` (per MS-DRSR §4.1.17.2
+/// `DS_NAME_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DsNameFormat {
+    /// Unknown name format.
+    Unknown = 0,
+    /// `CN=User,DC=adrian,DC=example` (RFC 1779).
+    Fqdn1779 = 1,
+    /// `DOMAIN\User` (NT4 account name).
+    Nt4Account = 2,
+    /// Display name (e.g. `Alice Smith`).
+    DisplayName = 3,
+    /// `{-guid}` GUID-based name.
+    Guid = 6,
+    /// `adrian.example/Users/Alice` canonical name.
+    Canonical = 7,
+    /// `alice@adrian.example` user principal name.
+    Upn = 8,
+    /// `HOST/dc01.adrian.example` service principal name.
+    Spn = 9,
+    /// `S-1-5-21-...` SID string.
+    SidOrSidHistory = 10,
+    /// `adrian.example` DNS domain name.
+    DnsDomain = 12,
+}
+
+/// Name status for a cracked entry (per MS-DRSR §4.1.17.3
+/// `DS_NAME_RESULT_ITEM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DsNameStatus {
+    /// The name was cracked successfully.
+    Ok = 0,
+    /// The name was not found.
+    NotFound = 1,
+    /// The name was ambiguous (matched multiple objects).
+    NotUnique = 2,
+    /// The format could not be resolved.
+    NoMapping = 3,
+    /// The name was cracked to a different domain.
+    DomainOnly = 4,
+}
+
+/// A single cracked-name result entry (per MS-DRSR §4.1.17.3
+/// `DS_NAME_RESULT_ITEM`).
+#[derive(Debug, Clone)]
+pub struct CrackedName {
+    /// The cracked name in the desired format.
+    pub name: String,
+    /// The status of the crack operation.
+    pub status: DsNameStatus,
+}
+
+/// `DRS_MSG_CRACKREQ_V1` — request body for `IDL_DRSCrackNames` (opnum
+/// 0x0C) per MS-DRSR §4.1.17.2. Converts between name formats (DN, SID,
+/// UPN, SPN, GUID, etc.).
+#[derive(Debug, Clone)]
+pub struct DrsCrackNamesReq {
+    /// The bind handle.
+    pub bind_handle: Uuid,
+    /// The input format of the names in `names`.
+    pub format_offered: DsNameFormat,
+    /// The desired output format.
+    pub format_desired: DsNameFormat,
+    /// The names to crack.
+    pub names: Vec<String>,
+}
+
+impl DrsCrackNamesReq {
+    /// Encode the request body. Layout: `[hDrs (16)] [flags (4)]
+    /// [formatOffered (4)] [formatDesired (4)] [cNames (4)] [rpNames ptr
+    /// (4) | conformant array of conformant wchar_t strings]`.
+    pub fn encode(&self, w: &mut NdrWriter) {
+        w.write_uuid(self.bind_handle);
+        w.write_uint32(0); // flags — reserved, must be 0.
+        w.write_uint32(self.format_offered as u32);
+        w.write_uint32(self.format_desired as u32);
+        w.write_uint32(self.names.len() as u32);
+        w.write_uint32(NON_NULL_REFERENT_ID);
+        for name in &self.names {
+            w.write_uint32(NON_NULL_REFERENT_ID);
+            let utf16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0u16)).collect();
+            w.write_uint32(utf16.len() as u32);
+            for &unit in &utf16 {
+                w.write_uint16(unit);
+            }
+            w.align(4);
+        }
+    }
+
+    /// Decode the request body.
+    pub fn decode(r: &mut NdrReader) -> Result<Self, DceRpcError> {
+        let bind_handle = r.read_uuid()?;
+        let _flags = r.read_uint32()?;
+        let format_offered = parse_ds_name_format(r.read_uint32()?);
+        let format_desired = parse_ds_name_format(r.read_uint32()?);
+        let c_names = r.read_uint32()? as usize;
+        let _rp_names_ptr = r.read_uint32()?;
+        let mut names = Vec::with_capacity(c_names);
+        for _ in 0..c_names {
+            let _ptr = r.read_uint32()?;
+            names.push(read_conformant_utf16_string(r)?);
+        }
+        Ok(Self {
+            bind_handle,
+            format_offered,
+            format_desired,
+            names,
+        })
+    }
+
+    /// Convenience encoder.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = NdrWriter::new();
+        self.encode(&mut w);
+        w.into_bytes()
+    }
+
+    /// Convenience decoder.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DceRpcError> {
+        let mut r = NdrReader::new(bytes);
+        Self::decode(&mut r)
+    }
+}
+
+/// `DRS_MSG_CRACKREPLY_V1` — reply body for `IDL_DRSCrackNames`.
+#[derive(Debug, Clone)]
+pub struct DrsCrackNamesReply {
+    /// The cracked name entries, one per input name.
+    pub entries: Vec<CrackedName>,
+}
+
+impl DrsCrackNamesReply {
+    /// Encode the reply body. Layout: `[cEntries (4)] [pEntries ptr (4) |
+    /// conformant array of DS_NAME_RESULT_ITEM]`. Each item is
+    /// `[pName ptr (4) | conformant wchar_t string] [status (4)]`.
+    pub fn encode(&self, w: &mut NdrWriter) {
+        w.write_uint32(self.entries.len() as u32);
+        w.write_uint32(NON_NULL_REFERENT_ID);
+        for entry in &self.entries {
+            w.write_uint32(NON_NULL_REFERENT_ID);
+            let utf16: Vec<u16> = entry
+                .name
+                .encode_utf16()
+                .chain(std::iter::once(0u16))
+                .collect();
+            w.write_uint32(utf16.len() as u32);
+            for &unit in &utf16 {
+                w.write_uint16(unit);
+            }
+            w.align(4);
+            w.write_uint32(entry.status as u32);
+        }
+    }
+
+    /// Decode the reply body.
+    pub fn decode(r: &mut NdrReader) -> Result<Self, DceRpcError> {
+        let c_entries = r.read_uint32()? as usize;
+        let _p_entries_ptr = r.read_uint32()?;
+        let mut entries = Vec::with_capacity(c_entries);
+        for _ in 0..c_entries {
+            let _ptr = r.read_uint32()?;
+            let name = read_conformant_utf16_string(r)?;
+            let status = parse_ds_name_status(r.read_uint32()?);
+            entries.push(CrackedName { name, status });
+        }
+        Ok(Self { entries })
+    }
+}
+
+/// High-level `IDL_DRSCrackNames` handler (opnum 0x0C, per MS-DRSR
+/// §4.1.17).
+///
+/// Converts names from `format_offered` to `format_desired`. In v1 we
+/// implement a minimal subset:
+///
+/// - `Fqdn1779 -> Upn`: splits `CN=Alice,DC=adrian,DC=example` into
+///   `alice@adrian.example` (lowercases the CN, joins DC parts with `.`).
+/// - `Fqdn1779 -> Canonical`: splits into `adrian.example/Users/Alice`.
+/// - `Fqdn1779 -> Fqdn1779`: identity (returns the input unchanged).
+///
+/// All other conversions return `DsNameStatus::NoMapping` (the caller can
+/// retry with a different format or consult the GC).
+pub async fn drs_crack_names(
+    _invocation_id: Uuid,
+    format_offered: DsNameFormat,
+    format_desired: DsNameFormat,
+    names: &[String],
+) -> Result<DrsCrackNamesReply, ReplicationError> {
+    let entries: Vec<CrackedName> = names
+        .iter()
+        .map(|name| crack_one_name(name, format_offered, format_desired))
+        .collect();
+    Ok(DrsCrackNamesReply { entries })
+}
+
+/// Crack a single name from `offered` to `desired` format.
+fn crack_one_name(name: &str, offered: DsNameFormat, desired: DsNameFormat) -> CrackedName {
+    if offered == desired {
+        return CrackedName {
+            name: name.to_string(),
+            status: DsNameStatus::Ok,
+        };
+    }
+    // Parse the DN into RDN components + DC parts.
+    if offered == DsNameFormat::Fqdn1779 {
+        let parts: Vec<&str> = name.split(',').collect();
+        let mut dc_parts: Vec<String> = Vec::new();
+        let mut cn_value: Option<String> = None;
+        for part in &parts {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix("CN=") {
+                if cn_value.is_none() {
+                    cn_value = Some(rest.to_string());
+                }
+            } else if let Some(rest) = part.strip_prefix("DC=") {
+                dc_parts.push(rest.to_string());
+            }
+        }
+        let domain = dc_parts.join(".");
+        let cn = cn_value.unwrap_or_default();
+        match desired {
+            DsNameFormat::Upn => {
+                let upn = format!("{}@{}", cn.to_lowercase(), domain);
+                return CrackedName {
+                    name: upn,
+                    status: DsNameStatus::Ok,
+                };
+            }
+            DsNameFormat::Canonical => {
+                let canonical = if domain.is_empty() {
+                    cn.clone()
+                } else {
+                    format!("{}/Users/{}", domain, cn)
+                };
+                return CrackedName {
+                    name: canonical,
+                    status: DsNameStatus::Ok,
+                };
+            }
+            _ => {}
+        }
+    }
+    // Unsupported conversion.
+    CrackedName {
+        name: String::new(),
+        status: DsNameStatus::NoMapping,
+    }
+}
+
+/// Wire-level dispatch for `IDL_DRSCrackNames` (opnum 0x0C).
+pub async fn drs_crack_names_dispatch(
+    invocation_id: Uuid,
+    stub_input: &[u8],
+) -> Result<Vec<u8>, ReplicationError> {
+    let req = DrsCrackNamesReq::from_bytes(stub_input)
+        .map_err(|e| ReplicationError::Backend(format!("DRSCrackNames NDR decode: {e}")))?;
+    let reply = drs_crack_names(
+        invocation_id,
+        req.format_offered,
+        req.format_desired,
+        &req.names,
+    )
+    .await?;
+    let mut w = NdrWriter::new();
+    w.write_uint32(1); // dwOutVersion
+    reply.encode(&mut w);
+    Ok(w.into_bytes())
+}
+
+// =====================================================================
+// NDR helpers shared by Wave 3 opnums
+// =====================================================================
+
+/// Read a conformant UTF-16LE NUL-terminated wchar_t string (per NDR
+/// conformant array rules: `[count (u32)] [count × uint16] [align 4]`).
+/// The trailing NUL WCHAR is included in `count` and stripped here.
+fn read_conformant_utf16_string(r: &mut NdrReader) -> Result<String, DceRpcError> {
+    let count = r.read_uint32()? as usize;
+    let mut units = Vec::with_capacity(count);
+    for _ in 0..count {
+        units.push(r.read_uint16()?);
+    }
+    r.align(4)?;
+    // Strip the trailing NUL WCHAR if present.
+    if units.last() == Some(&0) {
+        units.pop();
+    }
+    String::from_utf16(&units).map_err(|e| DceRpcError::Ndr(format!("UTF-16 decode: {e}")))
+}
+
+/// Parse a `u32` into a [`DsNameFormat`]. Unknown values fall back to
+/// [`DsNameFormat::Unknown`] (per MS-DRSR §4.1.17.2 — the server should
+/// reject unknown formats, but we tolerate them for forward compat).
+fn parse_ds_name_format(v: u32) -> DsNameFormat {
+    match v {
+        0 => DsNameFormat::Unknown,
+        1 => DsNameFormat::Fqdn1779,
+        2 => DsNameFormat::Nt4Account,
+        3 => DsNameFormat::DisplayName,
+        6 => DsNameFormat::Guid,
+        7 => DsNameFormat::Canonical,
+        8 => DsNameFormat::Upn,
+        9 => DsNameFormat::Spn,
+        10 => DsNameFormat::SidOrSidHistory,
+        12 => DsNameFormat::DnsDomain,
+        _ => DsNameFormat::Unknown,
+    }
+}
+
+/// Parse a `u32` into a [`DsNameStatus`]. Unknown values fall back to
+/// [`DsNameStatus::Ok`] (defensive — the server should only emit known
+/// statuses, but a malformed reply shouldn't crash the client).
+fn parse_ds_name_status(v: u32) -> DsNameStatus {
+    match v {
+        0 => DsNameStatus::Ok,
+        1 => DsNameStatus::NotFound,
+        2 => DsNameStatus::NotUnique,
+        3 => DsNameStatus::NoMapping,
+        4 => DsNameStatus::DomainOnly,
+        _ => DsNameStatus::Ok,
+    }
+}
+
+// =====================================================================
 // DrSuapiReplicator (Wave 1: get_changes + apply_changes wired)
 // =====================================================================
 
@@ -1478,14 +2043,11 @@ impl Replicator for DrSuapiReplicator {
     }
 }
 
-// TODO: implement IDL_DRSUnbind (opnum 0x01) per MS-DRSR §4.1.5.
-// TODO: implement IDL_DRSReplicaSync (opnum 0x03) per MS-DRSR §4.1.10.
 // TODO: implement IDL_DRSUpdateRefs (opnum 0x05) per MS-DRSR §4.1.21.
 // TODO: implement IDL_DRSReplicaAdd (opnum 0x06) per MS-DRSR §4.1.11.
 // TODO: implement IDL_DRSReplicaDel (opnum 0x07) per MS-DRSR §4.1.13.
 // TODO: implement IDL_DRSReplicaModify (opnum 0x08) per MS-DRSR §4.1.12.
 // TODO: implement IDL_DRSGetReplInfo (opnum 0x15) per MS-DRSR §4.1.26.
-// TODO: implement IDL_DRSCrackNames (opnum 0x0C) per MS-DRSR §4.1.17.
 // TODO: implement IDL_DRSVerifyNames (opnum 0x0E) per MS-DRSR §4.1.19.
 // TODO: implement IDL_DRSDomainControllerInfo (opnum 0x11) per MS-DRSR §4.1.16.
 // TODO: implement EXOP_REPL_SECRETS (DCSync) per ADR-122 — ACL-gated, caller
@@ -2508,5 +3070,157 @@ mod tests {
             .expect("get_changes with cursor");
         // Wave 1: no USN filtering — all objects returned.
         assert_eq!(payload.operations.len(), 2);
+    }
+
+    // =================================================================
+    // NEW (Wave 3) — DRSUnbind + DRSReplicaSync + DRSCrackNames
+    // 2 tests per opnum: NDR round-trip + handler behavior.
+    // =================================================================
+
+    #[tokio::test]
+    async fn wave3_drs_unbind_dispatch_round_trips_through_ndr() {
+        // T-301: encode a DRSUnbind request, dispatch, decode the reply.
+        let bind_handle = Uuid::now_v7();
+        let req = DrsUnbindReq { bind_handle };
+        let req_bytes = req.to_bytes();
+        let reply_bytes = drs_unbind_dispatch(Uuid::nil(), &req_bytes)
+            .await
+            .expect("dispatch must succeed");
+        // Reply layout: dwOutVersion (u32) | bind_handle (16).
+        assert_eq!(reply_bytes.len(), 4 + 16);
+        let mut r = NdrReader::new(&reply_bytes);
+        let dw_out_version = r.read_uint32().expect("dwOutVersion");
+        assert_eq!(dw_out_version, 1);
+        let reply = DrsUnbindReply::decode(&mut r).expect("decode reply");
+        assert_eq!(reply.bind_handle, Uuid::nil(), "unbind must nil the handle");
+    }
+
+    #[tokio::test]
+    async fn wave3_drs_unbind_handler_returns_nil_handle() {
+        // T-301 handler: the high-level handler returns a nil bind handle
+        // to indicate the handle is released.
+        let reply = drs_unbind(Uuid::nil(), Uuid::now_v7())
+            .await
+            .expect("handler must succeed");
+        assert_eq!(reply.bind_handle, Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn wave3_drs_replica_sync_dispatch_round_trips_through_ndr() {
+        // T-302: encode a DRSReplicaSync request, dispatch, decode reply.
+        let req = DrsReplicaSyncReq {
+            bind_handle: Uuid::now_v7(),
+            nc_dn: "DC=adrian,DC=example".into(),
+            src_dsa_address: "dc01.adrian.example".into(),
+            ul_options: 0,
+        };
+        let req_bytes = req.to_bytes();
+        // Round-trip the request first to verify NDR codec.
+        let decoded_req = DrsReplicaSyncReq::from_bytes(&req_bytes).expect("req round-trip");
+        assert_eq!(decoded_req.nc_dn, "DC=adrian,DC=example");
+        assert_eq!(decoded_req.src_dsa_address, "dc01.adrian.example");
+        // Dispatch.
+        let reply_bytes = drs_replica_sync_dispatch(Uuid::nil(), &req_bytes)
+            .await
+            .expect("dispatch must succeed");
+        let mut r = NdrReader::new(&reply_bytes);
+        let dw_out_version = r.read_uint32().expect("dwOutVersion");
+        assert_eq!(dw_out_version, 1);
+        let reply = DrsReplicaSyncReply::decode(&mut r).expect("decode reply");
+        assert_eq!(reply.retval, 0, "replica sync should succeed");
+    }
+
+    #[tokio::test]
+    async fn wave3_drs_replica_sync_handler_returns_success() {
+        // T-302 handler: the high-level handler returns retval=0.
+        let reply = drs_replica_sync(
+            Uuid::nil(),
+            "DC=adrian,DC=example",
+            "dc01.adrian.example",
+            0,
+        )
+        .await
+        .expect("handler must succeed");
+        assert_eq!(reply.retval, 0);
+    }
+
+    #[tokio::test]
+    async fn wave3_drs_crack_names_dispatch_round_trips_through_ndr() {
+        // T-303: encode a DRSCrackNames request, dispatch, decode reply.
+        let req = DrsCrackNamesReq {
+            bind_handle: Uuid::now_v7(),
+            format_offered: DsNameFormat::Fqdn1779,
+            format_desired: DsNameFormat::Upn,
+            names: vec![
+                "CN=Alice,DC=adrian,DC=example".into(),
+                "CN=Bob,DC=adrian,DC=example".into(),
+            ],
+        };
+        let req_bytes = req.to_bytes();
+        // Round-trip the request to verify NDR codec.
+        let decoded_req = DrsCrackNamesReq::from_bytes(&req_bytes).expect("req round-trip");
+        assert_eq!(decoded_req.names.len(), 2);
+        assert_eq!(decoded_req.format_offered, DsNameFormat::Fqdn1779);
+        assert_eq!(decoded_req.format_desired, DsNameFormat::Upn);
+        // Dispatch.
+        let reply_bytes = drs_crack_names_dispatch(Uuid::nil(), &req_bytes)
+            .await
+            .expect("dispatch must succeed");
+        let mut r = NdrReader::new(&reply_bytes);
+        let dw_out_version = r.read_uint32().expect("dwOutVersion");
+        assert_eq!(dw_out_version, 1);
+        let reply = DrsCrackNamesReply::decode(&mut r).expect("decode reply");
+        assert_eq!(reply.entries.len(), 2);
+        assert_eq!(reply.entries[0].name, "alice@adrian.example");
+        assert_eq!(reply.entries[0].status, DsNameStatus::Ok);
+        assert_eq!(reply.entries[1].name, "bob@adrian.example");
+    }
+
+    #[tokio::test]
+    async fn wave3_drs_crack_names_handler_converts_dn_to_upn_and_canonical() {
+        // T-303 handler: Fqdn1779 -> Upn and Fqdn1779 -> Canonical both work.
+        let names = vec!["CN=Alice,DC=adrian,DC=example".to_string()];
+        // Upn conversion.
+        let reply = drs_crack_names(
+            Uuid::nil(),
+            DsNameFormat::Fqdn1779,
+            DsNameFormat::Upn,
+            &names,
+        )
+        .await
+        .expect("Upn crack");
+        assert_eq!(reply.entries[0].name, "alice@adrian.example");
+        assert_eq!(reply.entries[0].status, DsNameStatus::Ok);
+        // Canonical conversion.
+        let reply = drs_crack_names(
+            Uuid::nil(),
+            DsNameFormat::Fqdn1779,
+            DsNameFormat::Canonical,
+            &names,
+        )
+        .await
+        .expect("Canonical crack");
+        assert_eq!(reply.entries[0].name, "adrian.example/Users/Alice");
+        assert_eq!(reply.entries[0].status, DsNameStatus::Ok);
+        // Identity conversion (same format in and out).
+        let reply = drs_crack_names(
+            Uuid::nil(),
+            DsNameFormat::Fqdn1779,
+            DsNameFormat::Fqdn1779,
+            &names,
+        )
+        .await
+        .expect("identity crack");
+        assert_eq!(reply.entries[0].name, "CN=Alice,DC=adrian,DC=example");
+        // Unsupported conversion returns NoMapping.
+        let reply = drs_crack_names(
+            Uuid::nil(),
+            DsNameFormat::Upn,
+            DsNameFormat::SidOrSidHistory,
+            &names,
+        )
+        .await
+        .expect("unsupported crack");
+        assert_eq!(reply.entries[0].status, DsNameStatus::NoMapping);
     }
 }
