@@ -636,6 +636,7 @@ name = "adrian-sdk-jni"
 version = "0.1.0"
 dependencies = [
  "adrian-sdk",
+ "adrian-sdk-c",
  "jni",
  "thiserror 2.0.20",
  "tokio",
@@ -656,6 +657,7 @@ name = "adrian-sdk-swift"
 version = "0.1.0"
 dependencies = [
  "adrian-sdk",
+ "adrian-sdk-c",
  "thiserror 2.0.20",
  "tokio",
 ]

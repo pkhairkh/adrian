@@ -11,6 +11,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 adrian-sdk = { path = "../adrian-sdk" }
+# Wave 3: route new `AdrianSdk_*` JNI entry points through the C ABI in
+# `adrian-sdk-c` per ADR-107 §Consequences (the C ABI is the foundation
+# for all language bindings — JNI, Swift, Python, Go).
+adrian-sdk-c = { path = "../adrian-sdk-c" }
 tokio.workspace = true
 thiserror.workspace = true
 jni.workspace = true
